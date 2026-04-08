@@ -188,18 +188,35 @@ Deferred from Task 3 to keep that PR scoped to plain reads/writes. Once we know 
 
 ---
 
-### 7. Build the GeneratePanel UI `[ ]`
+### 7. Build the GeneratePanel UI — two flows `[ ]`
+
+The artifact has two distinct generation entry points and we should preserve that split:
+
+- **Flow A — Generate new object** (Header "Generate more" button): standalone panel with a name field + optional color tag. Submitting calls `/api/generate` with no `svg_id` and no `current_svg`. Accept → INSERT into `physics_svgs`.
+- **Flow B — Revise existing object** (DetailModal "Send to Claude" button): uses the open modal item's name, feedback history, color tag, and current SVG markup as context. Submitting calls `/api/generate` with the existing `svg_id`. Accept → UPDATE the row, which auto-archives the prior version via the `archive_svg_version` trigger.
+
+The Modal function I wrote in Task 3 already accepts both shapes — `svg_id` is optional, `current_svg` is optional. The UI is responsible for picking which flow it's in and doing the right INSERT/UPDATE on accept.
 
 **Scope**
-- Replace the Task 2 stub in `src/components/GeneratePanel.jsx`
-- Inputs: object name, optional color tag, optional feedback, optional current SVG
-- POST to `/api/generate` with the user's auth token, render streamed SVG preview
-- "Accept" → UPDATE `physics_svgs` (or INSERT for new objects)
-- "Revise" → keep streaming/iterating with new feedback
+- Replace the Task 2 stub in `src/components/GeneratePanel.jsx` with a real component (Flow A)
+- Wire the existing DetailModal "Send to Claude" button to a parallel revision UI (Flow B) — likely an inline preview within the modal rather than a separate panel
+- Both flows POST to `/api/generate` with the Supabase auth token in the `Authorization` header
+- Preview the streamed SVG response inline (large, rendered)
+- Both flows include "Accept" and "Revise again" actions
+- **Name collision handling for Flow A:** validate the entered name against the in-memory library on input change. If it collides, disable submit and offer "Revise existing instead?" as a one-click jump to Flow B for that item. (We hit this manually with the football — the unique constraint on `physics_svgs.name` will reject the INSERT, so we want to catch it before the round trip.)
+- On accept (Flow A INSERT), set `created_by = auth.uid()` and `updated_by = auth.uid()`
+- On accept (Flow B UPDATE), set `updated_by = auth.uid()` so the version-archive trigger attributes the prior version to the right user
+- After accept, refresh `useSvgs` so the grid reflects the new/updated item
+
+**Out of scope**
+- Diff viewer between `svg_versions` entries (backlog item)
+- Multi-turn chat-style refinement (Revise just sends a fresh request with accumulated feedback, same as the artifact)
 
 **Acceptance**
-- End-to-end flow: prompt → Vercel → Modal → Claude → preview → accept/revise → DB update
-- New object name not in library inserts a new row; existing name updates and bumps version (via the `archive_svg_version` trigger)
+- Flow A: typing a fresh name + clicking Generate produces a preview, Accept inserts a new row, the grid updates without reload
+- Flow A name collision: typing an existing name disables Generate and shows a "revise instead" affordance
+- Flow B: opening a modal item, clicking Send to Claude produces a preview, Accept updates the row, the version is bumped, `svg_versions` gains a snapshot
+- Both flows: a corresponding `generation_sessions` row exists with non-null tokens and cost
 
 ---
 

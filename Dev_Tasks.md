@@ -51,7 +51,7 @@ Stand up a real Vite project in this directory and break [gist-svg-manager.jsx](
 
 **Out of scope**
 - Supabase client, auth, login UI, seed script (Task 3)
-- Realtime (Task 4)
+- Realtime (Task 5)
 - GeneratePanel functionality beyond a stub (Phase 3)
 - Tailwind, TypeScript, ESLint config beyond the Vite default
 - Visual redesign
@@ -65,15 +65,17 @@ Stand up a real Vite project in this directory and break [gist-svg-manager.jsx](
 
 ---
 
-### 3. Wire Supabase client, ship login UI, seed the database `[ ]`
+### 3. Wire Supabase, ship login UI, seed the database, and build the Modal generate_svg() function `[ ]`
 
-Connect the decomposed app to the live Supabase project. Replaces the localStorage bridge with real DB queries and ships the auth gate.
+Connect the decomposed app to the live Supabase project, replace the localStorage bridge with real DB queries, ship the auth gate, **and** build the Modal function that calls Claude. The Modal piece is bundled here because it's isolated (Python, separate deploy) and lets us verify the Claude prompt and cost logging in isolation before the Vercel proxy and UI come together in later tasks.
 
 **Prerequisites**
 - Task 2 complete
 - Supabase free-tier project exists with [gist-supabase-schema.sql](gist-supabase-schema.sql) applied (confirmed)
 - Bill has the project URL, anon key, and service role key from the Supabase dashboard
 - Bill creates `.env.local` himself using the `.env.local.example` I provide
+- Bill has a Modal account and the `modal` CLI installed locally (`pip install modal`, `modal token new`)
+- Bill has an Anthropic API key (separate from Bill's Pro account if there's billing isolation to maintain)
 
 **Scope — Supabase client**
 - Install `@supabase/supabase-js`
@@ -87,12 +89,16 @@ Connect the decomposed app to the live Supabase project. Replaces the localStora
 - Logged-out users see the login page; logged-in users see the grid
 
 **Scope — Replace localStorage with Supabase queries**
-- `src/hooks/useSvgs.js` — load `svgs_with_details` view, expose status/color/notes update mutations
-- `src/hooks/useFeedback.js` — load `feedback_with_author`, post feedback
-- All status/color/notes/feedback writes go through Postgres
+- `src/hooks/useSvgs.js` — load `svgs_with_details` view + `svg_feedback` rows in parallel, transform into the artifact's item shape so the existing components don't need rewrites. Exposes status/color/notes/feedback mutations against Postgres.
+- All status/color/notes/feedback writes go through Postgres (optimistic local update + rollback on error)
 - Remove the localStorage bridge from Task 2 entirely
 - Delete `gist-svg-manager.jsx` (no longer needed as reference)
-- In-memory undo stack still works for UI undo; DB versioning is automatic via the `archive_svg_version` trigger
+- **Drop the in-memory undo stack.** With Supabase as source of truth, an undo would have to write the previous row back to the DB, which has weird semantics across users (you'd accidentally undo the other person's edits). DB-side history is still captured automatically via the `archive_svg_version` trigger; we'll surface it as a "restore previous version" UI in a later task once we know what UX makes sense.
+
+**Scope — Bootstrap (manual SQL via Supabase SQL editor)**
+- After Bill ships the local code and signs up via the new login UI, he grabs his `auth.users.id` from the Supabase auth dashboard
+- Bill runs a one-line `INSERT INTO project_members ...` snippet in the Supabase SQL editor (snippet provided by Claude in the run instructions)
+- This bootstrap step has to happen *before* the seed script runs, otherwise RLS blocks Bill from seeing anything
 
 **Scope — Seed script**
 - `scripts/seed.js` — Node script that reads `src/lib/seedData.js` and inserts the 50 SVGs into `physics_svgs`
@@ -101,18 +107,35 @@ Connect the decomposed app to the live Supabase project. Replaces the localStora
 - Script is committed; the env vars to run it are not
 - Verify what `created_by` allows for system-seeded rows (NULL vs placeholder) — handle accordingly
 
+**Scope — Modal `generate_svg()` function**
+- `modal_functions/generate_svg.py` — Python function that:
+  - Uses the system prompt template from [src/lib/constants.js](src/lib/constants.js) (port the `buildSystemPrompt` text into Python verbatim — single source of truth lives in JS for now, Python mirrors it)
+  - Builds final prompt: system prompt + library context + feedback history + color palette constraint + current SVG markup
+  - Calls Claude API (`claude-sonnet-4-20250514`) with streaming
+  - Logs token usage and computed `cost_usd` to `generation_sessions` (status `pending` → `completed`/`failed`)
+  - Returns the generated SVG (or streams it — exact return shape decided during implementation based on Modal's SSE story)
+- Modal secrets:
+  - `modal secret create anthropic-secret ANTHROPIC_API_KEY=sk-ant-...`
+  - `modal secret create supabase-gist-credentials SUPABASE_GIST_URL=... SUPABASE_GIST_SERVICE_ROLE_KEY=...`
+- Deployed to Modal via `modal deploy modal_functions/generate_svg.py`
+- Verifiable in isolation (no Vercel, no React UI yet) — call directly with `modal run` or via the Modal endpoint URL using curl
+
 **Out of scope**
-- Realtime subscriptions (Task 4)
-- Inserting Bill + Duncan into `project_members` (Task 4-prerequisite — happens after they sign up)
-- GeneratePanel functionality (Phase 3)
-- Vercel deploy (Task 10)
+- Vercel `api/generate.ts` proxy (Task 6)
+- GeneratePanel React UI (Task 7)
+- Realtime subscriptions (Task 5)
+- Inserting Bill + Duncan into `project_members` (Task 4 — happens after they sign up)
+- `keep_alive` Modal cron (Task 8)
+- Vercel deploy (Task 9)
 
 **Acceptance**
 - Logged-out users see the login page
-- After Bill + Duncan sign up and the next task inserts them into `project_members`, they see the seeded grid
+- After Bill + Duncan sign up and Task 4 inserts them into `project_members`, they see the seeded grid
 - All status/color/notes/feedback edits round-trip through the DB
 - Both browsers see the same data on reload (no longer dependent on localStorage)
-- `seedData.js` and `localStorage` are gone from the runtime path (seedData.js may still exist for the seed script to import)
+- `localStorage` is gone from the runtime path
+- `modal run modal_functions/generate_svg.py` (or equivalent test invocation) returns a valid 64×64 SVG for a test prompt
+- A `generation_sessions` row is created with non-null `input_tokens`, `output_tokens`, and `cost_usd`
 
 ---
 
@@ -150,25 +173,7 @@ Deferred from Task 3 to keep that PR scoped to plain reads/writes. Once we know 
 
 ## Phase 3 — Generation pipeline
 
-### 6. Build Modal `generate_svg()` function `[ ]`
-
-**Scope**
-- `modal_functions/generate_svg.py` — Python function that:
-  - Reads system prompt template from constants
-  - Builds final prompt: system prompt + library context + feedback history + color palette constraint + current SVG markup
-  - Calls Claude API (`claude-sonnet-4-20250514`) with streaming
-  - Logs token usage and computed `cost_usd` to `generation_sessions` (status pending → completed/failed)
-  - Returns the generated SVG (or streams it)
-- `modal secret create anthropic-secret`, `modal secret create supabase-gist-credentials`
-- Deploy to Modal
-
-**Acceptance**
-- `modal run` against a test prompt returns a valid 64×64 SVG
-- `generation_sessions` row created with token counts and cost
-
----
-
-### 7. Build Vercel serverless proxy `api/generate.ts` `[ ]`
+### 6. Build Vercel serverless proxy `api/generate.ts` `[ ]`
 
 **Scope**
 - TypeScript Node function in `api/generate.ts`
@@ -183,7 +188,7 @@ Deferred from Task 3 to keep that PR scoped to plain reads/writes. Once we know 
 
 ---
 
-### 8. Build the GeneratePanel UI `[ ]`
+### 7. Build the GeneratePanel UI `[ ]`
 
 **Scope**
 - Replace the Task 2 stub in `src/components/GeneratePanel.jsx`
@@ -198,7 +203,7 @@ Deferred from Task 3 to keep that PR scoped to plain reads/writes. Once we know 
 
 ---
 
-### 9. Build Modal `keep_alive()` weekly cron `[ ]`
+### 8. Build Modal `keep_alive()` weekly cron `[ ]`
 
 **Scope**
 - `modal_functions/keep_alive.py` — pings the `heartbeat` table once a week so the free-tier Supabase project doesn't pause after 7 days idle
@@ -212,7 +217,7 @@ Deferred from Task 3 to keep that PR scoped to plain reads/writes. Once we know 
 
 ## Phase 4 — Deploy & polish
 
-### 10. Push to GitHub and set up Vercel auto-deploy `[ ]`
+### 9. Push to GitHub and set up Vercel auto-deploy `[ ]`
 
 **Scope**
 - Create GitHub repo, add remote, push `main`
@@ -226,7 +231,7 @@ Deferred from Task 3 to keep that PR scoped to plain reads/writes. Once we know 
 
 ---
 
-### 11. End-to-end test: generate, review, approve, export zip `[ ]`
+### 10. End-to-end test: generate, review, approve, export zip `[ ]`
 
 **Scope**
 - Walk through a full session: log in, generate a new object, give feedback, revise, approve

@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { STATUSES, buildSystemPrompt } from "./lib/constants.js";
-import { createInitialItems } from "./lib/seedData.js";
-import { loadItems, saveItems } from "./lib/storage.js";
+import { useAuth } from "./hooks/useAuth.js";
+import { useSvgs } from "./hooks/useSvgs.js";
+import LoginPage from "./components/LoginPage.jsx";
 import Header from "./components/Header.jsx";
 import Toast from "./components/Toast.jsx";
 import FilterBar from "./components/FilterBar.jsx";
@@ -9,71 +10,60 @@ import SvgGrid from "./components/SvgGrid.jsx";
 import DetailModal from "./components/DetailModal.jsx";
 import SystemPrompt from "./components/SystemPrompt.jsx";
 
-const UNDO_LIMIT = 30;
-
 export default function App() {
-  // Lazy initial state: read localStorage once on mount, fall back to seed
-  // data. localStorage is synchronous so we don't need a separate "loaded"
-  // gate (the artifact had one because Claude.ai's window.storage was async).
-  const [items, setItemsRaw] = useState(() => loadItems() ?? createInitialItems());
-  const [modalItem, setModalItem] = useState(null);
+  const auth = useAuth();
+
+  // Auth gate. While Supabase is restoring the session we render nothing
+  // (rather than flashing the login screen at users who are already in).
+  if (auth.loading) {
+    return <CenteredMessage>Loading...</CenteredMessage>;
+  }
+  if (!auth.user) {
+    return <LoginPage onSignIn={auth.signIn} onSignUp={auth.signUp} />;
+  }
+
+  return <SignedInApp user={auth.user} onSignOut={auth.signOut} />;
+}
+
+function SignedInApp({ user, onSignOut }) {
+  const svgs = useSvgs(user);
+
+  // UI state.
+  const [modalItemId, setModalItemId] = useState(null);
   const [filters, setFilters] = useState(new Set(STATUSES));
   const [search, setSearch] = useState("");
   const [feedbackText, setFeedbackText] = useState("");
   const [showSystemPrompt, setShowSystemPrompt] = useState(false);
   const [toast, setToast] = useState(null);
-  const [hasUndo, setHasUndo] = useState(false);
-
-  const undoStackRef = useRef([]);
   const toastTimerRef = useRef(null);
 
-  // Show a transient toast message that auto-dismisses.
   const showToast = useCallback((message) => {
     setToast(message);
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     toastTimerRef.current = setTimeout(() => setToast(null), 2200);
   }, []);
 
-  // setItems wrapper that pushes the previous state onto the undo stack
-  // (capped at 30 entries) and persists the new state to localStorage.
-  const setItemsWithUndo = useCallback((updaterOrValue) => {
-    setItemsRaw((prev) => {
-      if (prev) {
-        undoStackRef.current = [
-          ...undoStackRef.current.slice(-(UNDO_LIMIT - 1)),
-          JSON.stringify(prev),
-        ];
-        setHasUndo(true);
-      }
-      const next =
-        typeof updaterOrValue === "function" ? updaterOrValue(prev) : updaterOrValue;
-      saveItems(next);
-      return next;
-    });
-  }, []);
-
-  const performUndo = useCallback(() => {
-    if (!undoStackRef.current.length) return;
-    const previous = JSON.parse(undoStackRef.current.pop());
-    setHasUndo(undoStackRef.current.length > 0);
-    setItemsRaw(previous);
-    saveItems(previous);
-    showToast("Undone");
-  }, [showToast]);
-
   const closeModal = useCallback(() => {
-    setModalItem(null);
+    setModalItemId(null);
     setFeedbackText("");
   }, []);
 
-  // Filter + search applied to items, in render order.
+  // Filter + search applied to items, in render order. Memoised against
+  // the items array reference so we don't re-filter on unrelated renders.
+  const items = svgs.items;
   const getVisibleItems = useCallback(() => {
+    if (!items) return [];
     const query = search.toLowerCase();
     return items.filter(
       (item) =>
         filters.has(item.status) && (!query || item.label.toLowerCase().includes(query))
     );
   }, [items, filters, search]);
+
+  // Look up the current modal item by id on every render so edits flow
+  // through automatically (no need for a separate "syncModalIfMatching"
+  // helper as the artifact had).
+  const modalItem = modalItemId && items ? items.find((i) => i.id === modalItemId) : null;
 
   const navigateModal = useCallback(
     (direction) => {
@@ -82,21 +72,16 @@ export default function App() {
       const index = visible.findIndex((x) => x.id === modalItem.id);
       const next = visible[index + direction];
       if (next) {
-        setModalItem(next);
+        setModalItemId(next.id);
         setFeedbackText("");
       }
     },
     [modalItem, getVisibleItems]
   );
 
-  // Global keyboard shortcuts: Cmd/Ctrl+Z undo (when no modal open),
-  // Esc to close overlays, Left/Right to nav within the modal.
+  // Keyboard shortcuts. Cmd/Ctrl+Z used to trigger undo; that's gone now.
   useEffect(() => {
     const handleKeydown = (e) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "z" && !modalItem) {
-        e.preventDefault();
-        performUndo();
-      }
       if (e.key === "Escape") {
         if (showSystemPrompt) setShowSystemPrompt(false);
         else if (modalItem) closeModal();
@@ -106,57 +91,31 @@ export default function App() {
     };
     window.addEventListener("keydown", handleKeydown);
     return () => window.removeEventListener("keydown", handleKeydown);
-  }, [modalItem, showSystemPrompt, closeModal, navigateModal, performUndo]);
+  }, [modalItem, showSystemPrompt, closeModal, navigateModal]);
 
-  // Keep the modal in sync with the underlying item when it gets edited.
-  const syncModalIfMatching = (id, updater) => {
-    if (modalItem?.id === id) setModalItem((m) => updater(m));
+  // Mutation handlers. Wrap useSvgs mutations with try/catch so we can
+  // surface errors via the toast (the hook already rolls back local state).
+  const wrapMutation = (fn) => async (...args) => {
+    try {
+      await fn(...args);
+    } catch (e) {
+      showToast(`Error: ${e.message ?? e}`);
+    }
   };
 
-  const updateStatus = (id, status) => {
-    setItemsWithUndo((prev) =>
-      prev.map((item) => (item.id === id ? { ...item, status } : item))
-    );
-    syncModalIfMatching(id, (m) => ({ ...m, status }));
-  };
+  const updateStatus = wrapMutation(svgs.updateStatus);
+  const updateNotes = wrapMutation(svgs.updateNotes);
+  const updateColor = wrapMutation(svgs.updateColor);
 
-  const updateNotes = (id, notes) => {
-    setItemsWithUndo((prev) =>
-      prev.map((item) => (item.id === id ? { ...item, notes } : item))
-    );
-    syncModalIfMatching(id, (m) => ({ ...m, notes }));
-  };
-
-  const updateColor = (id, colorTag) => {
-    setItemsWithUndo((prev) =>
-      prev.map((item) => (item.id === id ? { ...item, colorTag } : item))
-    );
-    syncModalIfMatching(id, (m) => ({ ...m, colorTag }));
-  };
-
-  // Adding feedback to a draft auto-promotes it to "revised". Other statuses
-  // keep their existing status when feedback is added.
-  const addFeedback = (id) => {
+  const addFeedback = async (id) => {
     if (!feedbackText.trim()) return;
-    const entry = { text: feedbackText.trim(), date: new Date().toISOString() };
-    setItemsWithUndo((prev) =>
-      prev.map((item) =>
-        item.id === id
-          ? {
-              ...item,
-              feedback: [...item.feedback, entry],
-              status: item.status === "draft" ? "revised" : item.status,
-            }
-          : item
-      )
-    );
-    syncModalIfMatching(id, (m) => ({
-      ...m,
-      feedback: [...m.feedback, entry],
-      status: m.status === "draft" ? "revised" : m.status,
-    }));
-    setFeedbackText("");
-    showToast("Feedback saved");
+    try {
+      await svgs.addFeedback(id, feedbackText);
+      setFeedbackText("");
+      showToast("Feedback saved");
+    } catch (e) {
+      showToast(`Error: ${e.message ?? e}`);
+    }
   };
 
   // Filter solo behavior: clicking a status when all are shown solos that
@@ -172,20 +131,22 @@ export default function App() {
     });
   };
 
-  const handleAllDraftsToIdea = () => {
-    setItemsWithUndo((prev) =>
-      prev.map((item) => (item.status === "draft" ? { ...item, status: "idea_only" } : item))
-    );
-    showToast("All drafts \u2192 idea only");
+  const handleAllDraftsToIdea = async () => {
+    try {
+      await svgs.promoteAllDraftsToIdea();
+      showToast("All drafts \u2192 idea only");
+    } catch (e) {
+      showToast(`Error: ${e.message ?? e}`);
+    }
   };
 
-  // Stub handlers for the generation pipeline. The real implementation
-  // ships in Task 8 (GeneratePanel + Vercel proxy + Modal). For now these
-  // just toast so the UI buttons remain visible and clickable but inert.
+  // Stub handlers for the generation pipeline. The Modal function exists
+  // (Task 3) but the Vercel proxy and React UI ship in Tasks 6 and 7.
   const handleGenerateMore = () => {
-    showToast("Generation pipeline ships in Phase 3");
+    showToast("Generation UI ships in Phase 3");
   };
   const handleDownloadApproved = () => {
+    if (!items) return;
     const approved = items.filter((item) => item.status === "approved");
     if (!approved.length) {
       showToast("No approved SVGs");
@@ -193,10 +154,26 @@ export default function App() {
     }
     showToast("Export pipeline ships in Phase 4");
   };
-  const handleSendToClaude = (item) => {
-    void item;
-    showToast("Generation pipeline ships in Phase 3");
+  const handleSendToClaude = () => {
+    showToast("Generation UI ships in Phase 3");
   };
+
+  // Loading / error states for the initial data load (separate from the
+  // auth gate above). Mutation errors get surfaced via toast in the
+  // wrapMutation helpers.
+  if (svgs.loading && !items) {
+    return <CenteredMessage>Loading library...</CenteredMessage>;
+  }
+  if (svgs.error && !items) {
+    return (
+      <CenteredMessage>
+        Failed to load: {svgs.error.message ?? String(svgs.error)}
+      </CenteredMessage>
+    );
+  }
+  if (!items) {
+    return <CenteredMessage>No items.</CenteredMessage>;
+  }
 
   const visibleItems = getVisibleItems();
   const statusCounts = STATUSES.reduce((acc, status) => {
@@ -218,8 +195,8 @@ export default function App() {
 
       <Header
         itemCount={items.length}
-        hasUndo={hasUndo}
-        onUndo={performUndo}
+        userEmail={user.email}
+        onSignOut={onSignOut}
         onGenerateMore={handleGenerateMore}
         onShowSystemPrompt={() => setShowSystemPrompt(true)}
         onDownloadApproved={handleDownloadApproved}
@@ -243,7 +220,7 @@ export default function App() {
       <SvgGrid
         items={visibleItems}
         onItemClick={(item) => {
-          setModalItem(item);
+          setModalItemId(item.id);
           setFeedbackText("");
         }}
       />
@@ -270,6 +247,20 @@ export default function App() {
           onClose={() => setShowSystemPrompt(false)}
         />
       )}
+    </div>
+  );
+}
+
+function CenteredMessage({ children }) {
+  return (
+    <div
+      style={{
+        padding: "2rem",
+        textAlign: "center",
+        color: "var(--color-text-secondary)",
+      }}
+    >
+      {children}
     </div>
   );
 }

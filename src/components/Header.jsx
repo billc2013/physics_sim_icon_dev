@@ -1,11 +1,13 @@
-// Top header: title + object count + button cluster (Undo, Generate more,
-// System prompt, Download approved). The action buttons are wired to
-// handlers in App.jsx; in Task 2 the generation/download handlers are
-// stubs that toast a "ships in Phase 3" message.
+// Top header: title + object count + user info + button cluster
+// (Generate more, System prompt, Download approved, Sign out).
+//
+// The "Generate more" and "Download approved" buttons are stubs in Task 3
+// that toast a "ships in Phase 3/4" message until the GeneratePanel UI and
+// zip exporter are built.
 export default function Header({
   itemCount,
-  hasUndo,
-  onUndo,
+  userEmail,
+  onSignOut,
   onGenerateMore,
   onShowSystemPrompt,
   onDownloadApproved,
@@ -34,15 +36,6 @@ export default function Header({
         </span>
       </div>
       <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
-        {hasUndo && (
-          <button
-            onClick={onUndo}
-            style={{ fontSize: 12, color: "var(--color-text-info)" }}
-            title="Ctrl/Cmd+Z"
-          >
-            Undo
-          </button>
-        )}
         <button onClick={onGenerateMore} style={{ fontSize: 13 }}>
           Generate more &#8599;
         </button>
@@ -51,6 +44,21 @@ export default function Header({
         </button>
         <button onClick={onDownloadApproved} style={{ fontSize: 13 }}>
           Download approved &#8599;
+        </button>
+        <span
+          style={{
+            fontSize: 11,
+            color: "var(--color-text-tertiary)",
+            marginLeft: 6,
+          }}
+        >
+          {userEmail}
+        </span>
+        <button
+          onClick={onSignOut}
+          style={{ fontSize: 12, color: "var(--color-text-secondary)" }}
+        >
+          Sign out
         </button>
       </div>
     </div>

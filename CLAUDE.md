@@ -97,7 +97,7 @@ These are intentional design decisions, not bugs:
 
 - **Filter solo behavior.** Clicking a status filter when all are shown solos that status. Clicking the soloed filter restores all four. More intuitive than separate all/none controls.
 - **Idea-only modal variant.** When `status === "idea_only"`, the modal shows a "Notes" textarea (how the concept maps to the physics engine) instead of the feedback form.
-- **In-memory undo (30 deep).** UI-level undo stack for quick reverts. The DB `svg_versions` table is the permanent history — they serve different purposes; keep both.
+- **Per-revision history via the DB.** The `archive_svg_version` trigger snapshots every status/content change to `svg_versions`. The artifact's in-memory undo stack was dropped in Task 3 because "undo" against a shared DB has weird multi-user semantics; a "restore previous version" UI built on `svg_versions` is the planned replacement.
 - **Keyboard nav.** Esc closes modal/system-prompt overlay; ← / → navigate visible items in modal; Cmd/Ctrl+Z triggers undo when no modal is open.
 
 ## Things to know about the existing artifact

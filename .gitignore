@@ -10,8 +10,7 @@ build/
 .env
 .env.local
 .env.*.local
-# Allow the example template
-!.env.local.example
+.env.local.example
 
 # Logs
 logs/

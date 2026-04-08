@@ -2,150 +2,88 @@
 
 Prioritized backlog for migrating the GIST Physics SVG Asset Manager from a single Claude.ai artifact into a deployed full-stack app.
 
-See [CLAUDE.md](CLAUDE.md) for working conventions and [overview_April_7.md](overview_April_7.md) for full architectural context.
+> **Note:** This file (and CLAUDE.md) is gitignored — working notes for Bill and Claude only, not committed to the repo.
+
+See [CLAUDE.md](CLAUDE.md) for working conventions, repo state, and the schema-vs-item-shape mapping. See [overview_April_7.md](overview_April_7.md) for full architectural context.
 
 Status legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
 ---
 
+## Snapshot
+
+Done locally:
+- ✓ Tasks 1, 2, 3, 6, 7
+
+Remaining:
+- Tasks 4, 5, 8, 9, 10
+
+The app works end-to-end on `vercel dev` (login → grid → review → both generate flows → audit log). What's missing is multi-user (Realtime), production deploy, the keep-alive job, Duncan's bootstrap, and the zip export.
+
+**Suggested next-task order from here:**
+1. **Task 9** (deploy) — unlocks Duncan signing up via the production URL
+2. **Task 4** (insert Duncan into project_members) — 10-second SQL after he signs up
+3. **Task 5** (Realtime) — multi-user live sync, biggest UX win once Duncan is in
+4. **Task 8** (keep_alive) — prevents Supabase free tier from pausing
+5. **Task 10** (zip export + final polish)
+
+---
+
 ## Phase 1 — Foundation
 
-### 1. Initialize git repository `[ ]`
+### 1. Initialize git repository `[x]`
 
-**Scope**
-- `git init` in this directory before any code changes
-- `.gitignore` for Node, Vite, .env*, .DS_Store, dist/, coverage/, scripts/seed-output, etc.
-- Initial commit capturing the current 4 files (overview, schema, jsx, CLAUDE.md, Dev_Tasks.md)
-
-**Out of scope**
-- GitHub remote and Vercel hookup (see Task 9)
-
-**Acceptance**
-- Local repo exists, clean working tree, baseline commit recorded
+Done. Initial commit `dd008e5 initial commit`.
 
 ---
 
-### 2. Vite + React scaffold and decompose the monolithic .jsx `[ ]`
+### 2. Vite + React scaffold and decompose the monolithic .jsx `[x]`
 
-Stand up a real Vite project in this directory and break [gist-svg-manager.jsx](gist-svg-manager.jsx) into the component/hook/lib structure described in [CLAUDE.md](CLAUDE.md#file-structure-target). No backend work in this task — Supabase wiring lands in Task 3.
+Done. Commit `e89d109 First major commit -- Vite scaffold + decompose initial single file proof of concept`.
 
-**Scope — Vite scaffold**
-- `npm create vite@latest .` (React + JavaScript template, in place)
-- `npm install`, verify `npm run dev` boots a blank app
-- `npm run build` and `npm run preview` work
+What landed:
+- `npm create vite@latest .` with React + JS template, `npm install`, `npm run dev/build/preview` all work
+- Decomposed into `src/{App.jsx, components/, hooks/, lib/}` per the structure in [CLAUDE.md](CLAUDE.md#actual-file-structure)
+- Inline styles preserved verbatim; theme variables added to `index.css`
+- Cryptic short names expanded (`SC` → `STATUS_CONFIG`, etc.)
+- localStorage bridge replaced `window.storage` (later removed in Task 3)
+- All artifact behaviors preserved (filter solo, idea-only modal, search, color tagging)
 
-**Scope — Decomposition (per [CLAUDE.md](CLAUDE.md#file-structure-target))**
-- `src/main.jsx`, `src/App.jsx`
-- `src/components/`: `SvgGrid.jsx`, `SvgCard.jsx`, `DetailModal.jsx`, `FilterBar.jsx`, `SystemPrompt.jsx`, `GeneratePanel.jsx` (stub — wired in Phase 3)
-- `src/hooks/`: empty placeholder directory (real hooks land in Task 3); or leave the directory uncreated until needed
-- `src/lib/`: `constants.js` (status config, color ramps, categories), `seedData.js` (the SVG_DATA constant verbatim from the artifact)
-- Inline styles preserved verbatim — no Tailwind, no CSS modules, no rewrites
-- Expand cryptic short names (`SC`, `SK`, `vis`, `togFilter`, `fbText`, etc.) to readable identifiers
-- Preserve all artifact behaviors: filter solo logic, idea-only modal variant, 30-deep in-memory undo, keyboard nav, search, status workflow, color tagging
-- No file in `src/` exceeds ~200 lines (excluding seedData.js)
-
-**Scope — Temporary persistence bridge**
-- Replace `window.storage.get/set` (the Claude.ai artifact shim) with `localStorage.getItem/setItem` using the same `gist-svg-v2` storage key
-- This is throwaway code; it's deleted in Task 3 when Supabase queries take over
-- No new abstraction layer — direct `localStorage` calls are fine since they go away
-
-**Out of scope**
-- Supabase client, auth, login UI, seed script (Task 3)
-- Realtime (Task 5)
-- GeneratePanel functionality beyond a stub (Phase 3)
-- Tailwind, TypeScript, ESLint config beyond the Vite default
-- Visual redesign
-
-**Acceptance**
-- `npm run dev` boots and the app behaves identically to the artifact (verify against the Claude.ai version side-by-side)
-- `npm run build` and `npm run preview` succeed
-- `gist-svg-manager.jsx` is now redundant — keep it in the repo for reference for one more task, then delete in Task 3
-- No file in `src/` over ~200 lines (excluding seedData.js)
-- All artifact behaviors preserved
+Note: `gist-svg-manager.jsx` is still on disk as reference. Original Task 3 plan said to delete it; Bill kept it.
 
 ---
 
-### 3. Wire Supabase, ship login UI, seed the database, and build the Modal generate_svg() function `[ ]`
+### 3. Wire Supabase, ship login UI, seed the database, and build the Modal generate_svg() function `[x]`
 
-Connect the decomposed app to the live Supabase project, replace the localStorage bridge with real DB queries, ship the auth gate, **and** build the Modal function that calls Claude. The Modal piece is bundled here because it's isolated (Python, separate deploy) and lets us verify the Claude prompt and cost logging in isolation before the Vercel proxy and UI come together in later tasks.
+Done. Commit `18a61f4 Phase 3 Done -- login, supabase integration, auth, modal pipeline tested`.
 
-**Prerequisites**
-- Task 2 complete
-- Supabase free-tier project exists with [gist-supabase-schema.sql](gist-supabase-schema.sql) applied (confirmed)
-- Bill has the project URL, anon key, and service role key from the Supabase dashboard
-- Bill creates `.env.local` himself using the `.env.local.example` I provide
-- Bill has a Modal account and the `modal` CLI installed locally (`pip install modal`, `modal token new`)
-- Bill has an Anthropic API key (separate from Bill's Pro account if there's billing isolation to maintain)
+What landed:
+- `@supabase/supabase-js` installed; singleton client in [src/lib/supabase.js](src/lib/supabase.js)
+- [src/hooks/useAuth.js](src/hooks/useAuth.js) — session state, sign in/up/out
+- [src/components/LoginPage.jsx](src/components/LoginPage.jsx) — minimal email/password gate
+- [src/hooks/useSvgs.js](src/hooks/useSvgs.js) — loads `svgs_with_details` view + `svg_feedback` rows in parallel, transforms into the artifact's item shape, exposes optimistic mutations
+- localStorage bridge removed
+- In-memory undo stack dropped (DB-side history via `archive_svg_version` trigger is the replacement)
+- [scripts/seed.js](scripts/seed.js) — Node script seeded all 50 SVGs with `created_by = Bill's auth.users.id`
+- Bill bootstrapped into `project_members` as owner via SQL editor
+- [modal_functions/generate_svg.py](modal_functions/generate_svg.py) — Modal function deployed and verified via `modal run`
+- Modal secrets created with names that diverged from the original plan: `anthropic-api` and `supabase_for_svg_gen` (env vars `ANTHROPIC_API_KEY`, `SUPABASE_DATA_URL`, `SUPABASE_SERVICE_ROLE_KEY`)
+- First end-to-end test: generated a `football` SVG via `modal run`, then promoted manually with SQL — exercised the version-archive trigger successfully
 
-**Scope — Supabase client**
-- Install `@supabase/supabase-js`
-- `.env.local.example` with `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`, plus a clearly-marked comment that the service role key goes in a separate env var only set inline when running the seed script
-- `src/lib/supabase.js` — singleton client constructed from `import.meta.env.VITE_SUPABASE_*`
-- `src/hooks/useSupabase.js` — context provider exposing the client (or skip if a plain import is sufficient — decide during implementation)
-
-**Scope — Auth + login UI**
-- `src/hooks/useAuth.js` — session state, signIn, signUp, signOut, `onAuthStateChange` listener
-- Minimal login page component (email/password) gating the rest of the app
-- Logged-out users see the login page; logged-in users see the grid
-
-**Scope — Replace localStorage with Supabase queries**
-- `src/hooks/useSvgs.js` — load `svgs_with_details` view + `svg_feedback` rows in parallel, transform into the artifact's item shape so the existing components don't need rewrites. Exposes status/color/notes/feedback mutations against Postgres.
-- All status/color/notes/feedback writes go through Postgres (optimistic local update + rollback on error)
-- Remove the localStorage bridge from Task 2 entirely
-- Delete `gist-svg-manager.jsx` (no longer needed as reference)
-- **Drop the in-memory undo stack.** With Supabase as source of truth, an undo would have to write the previous row back to the DB, which has weird semantics across users (you'd accidentally undo the other person's edits). DB-side history is still captured automatically via the `archive_svg_version` trigger; we'll surface it as a "restore previous version" UI in a later task once we know what UX makes sense.
-
-**Scope — Bootstrap (manual SQL via Supabase SQL editor)**
-- After Bill ships the local code and signs up via the new login UI, he grabs his `auth.users.id` from the Supabase auth dashboard
-- Bill runs a one-line `INSERT INTO project_members ...` snippet in the Supabase SQL editor (snippet provided by Claude in the run instructions)
-- This bootstrap step has to happen *before* the seed script runs, otherwise RLS blocks Bill from seeing anything
-
-**Scope — Seed script**
-- `scripts/seed.js` — Node script that reads `src/lib/seedData.js` and inserts the 50 SVGs into `physics_svgs`
-- Run once locally with `SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... node scripts/seed.js`
-- Service role key never written to disk; script is idempotent (skip rows where `name` already exists)
-- Script is committed; the env vars to run it are not
-- Verify what `created_by` allows for system-seeded rows (NULL vs placeholder) — handle accordingly
-
-**Scope — Modal `generate_svg()` function**
-- `modal_functions/generate_svg.py` — Python function that:
-  - Uses the system prompt template from [src/lib/constants.js](src/lib/constants.js) (port the `buildSystemPrompt` text into Python verbatim — single source of truth lives in JS for now, Python mirrors it)
-  - Builds final prompt: system prompt + library context + feedback history + color palette constraint + current SVG markup
-  - Calls Claude API (`claude-sonnet-4-20250514`) with streaming
-  - Logs token usage and computed `cost_usd` to `generation_sessions` (status `pending` → `completed`/`failed`)
-  - Returns the generated SVG (or streams it — exact return shape decided during implementation based on Modal's SSE story)
-- Modal secrets:
-  - `modal secret create anthropic-secret ANTHROPIC_API_KEY=sk-ant-...`
-  - `modal secret create supabase-gist-credentials SUPABASE_GIST_URL=... SUPABASE_GIST_SERVICE_ROLE_KEY=...`
-- Deployed to Modal via `modal deploy modal_functions/generate_svg.py`
-- Verifiable in isolation (no Vercel, no React UI yet) — call directly with `modal run` or via the Modal endpoint URL using curl
-
-**Out of scope**
-- Vercel `api/generate.ts` proxy (Task 6)
-- GeneratePanel React UI (Task 7)
-- Realtime subscriptions (Task 5)
-- Inserting Bill + Duncan into `project_members` (Task 4 — happens after they sign up)
-- `keep_alive` Modal cron (Task 8)
-- Vercel deploy (Task 9)
-
-**Acceptance**
-- Logged-out users see the login page
-- After Bill + Duncan sign up and Task 4 inserts them into `project_members`, they see the seeded grid
-- All status/color/notes/feedback edits round-trip through the DB
-- Both browsers see the same data on reload (no longer dependent on localStorage)
-- `localStorage` is gone from the runtime path
-- `modal run modal_functions/generate_svg.py` (or equivalent test invocation) returns a valid 64×64 SVG for a test prompt
-- A `generation_sessions` row is created with non-null `input_tokens`, `output_tokens`, and `cost_usd`
+Discoveries (now reflected in CLAUDE.md):
+- The `feedback_with_author` view drops `author_id`, so `useSvgs` reads raw `svg_feedback` rows directly. Switch to the view in a later task when we want to display "Duncan said..." attribution.
+- The `useFeedback.js` hook from the original plan got rolled into `useSvgs.js` because feedback is part of the item shape — splitting them would have meant maintaining two parallel shapes through every component.
 
 ---
 
-### 4. Insert Bill and Duncan into `project_members` `[ ]`
+### 4. Insert Bill and Duncan into `project_members` `[~]`
 
-Tiny one-shot bridge task. Runs only after Task 3 ships and both users have signed up via the new login UI.
+Bill is in. Duncan is not yet.
 
-**Scope**
-- After both signups complete, run a SQL snippet (Supabase SQL editor) inserting both `auth.users.id` values into `project_members` with `role = 'owner'` and a `display_name`
-- Verify they can read `physics_svgs` from the app
+**Remaining scope**
+- After Duncan signs up via the deployed production URL (waits on Task 9), grab his `auth.users.id` from the Supabase auth dashboard
+- Run a one-line `INSERT INTO project_members (user_id, display_name, role) VALUES (...)` snippet in the Supabase SQL editor with role `owner`
+- Verify Duncan can read `physics_svgs` from the deployed app
 
 **Acceptance**
 - Two owner rows in `project_members`
@@ -155,19 +93,29 @@ Tiny one-shot bridge task. Runs only after Task 3 ships and both users have sign
 
 ## Phase 2 — Realtime sync
 
-### 5. Add Realtime subscriptions to `useSvgs` and `useFeedback` `[ ]`
+### 5. Add Realtime subscriptions to `useSvgs` `[ ]`
 
-Deferred from Task 3 to keep that PR scoped to plain reads/writes. Once we know basic queries work, add Realtime.
+Deferred from Task 3 to keep that PR scoped. Now blocking the multi-user UX (without it, Bill and Duncan see stale data until they refresh).
 
 **Scope**
-- Subscribe to `postgres_changes` on `physics_svgs` and `svg_feedback` in the respective hooks
-- Reconcile incoming events with local state
-- Handle subscription cleanup on unmount and on auth changes
+- Subscribe to `postgres_changes` on `physics_svgs` and `svg_feedback` inside `useSvgs.js`
+- Reconcile incoming events with local state. **Be aware of the item-shape transform:** events arrive as raw schema rows, but local state holds shaped items with `_uuid`, joined `colorTag`, embedded `feedback[]`, etc. Two reasonable approaches:
+  - **(a)** Re-call `refresh()` on any incoming event. Simple, slightly wasteful, fine for 50–100 items.
+  - **(b)** Patch local state surgically by mapping the raw row through `shapeItem()`. Requires fetching the joined view row separately, since `postgres_changes` returns the base table row not the view row. More work.
+- Consider how Realtime interacts with the **optimistic update** pattern in `useSvgs`. When my own UPDATE comes back to me as a Realtime event, I shouldn't double-apply it. Two options:
+  - Diff against current state and skip no-op patches
+  - Track an "in-flight" set keyed by `(table, id)` and ignore events for those rows
+- Handle subscription cleanup on unmount and on auth changes (sign out should close all channels)
 - Verify two browser windows logged in as different users see live updates
 
+**Out of scope**
+- Realtime presence ("Duncan is viewing this item") — backlog
+- Conflict resolution beyond last-write-wins — backlog
+
 **Acceptance**
-- Two-window test: status change, color change, feedback post, notes edit all propagate without refresh
-- Subscriptions don't leak across logout/login
+- Two-window test: status change, color change, feedback post, notes edit, accept-revision all propagate without refresh
+- Subscriptions don't leak across logout/login (no zombie channels in the Supabase dashboard's Realtime metrics)
+- The in-flight Bill-typing-into-the-textbox case doesn't get clobbered by his own UPDATE round-tripping back
 
 ---
 
@@ -175,48 +123,41 @@ Deferred from Task 3 to keep that PR scoped to plain reads/writes. Once we know 
 
 ### 6. Build Vercel serverless proxy `api/generate.ts` `[x]`
 
-**Scope**
-- TypeScript Node function in `api/generate.ts`
-- Validates Supabase JWT from `Authorization: Bearer ...` header
-- Forwards request body to `MODAL_ENDPOINT_URL`, streams SSE response back to client
-- No business logic, no DB writes, no Anthropic key
+Done. Commit `3637657 modal set-up; web feature for updating and creating svgs with llm call enabled`.
 
-**Acceptance**
-- Unauthenticated requests get 401
-- Authenticated requests reach Modal and stream back SVG output
-- Locally testable with `vercel dev`
+What landed:
+- [api/generate.ts](api/generate.ts) — TypeScript Node function
+- Validates Supabase JWT from `Authorization: Bearer ...` header by calling `supabase.auth.getUser(jwt)`
+- **Injects** `requested_by` from the validated user (overrides whatever the client sent)
+- Forwards JSON body to `MODAL_ENDPOINT_URL`
+- Returns 401 / 400 / 502 / 500 with structured error messages
+- `@vercel/node` installed as a devDep for type definitions
+- Improved error message at the end of the dev session reports *which specific* env vars are missing rather than a generic "misconfigured"
+
+Discoveries (now reflected in CLAUDE.md):
+- `vercel dev` reads env vars from the linked **Vercel project's dashboard first**, not `.env.local`. Populating `.env.local` alone is not enough — you have to also `vercel env add ... development` for each var. This took ~30 minutes to debug.
+- Modal endpoint URLs that look like `https://modal.com/apps/<workspace>/main/deployed/<app>` are the **dashboard URLs**, NOT the function endpoint. The real endpoint is `https://<workspace>--<app>-<function-with-hyphens>.modal.run` and is printed by `modal deploy`.
 
 ---
 
 ### 7. Build the GeneratePanel UI — two flows `[x]`
 
-The artifact has two distinct generation entry points and we should preserve that split:
+Done. Same commit as Task 6.
 
-- **Flow A — Generate new object** (Header "Generate more" button): standalone panel with a name field + optional color tag. Submitting calls `/api/generate` with no `svg_id` and no `current_svg`. Accept → INSERT into `physics_svgs`.
-- **Flow B — Revise existing object** (DetailModal "Send to Claude" button): uses the open modal item's name, feedback history, color tag, and current SVG markup as context. Submitting calls `/api/generate` with the existing `svg_id`. Accept → UPDATE the row, which auto-archives the prior version via the `archive_svg_version` trigger.
+What landed:
+- [src/hooks/useGeneration.js](src/hooks/useGeneration.js) — state machine: `idle → generating → ready/error`. App holds two instances (`newGeneration`, `reviseGeneration`) so the two flows don't collide.
+- [src/components/GenerateNewModal.jsx](src/components/GenerateNewModal.jsx) — Flow A overlay, name input + color picker + preview + accept/discard. Includes name normalization (lowercase + snake_case) and collision detection against `existingNames`.
+- [src/components/DetailModal.jsx](src/components/DetailModal.jsx) extended with an inline "Revision preview" panel for Flow B. "Send to Claude" button now wires to a real handler and disables during generation.
+- [src/hooks/useSvgs.js](src/hooks/useSvgs.js) gained `insertSvg` (Flow A accept) and `updateSvgContent` (Flow B accept) mutations. Both set `created_by`/`updated_by` correctly so the version-archive trigger attributes prior versions to the right user.
+- [.env.local.example](.env.local.example) updated with `MODAL_ENDPOINT_URL`
+- [modal_functions/generate_svg.py](modal_functions/generate_svg.py) gained `@modal.fastapi_endpoint` HTTP wrapper that calls `generate_svg.local(...)` internally — preserves the `modal run` test path
 
-The Modal function I wrote in Task 3 already accepts both shapes — `svg_id` is optional, `current_svg` is optional. The UI is responsible for picking which flow it's in and doing the right INSERT/UPDATE on accept.
+Verified end-to-end via `vercel dev`:
+- Flow A: typed `coffee_mug`, generated, accepted → new draft card appeared in grid, row in `physics_svgs`, row in `generation_sessions`
+- Flow B: opened `bowling_ball`, sent to Claude, accepted → version bumped, prior version archived to `svg_versions`, status promoted draft→revised
+- Collision path: typing `football` disabled the Generate button and offered "Open it to revise" jump
 
-**Scope**
-- Replace the Task 2 stub in `src/components/GeneratePanel.jsx` with a real component (Flow A)
-- Wire the existing DetailModal "Send to Claude" button to a parallel revision UI (Flow B) — likely an inline preview within the modal rather than a separate panel
-- Both flows POST to `/api/generate` with the Supabase auth token in the `Authorization` header
-- Preview the streamed SVG response inline (large, rendered)
-- Both flows include "Accept" and "Revise again" actions
-- **Name collision handling for Flow A:** validate the entered name against the in-memory library on input change. If it collides, disable submit and offer "Revise existing instead?" as a one-click jump to Flow B for that item. (We hit this manually with the football — the unique constraint on `physics_svgs.name` will reject the INSERT, so we want to catch it before the round trip.)
-- On accept (Flow A INSERT), set `created_by = auth.uid()` and `updated_by = auth.uid()`
-- On accept (Flow B UPDATE), set `updated_by = auth.uid()` so the version-archive trigger attributes the prior version to the right user
-- After accept, refresh `useSvgs` so the grid reflects the new/updated item
-
-**Out of scope**
-- Diff viewer between `svg_versions` entries (backlog item)
-- Multi-turn chat-style refinement (Revise just sends a fresh request with accumulated feedback, same as the artifact)
-
-**Acceptance**
-- Flow A: typing a fresh name + clicking Generate produces a preview, Accept inserts a new row, the grid updates without reload
-- Flow A name collision: typing an existing name disables Generate and shows a "revise instead" affordance
-- Flow B: opening a modal item, clicking Send to Claude produces a preview, Accept updates the row, the version is bumped, `svg_versions` gains a snapshot
-- Both flows: a corresponding `generation_sessions` row exists with non-null tokens and cost
+**Note for Task 5:** The optimistic update pattern in `useSvgs` needs to play nicely with Realtime — see notes there.
 
 ---
 
@@ -224,11 +165,17 @@ The Modal function I wrote in Task 3 already accepts both shapes — `svg_id` is
 
 **Scope**
 - `modal_functions/keep_alive.py` — pings the `heartbeat` table once a week so the free-tier Supabase project doesn't pause after 7 days idle
-- Deploy as a Modal scheduled function
+- Reuse the existing `supabase_for_svg_gen` Modal secret (env vars `SUPABASE_DATA_URL`, `SUPABASE_SERVICE_ROLE_KEY`) — no new secret needed
+- Deploy as a Modal scheduled function (`@app.function(schedule=modal.Period(days=7))` or similar)
+
+**Out of scope**
+- Slack/email alerting if the heartbeat fails — backlog
+- Multi-region redundancy — overkill for free tier
 
 **Acceptance**
-- Scheduled, observable in Modal dashboard
-- Heartbeat row updated weekly
+- Function deployed and visible in Modal dashboard with a schedule
+- Heartbeat row's `last_ping` updates after manual `modal run` invocation
+- Document in CLAUDE.md that the cron exists so future Claude doesn't trip over an unfamiliar function
 
 ---
 
@@ -236,37 +183,76 @@ The Modal function I wrote in Task 3 already accepts both shapes — `svg_id` is
 
 ### 9. Push to GitHub and set up Vercel auto-deploy `[ ]`
 
+This unblocks Duncan signing up (Task 4). Probably the most "yak shaving for the value" task in the backlog.
+
+**Prerequisites**
+- Bill has a GitHub account and can create a new repo
+- The Vercel project is already linked locally (`.vercel/project.json` shows `bill-churchs-projects/physics-sim-icon-dev`)
+
 **Scope**
-- Create GitHub repo, add remote, push `main`
-- Connect the GitHub repo to Vercel
-- Configure Vercel env vars (`VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`, `MODAL_ENDPOINT_URL`)
-- `vercel.json` if any rewrite/header customization is needed
+- Create GitHub repo (Bill creates it via UI; Claude provides the `git remote add` + push commands)
+- Decide what to commit vs. what stays local-only:
+  - Currently gitignored: `CLAUDE.md`, `Dev_Tasks.md`, `.env*`, `gist-supabase-schema.sql`. Confirm Bill wants this state for the public repo, or pull the schema back in.
+  - Add `__pycache__/` to gitignore if not already (Modal creates these locally)
+  - Decide whether `.env.local.example` should be committed (it's a useful onboarding doc with no secrets — recommend unignoring it for the deploy)
+- Push `main` to GitHub
+- Connect the GitHub repo to Vercel (already linked locally so this should be a few clicks in the dashboard)
+- **Configure Vercel env vars at `production` scope** (NOT just `development`):
+  - `VITE_SUPABASE_URL`
+  - `VITE_SUPABASE_ANON_KEY`
+  - `MODAL_ENDPOINT_URL`
+  - Use `vercel env add <name> production` from the CLI for each
+- Possibly add `vercel.json` if a rewrite/header is needed (probably not)
 - Verify push to `main` triggers a deploy
+- Smoke-test the production URL: sign up as Duncan, sign in as Bill, generate something, accept it
+
+**Out of scope**
+- GitHub Actions / CI beyond Vercel's built-in
+- Branch protection, code review requirements
+- Custom domain (use the default `*.vercel.app` URL for now)
 
 **Acceptance**
-- Production URL works end-to-end with auth, realtime, and generation
+- Production URL works end-to-end with auth, generation (both flows), and persistence
+- Pushing to `main` redeploys automatically
+- Duncan can sign up via the production URL (Task 4 then unblocks)
 
 ---
 
-### 10. End-to-end test: generate, review, approve, export zip `[ ]`
+### 10. End-to-end test + zip export of approved SVGs `[ ]`
 
 **Scope**
-- Walk through a full session: log in, generate a new object, give feedback, revise, approve
-- Export approved SVGs as a zip (small client-side helper, JSZip is fine)
+- Walk through a full session against production: log in, generate a new object, give feedback, revise, approve
+- Implement zip export of approved SVGs (small client-side helper, JSZip is fine — `npm install jszip`)
+- Wire up the existing "Download approved" Header button (currently a stub that toasts "ships in Phase 4")
+- Each SVG in the zip named after `physics_svgs.name` (e.g. `wooden_block.svg`)
+- Optionally include a `feedback-log.json` per the original artifact's design
+
+**Out of scope**
+- Per-status export, per-color export — backlog
+- Server-side zip generation — pointless for ~50 small SVGs
 
 **Acceptance**
-- Zip downloads, contains valid SVG files named after `physics_svgs.name`
-- All approved items present
+- Zip downloads from production
+- Contains valid SVG files with the right names
+- All approved items present, no unapproved leakage
 
 ---
 
 ## Backlog / nice-to-have (not yet scheduled)
 
-- Tailwind migration (if/when inline styles become painful)
-- Keyboard shortcut overlay (`?` to view bindings)
-- Bulk approve / bulk re-tag color
-- Per-user "favorites" or "needs my review" filter
-- Diff viewer between `svg_versions` entries
-- Export to Planck.js-compatible JSON manifest
-- ESLint + Prettier config
-- A small test setup (Vitest) once the surface is stable
+- **Restore-previous-version UI** built on `svg_versions`. Replaces the in-memory undo we dropped in Task 3.
+- **Diff viewer** between `svg_versions` entries (visual side-by-side or text diff of the SVG markup).
+- **Realtime presence** ("Duncan is viewing wooden_block right now").
+- **Author attribution on feedback** — switch `useSvgs` from raw `svg_feedback` reads to the `feedback_with_author` view and surface "Duncan said..." in the feedback history block. (Currently we don't because the view drops `author_id`.)
+- **Tailwind migration** if/when inline styles become painful.
+- **Keyboard shortcut overlay** (`?` to view bindings).
+- **Bulk approve / bulk re-tag color.**
+- **Per-user "favorites" or "needs my review" filter.**
+- **Export to Planck.js-compatible JSON manifest** (different shape than the raw zip — feeds the simulation pipeline directly).
+- **ESLint + Prettier config standardization** (current config is Vite default + Bill's tweaks).
+- **Vitest test setup** once the surface is stable.
+- **Move the system prompt to a single source of truth** (shared `.txt` file or Supabase config table) once it starts changing frequently. Currently duplicated in JS and Python with a comment reminder.
+- **Streaming generation responses** (Modal SSE → Vercel SSE → React EventSource). Cooler UX than the current 5–15s spinner. Deferred from Task 7.
+- **Delete the `GeneratePanel.jsx` stub** left over from Task 2 (Flow A is in `GenerateNewModal.jsx` instead).
+- **Delete `gist-svg-manager.jsx`** once it's no longer useful as reference.
+- **Modal-side defense in depth:** add `requires_proxy_auth=True` to `generate_svg_http` and rotate Modal API tokens through Vercel. Currently relies on URL secrecy.

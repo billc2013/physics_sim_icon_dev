@@ -43,3 +43,8 @@ scripts/seed-output/
 gist-supabase-schema.sql
 .vercel
 .env*.local
+
+CLAUDE.md
+Dev_Tasks.md
+
+__pycache__/*/

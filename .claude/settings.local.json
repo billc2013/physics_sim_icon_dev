@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la *.jsx *.md *.sql)",
+      "Bash(ls -la .env*)"
+    ]
+  }
+}

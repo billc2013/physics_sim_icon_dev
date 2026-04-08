@@ -45,6 +45,7 @@ import os
 from typing import Optional
 
 import modal
+from pydantic import BaseModel
 
 app = modal.App("gist-generate-svg")
 
@@ -56,10 +57,25 @@ OUTPUT_PRICE_PER_MTOK = 15.00
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
 
 # The container image: Python with the two HTTP clients we need.
+# fastapi/pydantic come with Modal but we pin them here so the local parse
+# of this file (during `modal deploy`) can also see pydantic.
 image = modal.Image.debian_slim(python_version="3.12").pip_install(
     "anthropic==0.39.0",
     "supabase==2.9.1",
+    "fastapi==0.115.0",
+    "pydantic==2.9.2",
 )
+
+
+class GenerateRequest(BaseModel):
+    """Request body shape for the HTTP endpoint. Mirrors generate_svg's args."""
+
+    object_name: str
+    requested_by: str
+    svg_id: Optional[str] = None
+    feedback_history: Optional[list[str]] = None
+    color_palette: Optional[dict] = None
+    current_svg: Optional[str] = None
 
 
 def build_system_prompt(library_names: list[str]) -> str:
@@ -252,6 +268,44 @@ def generate_svg(
             }
         ).eq("id", session_id).execute()
         raise
+
+
+@app.function(
+    image=image,
+    secrets=[
+        modal.Secret.from_name("anthropic-api"),
+        modal.Secret.from_name("supabase_for_svg_gen"),
+    ],
+    timeout=120,
+)
+@modal.fastapi_endpoint(method="POST")
+def generate_svg_http(payload: GenerateRequest) -> dict:
+    """
+    HTTPS POST endpoint version of generate_svg. Called by the Vercel proxy
+    `api/generate.ts`. The Vercel function validates the user's Supabase JWT
+    and sets `requested_by` from the authenticated user_id before forwarding,
+    so the browser cannot impersonate another user.
+
+    Body: GenerateRequest (see Pydantic model above).
+
+    Auth: NONE at the Modal layer for v1. The endpoint URL lives only in
+    Vercel env vars; the browser never sees it. If we ever need stronger
+    isolation we can add `requires_proxy_auth=True` and rotate Modal API
+    tokens through Vercel.
+
+    Deploy:
+        modal deploy modal_functions/generate_svg.py
+    Modal will print the new endpoint URL on stdout. Copy it into Vercel as
+    `MODAL_ENDPOINT_URL`.
+    """
+    return generate_svg.local(
+        object_name=payload.object_name,
+        requested_by=payload.requested_by,
+        svg_id=payload.svg_id,
+        feedback_history=payload.feedback_history,
+        color_palette=payload.color_palette,
+        current_svg=payload.current_svg,
+    )
 
 
 @app.local_entrypoint()

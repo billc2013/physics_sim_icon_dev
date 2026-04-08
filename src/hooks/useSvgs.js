@@ -190,6 +190,62 @@ export function useSvgs(user) {
     [findUuid, items, optimisticUpdate, user]
   );
 
+  // Insert a brand-new SVG into the library. Used by Flow A in
+  // GenerateNewModal after the user accepts a Claude-generated SVG.
+  // Returns the inserted item id (the schema's `name`) on success.
+  const insertSvg = useCallback(
+    async ({ name, displayName, svgContent }) => {
+      if (!user) return null;
+      const { error: dbError } = await supabase.from("physics_svgs").insert({
+        name,
+        display_name: displayName,
+        svg_content: svgContent,
+        status: "draft",
+        notes: "",
+        created_by: user.id,
+        updated_by: user.id,
+      });
+      if (dbError) throw dbError;
+      // Reload so the new row appears in the grid.
+      await refresh();
+      return name;
+    },
+    [refresh, user]
+  );
+
+  // Replace the SVG markup of an existing item. Used by Flow B in
+  // DetailModal after the user accepts a revision. The
+  // `archive_svg_version` trigger automatically snapshots the prior
+  // version into svg_versions and bumps the version number.
+  //
+  // Promotes draft -> revised so the badge reflects the change.
+  const updateSvgContent = useCallback(
+    async (id, newSvgContent) => {
+      const uuid = findUuid(id);
+      if (!uuid || !user) return;
+      const item = items?.find((i) => i.id === id);
+      if (!item) return;
+      const promotedStatus = item.status === "draft" ? "revised" : item.status;
+
+      await optimisticUpdate(
+        id,
+        { svg: newSvgContent, status: promotedStatus },
+        async () => {
+          const { error: dbError } = await supabase
+            .from("physics_svgs")
+            .update({
+              svg_content: newSvgContent,
+              status: promotedStatus,
+              updated_by: user.id,
+            })
+            .eq("id", uuid);
+          if (dbError) throw dbError;
+        }
+      );
+    },
+    [findUuid, items, optimisticUpdate, user]
+  );
+
   // Bulk action: promote every draft to idea_only. One UPDATE statement.
   const promoteAllDraftsToIdea = useCallback(async () => {
     if (!user || !items) return;
@@ -219,5 +275,7 @@ export function useSvgs(user) {
     updateColor,
     addFeedback,
     promoteAllDraftsToIdea,
+    insertSvg,
+    updateSvgContent,
   };
 }

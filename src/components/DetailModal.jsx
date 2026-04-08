@@ -7,6 +7,11 @@ import FeedbackHistory from "./FeedbackHistory.jsx";
 //  - normal: shows feedback form for revision notes
 //  - idea_only: shows a Notes textarea (how the concept maps to the
 //    physics engine, e.g. rope -> distance joint), no feedback form
+//
+// Generation (Flow B) is overlaid as an inline preview area below the
+// existing SVG when the parent's `generation` prop transitions out of
+// 'idle'. The user can Accept (UPDATE the row, archives prior version
+// via the trigger), Try again, or Discard.
 export default function DetailModal({
   item,
   feedbackText,
@@ -19,6 +24,9 @@ export default function DetailModal({
   onPrevious,
   onNext,
   onSendToClaude,
+  generation,
+  onAcceptRevision,
+  onDiscardRevision,
 }) {
   const textareaRef = useRef(null);
   const isIdeaOnly = item.status === "idea_only";
@@ -102,6 +110,83 @@ export default function DetailModal({
             style={{ width: 180, height: 180, margin: "0 auto" }}
           />
         </div>
+
+        {generation?.status === "error" && generation.error && (
+          <div
+            style={{
+              marginBottom: 12,
+              padding: "8px 10px",
+              borderRadius: "var(--border-radius-md)",
+              background: "#FECACA",
+              color: "#991B1B",
+              fontSize: 12,
+            }}
+          >
+            {generation.error.message ?? String(generation.error)}
+          </div>
+        )}
+
+        {generation?.status === "ready" && generation.result && (
+          <div
+            style={{
+              marginBottom: 16,
+              padding: 12,
+              borderRadius: "var(--border-radius-md)",
+              border: "1px solid var(--color-border-secondary)",
+            }}
+          >
+            <div
+              style={{
+                fontSize: 12,
+                fontWeight: 500,
+                color: "var(--color-text-secondary)",
+                marginBottom: 6,
+              }}
+            >
+              Revision preview
+            </div>
+            <div
+              style={{
+                background: "var(--color-background-secondary)",
+                borderRadius: "var(--border-radius-md)",
+                padding: 24,
+                textAlign: "center",
+                marginBottom: 8,
+              }}
+            >
+              <div
+                dangerouslySetInnerHTML={{ __html: generation.result.svg }}
+                style={{ width: 180, height: 180, margin: "0 auto" }}
+              />
+            </div>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+              }}
+            >
+              <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>
+                {generation.result.input_tokens}+{generation.result.output_tokens} tokens
+                &middot; ${generation.result.cost_usd.toFixed(4)}
+              </span>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button onClick={onDiscardRevision} style={{ fontSize: 12 }}>
+                  Discard
+                </button>
+                <button onClick={() => onSendToClaude(item)} style={{ fontSize: 12 }}>
+                  Try again
+                </button>
+                <button
+                  onClick={() => onAcceptRevision(item.id, generation.result.svg)}
+                  style={{ fontSize: 12, fontWeight: 500 }}
+                >
+                  Accept
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         <div style={{ display: "flex", gap: 6, marginBottom: 12, flexWrap: "wrap" }}>
           {STATUSES.map((status) => {
@@ -216,8 +301,14 @@ export default function DetailModal({
           >
             &larr; Previous
           </button>
-          <button onClick={() => onSendToClaude(item)} style={{ fontSize: 12 }}>
-            Send to Claude &#8599;
+          <button
+            onClick={() => onSendToClaude(item)}
+            disabled={generation?.status === "generating"}
+            style={{ fontSize: 12 }}
+          >
+            {generation?.status === "generating"
+              ? "Generating..."
+              : "Send to Claude \u2197"}
           </button>
           <button
             onClick={onNext}

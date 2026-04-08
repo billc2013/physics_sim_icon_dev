@@ -173,7 +173,7 @@ Deferred from Task 3 to keep that PR scoped to plain reads/writes. Once we know 
 
 ## Phase 3 — Generation pipeline
 
-### 6. Build Vercel serverless proxy `api/generate.ts` `[ ]`
+### 6. Build Vercel serverless proxy `api/generate.ts` `[x]`
 
 **Scope**
 - TypeScript Node function in `api/generate.ts`
@@ -188,7 +188,7 @@ Deferred from Task 3 to keep that PR scoped to plain reads/writes. Once we know 
 
 ---
 
-### 7. Build the GeneratePanel UI — two flows `[ ]`
+### 7. Build the GeneratePanel UI — two flows `[x]`
 
 The artifact has two distinct generation entry points and we should preserve that split:
 

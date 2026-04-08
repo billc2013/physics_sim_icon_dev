@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm ls:*)",
+      "Bash(npm audit:*)",
+      "Bash(grep -c \"createClient\\\\|supabase\\\\|VercelRequest\\\\|generate.ts\" dist/assets/index-*.js)",
+      "Bash(grep -o \"react@[0-9.]*\" dist/assets/index-*.js)",
+      "Bash(grep -c \"REACT_PRODUCTION\\\\|react-dom\" dist/assets/index-*.js)",
+      "Bash(wc -l src/App.jsx src/components/*.jsx src/hooks/*.js src/lib/*.js api/*.ts modal_functions/*.py)"
+    ]
+  }
+}

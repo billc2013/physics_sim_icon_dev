@@ -1,7 +1,8 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { STATUSES, buildSystemPrompt } from "./lib/constants.js";
 import { useAuth } from "./hooks/useAuth.js";
 import { useSvgs } from "./hooks/useSvgs.js";
+import { useGeneration } from "./hooks/useGeneration.js";
 import LoginPage from "./components/LoginPage.jsx";
 import Header from "./components/Header.jsx";
 import Toast from "./components/Toast.jsx";
@@ -9,6 +10,7 @@ import FilterBar from "./components/FilterBar.jsx";
 import SvgGrid from "./components/SvgGrid.jsx";
 import DetailModal from "./components/DetailModal.jsx";
 import SystemPrompt from "./components/SystemPrompt.jsx";
+import GenerateNewModal from "./components/GenerateNewModal.jsx";
 
 export default function App() {
   const auth = useAuth();
@@ -28,12 +30,20 @@ export default function App() {
 function SignedInApp({ user, onSignOut }) {
   const svgs = useSvgs(user);
 
+  // Two independent useGeneration instances so Flow A and Flow B don't
+  // step on each other (you could be reviewing one item's revision while
+  // also having a "Generate new" panel open). Each tracks its own status,
+  // result, and error state.
+  const newGeneration = useGeneration();
+  const reviseGeneration = useGeneration();
+
   // UI state.
   const [modalItemId, setModalItemId] = useState(null);
   const [filters, setFilters] = useState(new Set(STATUSES));
   const [search, setSearch] = useState("");
   const [feedbackText, setFeedbackText] = useState("");
   const [showSystemPrompt, setShowSystemPrompt] = useState(false);
+  const [showGenerateNew, setShowGenerateNew] = useState(false);
   const [toast, setToast] = useState(null);
   const toastTimerRef = useRef(null);
 
@@ -46,7 +56,17 @@ function SignedInApp({ user, onSignOut }) {
   const closeModal = useCallback(() => {
     setModalItemId(null);
     setFeedbackText("");
-  }, []);
+    reviseGeneration.reset();
+  }, [reviseGeneration]);
+
+  const openModalForId = useCallback(
+    (id) => {
+      setModalItemId(id);
+      setFeedbackText("");
+      reviseGeneration.reset();
+    },
+    [reviseGeneration]
+  );
 
   // Filter + search applied to items, in render order. Memoised against
   // the items array reference so we don't re-filter on unrelated renders.
@@ -72,11 +92,10 @@ function SignedInApp({ user, onSignOut }) {
       const index = visible.findIndex((x) => x.id === modalItem.id);
       const next = visible[index + direction];
       if (next) {
-        setModalItemId(next.id);
-        setFeedbackText("");
+        openModalForId(next.id);
       }
     },
-    [modalItem, getVisibleItems]
+    [modalItem, getVisibleItems, openModalForId]
   );
 
   // Keyboard shortcuts. Cmd/Ctrl+Z used to trigger undo; that's gone now.
@@ -140,11 +159,73 @@ function SignedInApp({ user, onSignOut }) {
     }
   };
 
-  // Stub handlers for the generation pipeline. The Modal function exists
-  // (Task 3) but the Vercel proxy and React UI ship in Tasks 6 and 7.
+  // ---------- Generation handlers ----------
+
+  // Names already in the library, used by Flow A for collision detection.
+  const existingNames = useMemo(
+    () => new Set((items ?? []).map((i) => i.id)),
+    [items]
+  );
+
+  // Flow A: open the "generate new" modal.
   const handleGenerateMore = () => {
-    showToast("Generation UI ships in Phase 3");
+    newGeneration.reset();
+    setShowGenerateNew(true);
   };
+  const handleCloseGenerateNew = () => {
+    setShowGenerateNew(false);
+    newGeneration.reset();
+  };
+  const handleNewGenerate = async ({ objectName, colorTag }) => {
+    await newGeneration.generate({ objectName, colorTag });
+  };
+  const handleNewAccept = async ({ name, displayName, svgContent }) => {
+    try {
+      await svgs.insertSvg({ name, displayName, svgContent });
+      showToast(`Added "${displayName}"`);
+    } catch (e) {
+      showToast(`Error: ${e.message ?? e}`);
+      throw e; // let GenerateNewModal stay open so the user can retry
+    }
+  };
+  // If the user types a name that already exists, give them a one-click
+  // jump to the detail modal so they can revise instead.
+  const handleJumpToExisting = (name) => {
+    handleCloseGenerateNew();
+    openModalForId(name);
+  };
+
+  // Flow B: send the currently-open detail modal item to Claude for revision.
+  // Builds the context from the item's existing feedback + any pending
+  // unsaved feedbackText the user has typed.
+  const handleSendToClaude = async (item) => {
+    const feedbackHistory = item.feedback.map((f) => f.text);
+    if (feedbackText.trim()) feedbackHistory.push(feedbackText.trim());
+    try {
+      await reviseGeneration.generate({
+        objectName: item.id,
+        colorTag: item.colorTag,
+        svgId: item._uuid,
+        feedbackHistory: feedbackHistory.length ? feedbackHistory : null,
+        currentSvg: item.svg,
+      });
+    } catch (e) {
+      showToast(`Error: ${e.message ?? e}`);
+    }
+  };
+  const handleAcceptRevision = async (id, newSvg) => {
+    try {
+      await svgs.updateSvgContent(id, newSvg);
+      reviseGeneration.reset();
+      showToast("Revision saved");
+    } catch (e) {
+      showToast(`Error: ${e.message ?? e}`);
+    }
+  };
+  const handleDiscardRevision = () => {
+    reviseGeneration.reset();
+  };
+
   const handleDownloadApproved = () => {
     if (!items) return;
     const approved = items.filter((item) => item.status === "approved");
@@ -153,9 +234,6 @@ function SignedInApp({ user, onSignOut }) {
       return;
     }
     showToast("Export pipeline ships in Phase 4");
-  };
-  const handleSendToClaude = () => {
-    showToast("Generation UI ships in Phase 3");
   };
 
   // Loading / error states for the initial data load (separate from the
@@ -219,10 +297,7 @@ function SignedInApp({ user, onSignOut }) {
 
       <SvgGrid
         items={visibleItems}
-        onItemClick={(item) => {
-          setModalItemId(item.id);
-          setFeedbackText("");
-        }}
+        onItemClick={(item) => openModalForId(item.id)}
       />
 
       {modalItem && (
@@ -238,6 +313,20 @@ function SignedInApp({ user, onSignOut }) {
           onPrevious={() => navigateModal(-1)}
           onNext={() => navigateModal(1)}
           onSendToClaude={handleSendToClaude}
+          generation={reviseGeneration}
+          onAcceptRevision={handleAcceptRevision}
+          onDiscardRevision={handleDiscardRevision}
+        />
+      )}
+
+      {showGenerateNew && (
+        <GenerateNewModal
+          existingNames={existingNames}
+          generation={newGeneration}
+          onGenerate={handleNewGenerate}
+          onAccept={handleNewAccept}
+          onClose={handleCloseGenerateNew}
+          onJumpToExisting={handleJumpToExisting}
         />
       )}
 

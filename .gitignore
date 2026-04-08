@@ -41,3 +41,5 @@ scripts/seed-output/
 
 # sql set-up 
 gist-supabase-schema.sql
+.vercel
+.env*.local

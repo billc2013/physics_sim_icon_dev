@@ -39,3 +39,6 @@ coverage/
 
 # Local seed script output (in case we ever write one)
 scripts/seed-output/
+
+# sql set-up 
+gist-supabase-schema.sql

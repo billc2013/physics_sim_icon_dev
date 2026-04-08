@@ -1,0 +1,85 @@
+/* Theme variables.
+ *
+ * The artifact's inline styles reference Claude.ai-style theme variables.
+ * We define them here so the migrated app renders with the same look.
+ * These names match the artifact 1:1 to keep the inline styles unchanged.
+ */
+:root {
+  /* Text */
+  --color-text-primary: #111827;
+  --color-text-secondary: #4b5563;
+  --color-text-tertiary: #9ca3af;
+  --color-text-success: #166534;
+  --color-text-warning: #92400e;
+  --color-text-info: #1d4ed8;
+
+  /* Backgrounds */
+  --color-background-primary: #ffffff;
+  --color-background-secondary: #f9fafb;
+  --color-background-success: #dcfce7;
+  --color-background-info: #dbeafe;
+
+  /* Borders */
+  --color-border-secondary: #d1d5db;
+  --color-border-tertiary: #e5e7eb;
+  --color-border-success: #86efac;
+
+  /* Shape */
+  --border-radius-md: 6px;
+  --border-radius-lg: 10px;
+
+  /* Type */
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Consolas, Menlo, monospace;
+
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.5;
+  color: var(--color-text-primary);
+  background: var(--color-background-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  cursor: pointer;
+  background: transparent;
+  border: 0.5px solid var(--color-border-tertiary);
+  padding: 4px 10px;
+  border-radius: var(--border-radius-md);
+  color: var(--color-text-primary);
+}
+
+button:hover {
+  border-color: var(--color-border-secondary);
+}
+
+input,
+textarea {
+  font-family: inherit;
+  font-size: inherit;
+  padding: 6px 10px;
+  border: 0.5px solid var(--color-border-tertiary);
+  border-radius: var(--border-radius-md);
+  color: var(--color-text-primary);
+  background: var(--color-background-primary);
+}
+
+input:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--color-border-secondary);
+}

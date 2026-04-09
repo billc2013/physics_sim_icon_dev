@@ -170,6 +170,25 @@ Both flows hit the same backend chain: browser → `/api/generate` (Vercel) → 
 
 App.jsx holds **two independent `useGeneration` instances** (`newGeneration` for Flow A, `reviseGeneration` for Flow B) so they can run concurrently without state collision.
 
+### Model tiers
+
+Both flows let the user pick between two Claude models before firing a generation. The selector is a shared `<ModelTierToggle>` pill switch rendered in both [GenerateNewModal.jsx](src/components/GenerateNewModal.jsx) and [DetailModal.jsx](src/components/DetailModal.jsx).
+
+| Tier       | Model ID              | Price (in/out per MTok) | When to use |
+|------------|-----------------------|-------------------------|-------------|
+| Standard   | `claude-sonnet-4-6`   | $3 / $15                | Default for all generations |
+| Advanced   | `claude-opus-4-6`     | $15 / $75               | Escalate when Standard can't nail the SVG |
+
+Behavior:
+
+- The tier toggle **resets to Standard each time DetailModal opens a new item** (`useEffect` on `item.id`), so Advanced is never sticky across objects. Explicit opt-in per-call prevents accidental runaway Opus spend.
+- The frontend sends `model_tier: "standard" | "advanced"` in the `/api/generate` POST body. The Vercel proxy validates against that allow-list before forwarding (defense in depth — don't trust an arbitrary string from the client).
+- Modal's [generate_svg.py](modal_functions/generate_svg.py) defines `MODEL_TIERS` mapping each tier to `{ model, input_price_per_mtok, output_price_per_mtok }`. The function looks up the tier, uses its model id for the Anthropic call, and uses its pricing in the `cost_usd` audit column.
+- The **UI intentionally does not label which model produced a given SVG** — Bill's call. The attribution lives in the database: `generation_sessions.model` records the resolved model id per call, so dev review can go through the table to see tier usage.
+- Pricing constants in `MODEL_TIERS` are used only for the audit `cost_usd` column, not for real billing. Mild drift vs. Anthropic's actual prices is tolerable; update when they change.
+
+To add/remove/rename a tier, edit both `MODEL_TIERS` in `generate_svg.py` AND the `ALLOWED_MODEL_TIERS` array in `api/generate.ts`, plus the `tiers` array in `ModelTierToggle.jsx`. All three must agree. (If this becomes a recurring chore, move the tier list to a shared JSON file alongside `shared/system_prompt.json`.)
+
 ## Modal secrets and env vars (Bill-specific naming)
 
 These names diverged from the original plan in CLAUDE.md after Bill set them up. Use these:
@@ -197,16 +216,18 @@ Verify with `vercel env ls`. **For Task 9 (production deploy)**, repeat with `pr
 
 The browser-side Vite app reads from `import.meta.env.VITE_*` at build time, which DOES use `.env.local`. So `.env.local` is still load-bearing for the React app — the Vercel-dashboard requirement is only for the `api/` function process.
 
-## System prompt is duplicated
+## System prompt — single source of truth
 
-The Claude generation prompt template lives in TWO places:
+The Claude generation prompt lives in **[shared/system_prompt.json](shared/system_prompt.json)**. Both runtimes read the same file:
 
-- [src/lib/constants.js](src/lib/constants.js) — `buildSystemPrompt(items)` (used to display the current prompt in the SystemPrompt overlay)
-- [modal_functions/generate_svg.py](modal_functions/generate_svg.py) — `build_system_prompt(library_names)` (used for actual Claude calls)
+- [src/lib/constants.js](src/lib/constants.js) — `buildSystemPrompt(items)` imports the JSON at build time and renders it for the SystemPrompt overlay
+- [modal_functions/generate_svg.py](modal_functions/generate_svg.py) — `build_system_prompt(library_names)` reads `/root/system_prompt.json` from inside the Modal container and renders it for actual Claude calls
 
-**They must be kept in sync manually.** A comment in each file reminds you. Bill has edited the JS version since the initial migration (current "People: modeled after traffic sign pictograms, no faces or details" wording) — verify the Python copy matches before generation tasks.
+Shape: `{ header, rules[], librarySection }`. Both renderers prefix each rule with `- ` and substitute `{count}` and `{names}` in `librarySection`. If you change the JSON shape (not the content), update both renderers in lockstep.
 
-If the prompt starts changing frequently, move it to a shared `.txt` file or a Supabase config table. Until then, in-place duplication is fine.
+**Redeploy reminder: editing the JSON requires `modal deploy modal_functions/generate_svg.py`** to push the change to the Python side. The image definition uses `.add_local_file(...)` to bake the JSON into the container, so Modal only sees the version from the last deploy. The Vite side picks up JSON edits on the next dev reload / build automatically.
+
+Expected iteration loop while tuning the prompt: edit `shared/system_prompt.json` → refresh browser to verify the overlay → `modal deploy modal_functions/generate_svg.py` → trigger a generation to test against Claude.
 
 ## SVG conventions
 

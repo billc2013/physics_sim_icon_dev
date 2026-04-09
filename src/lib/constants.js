@@ -1,3 +1,5 @@
+import systemPromptConfig from "../../shared/system_prompt.json";
+
 // Status workflow values, in canonical display order.
 export const STATUSES = ["draft", "revised", "approved", "idea_only"];
 
@@ -29,13 +31,16 @@ export const STORAGE_KEY = "gist-svg-v2";
 
 // Builds the system prompt sent to Claude during generation. Includes the
 // full library of existing object names so Claude can avoid duplicates.
+//
+// Source of truth is shared/system_prompt.json — edited in one place and
+// consumed by both this file (for the SystemPrompt overlay) and by
+// modal_functions/generate_svg.py (for actual Claude calls). After editing
+// the JSON you must run `modal deploy modal_functions/generate_svg.py` for
+// the Python side to pick up the change.
 export function buildSystemPrompt(items) {
-  return `You generate SVG icons for the GIST project (LLM \u2192 JSON \u2192 Planck.js). Rules:
-- 64x64 viewBox, simple silhouettes, Tailwind-inspired fills
-- No external deps, inline styles only
-- Monochromatic 3-tone (light/mid/dark from same hue)
-- People: modeled after traffic sign pictograms, no faces or details
-- Categories: vehicles, projectiles, blocks, people, connectors, planes, pendulums, everyday, lab, space, air resistance
-
-Library (${items.length}): ${items.map((i) => i.id).join(", ")}`;
+  const rules = systemPromptConfig.rules.map((r) => `- ${r}`).join("\n");
+  const library = systemPromptConfig.librarySection
+    .replace("{count}", items.length)
+    .replace("{names}", items.map((i) => i.id).join(", "));
+  return `${systemPromptConfig.header}\n${rules}\n\n${library}`;
 }

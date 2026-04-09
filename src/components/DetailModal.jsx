@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { STATUSES, STATUS_CONFIG } from "../lib/constants.js";
 import ColorPaletteTag from "./ColorPaletteTag.jsx";
 import FeedbackHistory from "./FeedbackHistory.jsx";
+import ModelTierToggle from "./ModelTierToggle.jsx";
 
 // Detail review modal. Two variants:
 //  - normal: shows feedback form for revision notes
@@ -12,6 +13,11 @@ import FeedbackHistory from "./FeedbackHistory.jsx";
 // existing SVG when the parent's `generation` prop transitions out of
 // 'idle'. The user can Accept (UPDATE the row, archives prior version
 // via the trigger), Try again, or Discard.
+//
+// `modelTier` / `onModelTierChange` are owned by the parent (App.jsx) and
+// reset to "standard" whenever a new item is opened, alongside the other
+// per-item state (feedbackText, reviseGeneration). This keeps Advanced
+// from being sticky across items.
 export default function DetailModal({
   item,
   feedbackText,
@@ -27,6 +33,8 @@ export default function DetailModal({
   generation,
   onAcceptRevision,
   onDiscardRevision,
+  modelTier,
+  onModelTierChange,
 }) {
   const textareaRef = useRef(null);
   const isIdeaOnly = item.status === "idea_only";
@@ -174,7 +182,10 @@ export default function DetailModal({
                 <button onClick={onDiscardRevision} style={{ fontSize: 12 }}>
                   Discard
                 </button>
-                <button onClick={() => onSendToClaude(item)} style={{ fontSize: 12 }}>
+                <button
+                  onClick={() => onSendToClaude(item)}
+                  style={{ fontSize: 12 }}
+                >
                   Try again
                 </button>
                 <button
@@ -288,11 +299,23 @@ export default function DetailModal({
 
         <div
           style={{
-            display: "flex",
-            justifyContent: "space-between",
-            marginTop: 8,
+            marginTop: 10,
             borderTop: "0.5px solid var(--color-border-tertiary)",
             paddingTop: 10,
+          }}
+        >
+          <ModelTierToggle
+            value={modelTier}
+            onChange={onModelTierChange}
+            disabled={generation?.status === "generating"}
+          />
+        </div>
+
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            marginTop: 10,
           }}
         >
           <button

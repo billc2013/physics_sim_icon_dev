@@ -34,36 +34,71 @@ DEPLOY
 
 PROMPT TEMPLATE
 ---------------
-The system prompt is duplicated here from src/lib/constants.js
-(`buildSystemPrompt`). The two languages don't share runtime, so when you
-edit one keep the other in sync. The prompt rarely changes; if it starts
-changing often, move it to a shared .txt file or a Supabase config table.
+The system prompt lives in shared/system_prompt.json at the repo root.
+That single file is consumed by both this module (for actual Claude calls)
+and src/lib/constants.js (for the SystemPrompt overlay in the web app).
+
+The JSON is baked into the Modal image via `add_local_file` below, so any
+edit to the JSON requires `modal deploy modal_functions/generate_svg.py`
+to push the new content to Modal. The Vite side picks up edits on the
+next dev reload / build automatically.
 """
 
 import json
 import os
+from pathlib import Path
 from typing import Optional
 
 import modal
 from pydantic import BaseModel
 
+# Resolve the shared system-prompt JSON relative to this file so that
+# `modal deploy` works from any working directory. This is evaluated at
+# parse time on the deploy machine; `add_local_file` below then bakes the
+# file into the container image at /root/system_prompt.json.
+SYSTEM_PROMPT_LOCAL_PATH = (
+    Path(__file__).resolve().parent.parent / "shared" / "system_prompt.json"
+)
+SYSTEM_PROMPT_REMOTE_PATH = "/root/system_prompt.json"
+
 app = modal.App("gist-generate-svg")
 
-# Pricing for claude-sonnet-4-20250514 (USD per million tokens).
-# Update if Anthropic changes their pricing.
-INPUT_PRICE_PER_MTOK = 3.00
-OUTPUT_PRICE_PER_MTOK = 15.00
-
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+# Two-tier model selection. The frontend sends a `model_tier` string and the
+# backend maps it to the actual Anthropic model ID plus per-MTok pricing.
+# Prices are USD per million tokens — update if Anthropic changes them. The
+# `cost_usd` column in generation_sessions uses these for an audit estimate,
+# not for billing, so mild pricing drift is tolerable.
+MODEL_TIERS = {
+    "standard": {
+        "model": "claude-sonnet-4-6",
+        "input_price_per_mtok": 3.00,
+        "output_price_per_mtok": 15.00,
+    },
+    "advanced": {
+        "model": "claude-opus-4-6",
+        "input_price_per_mtok": 15.00,
+        "output_price_per_mtok": 75.00,
+    },
+}
+DEFAULT_MODEL_TIER = "standard"
 
 # The container image: Python with the two HTTP clients we need.
 # fastapi/pydantic come with Modal but we pin them here so the local parse
 # of this file (during `modal deploy`) can also see pydantic.
-image = modal.Image.debian_slim(python_version="3.12").pip_install(
-    "anthropic==0.39.0",
-    "supabase==2.9.1",
-    "fastapi==0.115.0",
-    "pydantic==2.9.2",
+# The shared system-prompt JSON is baked into the image via add_local_file
+# so the function can read it at /root/system_prompt.json inside the sandbox.
+image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install(
+        "anthropic==0.39.0",
+        "supabase==2.9.1",
+        "fastapi==0.115.0",
+        "pydantic==2.9.2",
+    )
+    .add_local_file(
+        local_path=str(SYSTEM_PROMPT_LOCAL_PATH),
+        remote_path=SYSTEM_PROMPT_REMOTE_PATH,
+    )
 )
 
 
@@ -76,20 +111,27 @@ class GenerateRequest(BaseModel):
     feedback_history: Optional[list[str]] = None
     color_palette: Optional[dict] = None
     current_svg: Optional[str] = None
+    model_tier: Optional[str] = DEFAULT_MODEL_TIER
 
 
 def build_system_prompt(library_names: list[str]) -> str:
-    """Mirror of src/lib/constants.js `buildSystemPrompt`. Keep in sync."""
-    return (
-        "You generate SVG icons for the GIST project (LLM \u2192 JSON \u2192 Planck.js). Rules:\n"
-        "- 64x64 viewBox, simple silhouettes, Tailwind-inspired fills\n"
-        "- No external deps, inline styles only\n"
-        "- Monochromatic 3-tone (light/mid/dark from same hue)\n"
-        "- People: modeled after traffic sign pictograms, no faces or details\n"
-        "- Categories: vehicles, projectiles, blocks, people, connectors, "
-        "planes, pendulums, everyday, lab, space, air resistance\n\n"
-        f"Library ({len(library_names)}): {', '.join(library_names)}"
+    """
+    Render the system prompt from shared/system_prompt.json.
+
+    The JSON is baked into the Modal image at SYSTEM_PROMPT_REMOTE_PATH, so
+    edits to the file require `modal deploy` to take effect on the Python
+    side. The JS side (src/lib/constants.js `buildSystemPrompt`) reads the
+    same file and must render identically — keep the two renderers in sync.
+    """
+    with open(SYSTEM_PROMPT_REMOTE_PATH) as f:
+        config = json.load(f)
+    rules = "\n".join(f"- {rule}" for rule in config["rules"])
+    library = (
+        config["librarySection"]
+        .replace("{count}", str(len(library_names)))
+        .replace("{names}", ", ".join(library_names))
     )
+    return f"{config['header']}\n{rules}\n\n{library}"
 
 
 def build_user_prompt(
@@ -154,6 +196,7 @@ def generate_svg(
     feedback_history: Optional[list[str]] = None,
     color_palette: Optional[dict] = None,
     current_svg: Optional[str] = None,
+    model_tier: Optional[str] = DEFAULT_MODEL_TIER,
 ) -> dict:
     """
     Generate or revise a physics SVG via Claude.
@@ -166,6 +209,8 @@ def generate_svg(
         feedback_history: list of feedback strings collected so far.
         color_palette: optional dict with keys {name, light, mid, dark}.
         current_svg: existing SVG markup (for revision), else None.
+        model_tier: "standard" (Sonnet 4.6, default) or "advanced" (Opus 4.6).
+                    Controls which Anthropic model handles the generation.
 
     Returns:
         {
@@ -178,6 +223,19 @@ def generate_svg(
     """
     from anthropic import Anthropic
     from supabase import create_client
+
+    # Resolve the model tier. Reject unknown values with a clear error so a
+    # typo in the client doesn't silently fall back to the default.
+    tier_key = model_tier or DEFAULT_MODEL_TIER
+    if tier_key not in MODEL_TIERS:
+        raise ValueError(
+            f"Unknown model_tier '{tier_key}'. "
+            f"Expected one of: {sorted(MODEL_TIERS.keys())}"
+        )
+    tier = MODEL_TIERS[tier_key]
+    model_id = tier["model"]
+    input_price_per_mtok = tier["input_price_per_mtok"]
+    output_price_per_mtok = tier["output_price_per_mtok"]
 
     anthropic_client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     supabase_client = create_client(
@@ -197,14 +255,16 @@ def generate_svg(
     )
 
     # 2. Open a generation_sessions row in 'pending' state. We do this BEFORE
-    #    the Claude call so that even on failure we have an audit row.
+    #    the Claude call so that even on failure we have an audit row. The
+    #    `model` column records the tier-resolved model id, so you can look
+    #    back at the DB later to see which tier produced a given SVG.
     session_insert = (
         supabase_client.from_("generation_sessions")
         .insert(
             {
                 "svg_id": svg_id,
                 "requested_by": requested_by,
-                "model": CLAUDE_MODEL,
+                "model": model_id,
                 "system_prompt": system_prompt,
                 "user_prompt": user_prompt,
                 "status": "pending",
@@ -219,7 +279,7 @@ def generate_svg(
         #    only need the final SVG. Streaming gets added when the Vercel
         #    proxy lands and the UI wants progressive rendering.
         message = anthropic_client.messages.create(
-            model=CLAUDE_MODEL,
+            model=model_id,
             max_tokens=4096,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
@@ -233,8 +293,8 @@ def generate_svg(
         input_tokens = message.usage.input_tokens
         output_tokens = message.usage.output_tokens
         cost_usd = (
-            input_tokens * INPUT_PRICE_PER_MTOK / 1_000_000
-            + output_tokens * OUTPUT_PRICE_PER_MTOK / 1_000_000
+            input_tokens * input_price_per_mtok / 1_000_000
+            + output_tokens * output_price_per_mtok / 1_000_000
         )
 
         # 4. Mark the session row 'completed' with the response and cost.
@@ -305,6 +365,7 @@ def generate_svg_http(payload: GenerateRequest) -> dict:
         feedback_history=payload.feedback_history,
         color_palette=payload.color_palette,
         current_svg=payload.current_svg,
+        model_tier=payload.model_tier,
     )
 
 
@@ -313,6 +374,7 @@ def main(
     object_name: str,
     requested_by: str,
     feedback: str = "",
+    model_tier: str = DEFAULT_MODEL_TIER,
 ):
     """
     Local entry point for `modal run modal_functions/generate_svg.py ...`.
@@ -324,12 +386,14 @@ def main(
 
     Optional:
         --feedback "Make it bigger and use more contrast"
+        --model-tier advanced    # use Opus 4.6 instead of the default Sonnet 4.6
     """
     feedback_list = [feedback] if feedback else None
     result = generate_svg.remote(
         object_name=object_name,
         requested_by=requested_by,
         feedback_history=feedback_list,
+        model_tier=model_tier,
     )
     print(json.dumps({k: v for k, v in result.items() if k != "svg"}, indent=2))
     print("\n--- SVG ---")

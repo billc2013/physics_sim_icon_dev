@@ -1,5 +1,6 @@
 import { useState, useMemo } from "react";
 import ColorPaletteTag from "./ColorPaletteTag.jsx";
+import ModelTierToggle from "./ModelTierToggle.jsx";
 
 // Flow A: generate a brand-new SVG. Reached from the Header "Generate more"
 // button. Asks for a snake_case object name + optional color palette tag,
@@ -14,7 +15,7 @@ import ColorPaletteTag from "./ColorPaletteTag.jsx";
 // Props:
 //   existingNames    Set<string>   already-taken names from useSvgs.items
 //   generation       useGeneration result object
-//   onGenerate       ({objectName, colorTag}) => Promise<void>
+//   onGenerate       ({objectName, colorTag, modelTier}) => Promise<void>
 //   onAccept         ({name, displayName, svgContent}) => Promise<void>
 //   onClose          () => void
 //   onJumpToExisting (name) => void   // optional, opens detail modal
@@ -28,6 +29,7 @@ export default function GenerateNewModal({
 }) {
   const [name, setName] = useState("");
   const [colorTag, setColorTag] = useState(null);
+  const [modelTier, setModelTier] = useState("standard");
   const [accepting, setAccepting] = useState(false);
 
   // Lowercase + snake-cased version of whatever the user typed. We don't
@@ -48,7 +50,7 @@ export default function GenerateNewModal({
     e.preventDefault();
     if (!normalizedName || collides || generation.status === "generating") return;
     try {
-      await onGenerate({ objectName: normalizedName, colorTag });
+      await onGenerate({ objectName: normalizedName, colorTag, modelTier });
     } catch {
       // Error already captured into generation.error by the hook.
     }
@@ -190,6 +192,8 @@ export default function GenerateNewModal({
             selectedTag={colorTag}
             onChange={(tag) => setColorTag(tag)}
           />
+
+          <ModelTierToggle value={modelTier} onChange={setModelTier} />
 
           <div style={{ display: "flex", justifyContent: "flex-end", gap: 6 }}>
             <button

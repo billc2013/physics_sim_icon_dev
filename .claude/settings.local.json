@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(ls -la *.jsx *.md *.sql)",
-      "Bash(ls -la .env*)"
+      "Bash(ls -la .env*)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('modal_functions/generate_svg.py'\\).read\\(\\)\\); print\\('ok'\\)\")"
     ]
   }
 }

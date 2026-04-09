@@ -69,14 +69,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   // 3. Build the Modal payload. We override `requested_by` no matter what
   //    the client sent, so the audit row in `generation_sessions` always
-  //    reflects the authenticated user.
+  //    reflects the authenticated user. We validate `model_tier` against a
+  //    small allow-list so the client can't smuggle an arbitrary model id
+  //    through to Anthropic.
   const clientBody = req.body ?? {};
+  const ALLOWED_MODEL_TIERS = ["standard", "advanced"] as const;
+  type ModelTier = (typeof ALLOWED_MODEL_TIERS)[number];
+  const rawTier = clientBody.model_tier;
+  const modelTier: ModelTier =
+    typeof rawTier === "string" && (ALLOWED_MODEL_TIERS as readonly string[]).includes(rawTier)
+      ? (rawTier as ModelTier)
+      : "standard";
+
   const modalPayload = {
     object_name: clientBody.object_name,
     svg_id: clientBody.svg_id ?? null,
     feedback_history: clientBody.feedback_history ?? null,
     color_palette: clientBody.color_palette ?? null,
     current_svg: clientBody.current_svg ?? null,
+    model_tier: modelTier,
     requested_by: userId,
   };
 

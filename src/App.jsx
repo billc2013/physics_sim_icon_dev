@@ -42,6 +42,10 @@ function SignedInApp({ user, onSignOut }) {
   const [filters, setFilters] = useState(new Set(STATUSES));
   const [search, setSearch] = useState("");
   const [feedbackText, setFeedbackText] = useState("");
+  // Model tier for the revise flow. Lives here (not in DetailModal) so that
+  // closeModal/openModalForId can reset it alongside feedbackText and the
+  // reviseGeneration state — keeping Advanced from being sticky across items.
+  const [reviseModelTier, setReviseModelTier] = useState("standard");
   const [showSystemPrompt, setShowSystemPrompt] = useState(false);
   const [showGenerateNew, setShowGenerateNew] = useState(false);
   const [toast, setToast] = useState(null);
@@ -56,6 +60,7 @@ function SignedInApp({ user, onSignOut }) {
   const closeModal = useCallback(() => {
     setModalItemId(null);
     setFeedbackText("");
+    setReviseModelTier("standard");
     reviseGeneration.reset();
   }, [reviseGeneration]);
 
@@ -63,6 +68,7 @@ function SignedInApp({ user, onSignOut }) {
     (id) => {
       setModalItemId(id);
       setFeedbackText("");
+      setReviseModelTier("standard");
       reviseGeneration.reset();
     },
     [reviseGeneration]
@@ -176,8 +182,8 @@ function SignedInApp({ user, onSignOut }) {
     setShowGenerateNew(false);
     newGeneration.reset();
   };
-  const handleNewGenerate = async ({ objectName, colorTag }) => {
-    await newGeneration.generate({ objectName, colorTag });
+  const handleNewGenerate = async ({ objectName, colorTag, modelTier }) => {
+    await newGeneration.generate({ objectName, colorTag, modelTier });
   };
   const handleNewAccept = async ({ name, displayName, svgContent }) => {
     try {
@@ -197,7 +203,10 @@ function SignedInApp({ user, onSignOut }) {
 
   // Flow B: send the currently-open detail modal item to Claude for revision.
   // Builds the context from the item's existing feedback + any pending
-  // unsaved feedbackText the user has typed.
+  // unsaved feedbackText the user has typed. The tier is read from
+  // `reviseModelTier` state (owned by this component and shown in the
+  // DetailModal as a pill switch), so the backend picks Sonnet 4.6 vs
+  // Opus 4.6 for this specific call.
   const handleSendToClaude = async (item) => {
     const feedbackHistory = item.feedback.map((f) => f.text);
     if (feedbackText.trim()) feedbackHistory.push(feedbackText.trim());
@@ -208,6 +217,7 @@ function SignedInApp({ user, onSignOut }) {
         svgId: item._uuid,
         feedbackHistory: feedbackHistory.length ? feedbackHistory : null,
         currentSvg: item.svg,
+        modelTier: reviseModelTier,
       });
     } catch (e) {
       showToast(`Error: ${e.message ?? e}`);
@@ -316,6 +326,8 @@ function SignedInApp({ user, onSignOut }) {
           generation={reviseGeneration}
           onAcceptRevision={handleAcceptRevision}
           onDiscardRevision={handleDiscardRevision}
+          modelTier={reviseModelTier}
+          onModelTierChange={setReviseModelTier}
         />
       )}
 

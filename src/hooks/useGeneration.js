@@ -23,6 +23,8 @@ import { COLOR_RAMPS } from "../lib/constants.js";
 //   svgId            string?  physics_svgs.id when revising, else undefined
 //   feedbackHistory  string[]?  feedback strings to send as context
 //   currentSvg       string?  existing SVG markup when revising
+//   modelTier        "standard" | "advanced"  which Anthropic model to use
+//                    (defaults to "standard" = Sonnet 4.6)
 export function useGeneration() {
   const [status, setStatus] = useState("idle");
   const [result, setResult] = useState(null);
@@ -40,6 +42,7 @@ export function useGeneration() {
     svgId,
     feedbackHistory,
     currentSvg,
+    modelTier = "standard",
   }) => {
     setStatus("generating");
     setResult(null);
@@ -76,6 +79,7 @@ export function useGeneration() {
           feedback_history: feedbackHistory ?? null,
           color_palette: colorPalette,
           current_svg: currentSvg ?? null,
+          model_tier: modelTier,
         }),
       });
 

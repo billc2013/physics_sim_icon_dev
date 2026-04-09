@@ -124,19 +124,33 @@ insert into public.color_palettes (name, light_hex, mid_hex, dark_hex) values
 -- -------------------------
 
 create table public.physics_svgs (
-  id            uuid primary key default uuid_generate_v4(),
-  name          text not null unique,
-  display_name  text not null,
-  svg_content   text not null,
-  status        svg_status not null default 'draft',
-  category_id   uuid references public.svg_categories(id) on delete set null,
-  color_id      uuid references public.color_palettes(id) on delete set null,
-  notes         text not null default '',
-  version       int not null default 1,
-  created_by    uuid references auth.users(id) on delete set null,
-  updated_by    uuid references auth.users(id) on delete set null,
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now()
+  id                      uuid primary key default uuid_generate_v4(),
+  name                    text not null unique,
+  display_name            text not null,
+  svg_content             text not null,
+  status                  svg_status not null default 'draft',
+  category_id             uuid references public.svg_categories(id) on delete set null,
+  color_id                uuid references public.color_palettes(id) on delete set null,
+  notes                   text not null default '',
+  version                 int not null default 1,
+  -- Export tracking: stamped by the "Download approved" flow. Nullable
+  -- because a freshly-created SVG has never been exported. `last_exported_version`
+  -- is the `version` value at the time of export, so a later revision can be
+  -- detected with `version > last_exported_version`.
+  last_exported_at        timestamptz null,
+  last_exported_version   int null,
+  last_exported_by        uuid references auth.users(id) on delete set null,
+  -- Free-form per-SVG physical properties used downstream by the physics
+  -- pipeline. Shape is informal while Bill and Duncan iterate; the v1
+  -- target is roughly:
+  --   { "mass_kg": number, "length_m": number, "width_m": number, "notes": string }
+  -- All fields optional. SI units are baked into the key names so there's
+  -- no ambiguity about what the numbers mean.
+  physical_properties     jsonb null,
+  created_by              uuid references auth.users(id) on delete set null,
+  updated_by              uuid references auth.users(id) on delete set null,
+  created_at              timestamptz not null default now(),
+  updated_at              timestamptz not null default now()
 );
 
 comment on table public.physics_svgs is
@@ -473,6 +487,10 @@ select
   s.status,
   s.notes,
   s.version,
+  s.last_exported_at,
+  s.last_exported_version,
+  s.last_exported_by,
+  s.physical_properties,
   s.created_at,
   s.updated_at,
   c.name       as category_name,
@@ -482,6 +500,7 @@ select
   cp.dark_hex  as color_dark,
   pm_created.display_name as created_by_name,
   pm_updated.display_name as updated_by_name,
+  pm_exported.display_name as last_exported_by_name,
   (
     select count(*)::int from public.svg_feedback f
     where f.svg_id = s.id
@@ -489,8 +508,9 @@ select
 from public.physics_svgs s
 left join public.svg_categories c   on s.category_id = c.id
 left join public.color_palettes cp  on s.color_id = cp.id
-left join public.project_members pm_created on s.created_by = pm_created.user_id
-left join public.project_members pm_updated on s.updated_by = pm_updated.user_id;
+left join public.project_members pm_created  on s.created_by       = pm_created.user_id
+left join public.project_members pm_updated  on s.updated_by       = pm_updated.user_id
+left join public.project_members pm_exported on s.last_exported_by = pm_exported.user_id;
 
 
 -- -------------------------
@@ -611,3 +631,126 @@ create policy "Anyone can read heartbeat"
 --   Use the SUPABASE_ANON_KEY (public) in the browser client. RLS policies
 --   ensure users only see/edit what their role permits. The anon key is safe
 --   to expose in client-side code because RLS enforces access control.
+
+
+-- ============================================================================
+-- 11. INCREMENTAL MIGRATIONS
+-- ============================================================================
+-- Changes applied to a live DB after the original schema was deployed. Each
+-- block is idempotent (safe to re-run) and should be copied verbatim into
+-- the Supabase SQL editor. The table definitions above are ALSO updated so
+-- the file stays the source of truth for fresh installs.
+--
+-- -------------------------
+-- 11a. Export tracking + physical_properties (Task 10 — Download approved)
+-- -------------------------
+-- Adds the four columns the "Download approved" feature needs. Run this
+-- block once; the `if not exists` clauses make re-runs no-ops.
+
+alter table public.physics_svgs
+  add column if not exists last_exported_at       timestamptz null,
+  add column if not exists last_exported_version  int         null,
+  add column if not exists last_exported_by       uuid        null
+    references auth.users(id) on delete set null,
+  add column if not exists physical_properties    jsonb       null;
+
+-- Index to make the "new or updated since last export" query fast. The
+-- predicate on `status = 'approved'` cuts the index to only rows we care
+-- about, which is ~30-50 rows max at current library size.
+create index if not exists idx_svgs_export_status
+  on public.physics_svgs (last_exported_at)
+  where status = 'approved';
+
+-- Re-create the view so `svgs_with_details` returns the new columns.
+-- CREATE OR REPLACE is not allowed for views when columns are added, so
+-- drop + recreate. Cheap: the view is just a projection.
+drop view if exists public.svgs_with_details;
+create view public.svgs_with_details
+with (security_invoker = true) as
+select
+  s.id,
+  s.name,
+  s.display_name,
+  s.svg_content,
+  s.status,
+  s.notes,
+  s.version,
+  s.last_exported_at,
+  s.last_exported_version,
+  s.last_exported_by,
+  s.physical_properties,
+  s.created_at,
+  s.updated_at,
+  c.name       as category_name,
+  cp.name      as color_name,
+  cp.light_hex as color_light,
+  cp.mid_hex   as color_mid,
+  cp.dark_hex  as color_dark,
+  pm_created.display_name as created_by_name,
+  pm_updated.display_name as updated_by_name,
+  pm_exported.display_name as last_exported_by_name,
+  (
+    select count(*)::int from public.svg_feedback f
+    where f.svg_id = s.id
+  ) as feedback_count
+from public.physics_svgs s
+left join public.svg_categories c   on s.category_id = c.id
+left join public.color_palettes cp  on s.color_id = cp.id
+left join public.project_members pm_created  on s.created_by       = pm_created.user_id
+left join public.project_members pm_updated  on s.updated_by       = pm_updated.user_id
+left join public.project_members pm_exported on s.last_exported_by = pm_exported.user_id;
+
+-- No RLS policy changes needed: existing "Editors can update SVGs" covers
+-- the stamping write, and "Members can view SVGs" covers reads of the
+-- new columns through the view. Export-stamping is a normal UPDATE and
+-- will fire the version-archive trigger unless we're careful — but
+-- because only last_exported_* columns change (not svg_content or status),
+-- `is distinct from` in archive_svg_version() returns false and no
+-- archival happens. Verified by inspection of the trigger function.
+
+
+-- -------------------------
+-- 11b. mark_svgs_exported RPC (Task 10 follow-up — stale-detection fix)
+-- -------------------------
+-- The stale-detection predicate used on the frontend is `updated_at >
+-- last_exported_at`. For this to resolve to "not stale" for just-exported
+-- items, both timestamps must be EXACTLY equal after a successful export.
+--
+-- A client-side UPDATE can't guarantee that: moddatetime sets updated_at
+-- to server's now() inside a BEFORE trigger, which differs from whatever
+-- client-side ISO string the browser supplies for last_exported_at (by
+-- the network round-trip latency, plus any clock drift). The two end up
+-- close but not equal, and updated_at > last_exported_at flips to true
+-- the instant the export finishes — so every just-exported item would
+-- immediately flag as stale.
+--
+-- Moving the stamp into a server-side RPC fixes this: both columns end
+-- up set to the same transaction-local now() value, so they're exactly
+-- equal and the stale check is false until a subsequent UPDATE bumps
+-- updated_at.
+
+create or replace function public.mark_svgs_exported(svg_ids uuid[])
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  -- Gate on project membership. auth.uid() inside a SECURITY DEFINER
+  -- function returns the CALLER's auth id, not the function owner's, so
+  -- this check is meaningful even with elevated privileges.
+  if not exists (
+    select 1 from public.project_members where user_id = auth.uid()
+  ) then
+    raise exception 'Not a project member';
+  end if;
+
+  update public.physics_svgs
+  set last_exported_at       = now(),
+      last_exported_version  = version,
+      last_exported_by       = auth.uid()
+  where id = any(svg_ids);
+end;
+$$;
+
+grant execute on function public.mark_svgs_exported(uuid[]) to authenticated;

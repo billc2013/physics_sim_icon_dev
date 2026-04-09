@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import JSZip from "jszip";
 import { STATUSES, buildSystemPrompt } from "./lib/constants.js";
 import { useAuth } from "./hooks/useAuth.js";
 import { useSvgs } from "./hooks/useSvgs.js";
@@ -11,6 +12,7 @@ import SvgGrid from "./components/SvgGrid.jsx";
 import DetailModal from "./components/DetailModal.jsx";
 import SystemPrompt from "./components/SystemPrompt.jsx";
 import GenerateNewModal from "./components/GenerateNewModal.jsx";
+import DownloadApprovedModal from "./components/DownloadApprovedModal.jsx";
 
 export default function App() {
   const auth = useAuth();
@@ -46,8 +48,18 @@ function SignedInApp({ user, onSignOut }) {
   // closeModal/openModalForId can reset it alongside feedbackText and the
   // reviseGeneration state — keeping Advanced from being sticky across items.
   const [reviseModelTier, setReviseModelTier] = useState("standard");
+  // Pending manual SVG upload, awaiting Accept/Discard. Shape:
+  //   { svg: string, warning: string|null } | null
+  // Lives here so navigation/close cleanly clears it like the other
+  // per-item state.
+  const [pendingUpload, setPendingUpload] = useState(null);
   const [showSystemPrompt, setShowSystemPrompt] = useState(false);
   const [showGenerateNew, setShowGenerateNew] = useState(false);
+  const [showDownloadApproved, setShowDownloadApproved] = useState(false);
+  // FilterBar "Downloaded" toggle — when on, further restricts the grid to
+  // items that have been exported at least once. Composes with the status
+  // filter set (AND, not OR).
+  const [downloadedOnly, setDownloadedOnly] = useState(false);
   const [toast, setToast] = useState(null);
   const toastTimerRef = useRef(null);
 
@@ -61,6 +73,7 @@ function SignedInApp({ user, onSignOut }) {
     setModalItemId(null);
     setFeedbackText("");
     setReviseModelTier("standard");
+    setPendingUpload(null);
     reviseGeneration.reset();
   }, [reviseGeneration]);
 
@@ -69,6 +82,7 @@ function SignedInApp({ user, onSignOut }) {
       setModalItemId(id);
       setFeedbackText("");
       setReviseModelTier("standard");
+      setPendingUpload(null);
       reviseGeneration.reset();
     },
     [reviseGeneration]
@@ -80,11 +94,13 @@ function SignedInApp({ user, onSignOut }) {
   const getVisibleItems = useCallback(() => {
     if (!items) return [];
     const query = search.toLowerCase();
-    return items.filter(
-      (item) =>
-        filters.has(item.status) && (!query || item.label.toLowerCase().includes(query))
-    );
-  }, [items, filters, search]);
+    return items.filter((item) => {
+      if (!filters.has(item.status)) return false;
+      if (query && !item.label.toLowerCase().includes(query)) return false;
+      if (downloadedOnly && item.lastExportedAt == null) return false;
+      return true;
+    });
+  }, [items, filters, search, downloadedOnly]);
 
   // Look up the current modal item by id on every render so edits flow
   // through automatically (no need for a separate "syncModalIfMatching"
@@ -236,6 +252,27 @@ function SignedInApp({ user, onSignOut }) {
     reviseGeneration.reset();
   };
 
+  // Manual SVG upload accept/discard. Goes through the same updateSvgContent
+  // path Claude revisions use, so the version-archive trigger fires and a
+  // draft auto-promotes to revised. From the schema's POV an uploaded SVG
+  // and a Claude-generated SVG are indistinguishable — only the
+  // generation_sessions table tracks "Claude was involved".
+  const handleAcceptUpload = async (id) => {
+    if (!pendingUpload) return;
+    try {
+      await svgs.updateSvgContent(id, pendingUpload.svg);
+      setPendingUpload(null);
+      showToast("Upload saved");
+    } catch (e) {
+      showToast(`Error: ${e.message ?? e}`);
+    }
+  };
+  const handleDiscardUpload = () => {
+    setPendingUpload(null);
+  };
+
+  // "Download approved" — opens the scope/manifest dialog. The dialog
+  // itself calls handleConfirmDownload with the selected items.
   const handleDownloadApproved = () => {
     if (!items) return;
     const approved = items.filter((item) => item.status === "approved");
@@ -243,7 +280,60 @@ function SignedInApp({ user, onSignOut }) {
       showToast("No approved SVGs");
       return;
     }
-    showToast("Export pipeline ships in Phase 4");
+    setShowDownloadApproved(true);
+  };
+
+  // Build the zip, trigger download, stamp the DB. Called from
+  // DownloadApprovedModal once the user has picked scope + manifest option.
+  const handleConfirmDownload = async ({ mode, includeManifest, items: selectedItems }) => {
+    if (!selectedItems?.length) return;
+
+    const zip = new JSZip();
+    for (const item of selectedItems) {
+      zip.file(`${item.id}.svg`, item.svg);
+    }
+
+    if (includeManifest) {
+      const manifest = {
+        manifest_version: 1,
+        exported_at: new Date().toISOString(),
+        exported_by: user.email,
+        export_mode: mode,
+        items: selectedItems.map((item) => ({
+          name: item.id,
+          display_name: item.label,
+          status: item.status,
+          version: item.version,
+          color_tag: item.colorTag,
+          physical_properties: item.physicalProperties,
+        })),
+      };
+      zip.file("manifest.json", JSON.stringify(manifest, null, 2));
+    }
+
+    const blob = await zip.generateAsync({ type: "blob" });
+    const dateStamp = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    const filename = `physics-sim-svgs-${dateStamp}.zip`;
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    // Stamp the DB. If this throws the user has still downloaded the zip,
+    // so we surface the error but don't undo the download.
+    try {
+      await svgs.markExported(selectedItems.map((item) => item._uuid));
+      showToast(`Downloaded ${selectedItems.length} SVGs`);
+    } catch (e) {
+      showToast(
+        `Downloaded, but failed to stamp export: ${e.message ?? e}`
+      );
+    }
   };
 
   // Loading / error states for the initial data load (separate from the
@@ -268,6 +358,8 @@ function SignedInApp({ user, onSignOut }) {
     acc[status] = items.filter((item) => item.status === status).length;
     return acc;
   }, {});
+  const approvedItems = items.filter((item) => item.status === "approved");
+  const downloadedCount = items.filter((item) => item.lastExportedAt != null).length;
   const systemPromptText = buildSystemPrompt(items);
 
   return (
@@ -303,6 +395,9 @@ function SignedInApp({ user, onSignOut }) {
         statusCounts={statusCounts}
         onToggleFilter={toggleFilter}
         onAllDraftsToIdea={handleAllDraftsToIdea}
+        downloadedOnly={downloadedOnly}
+        onToggleDownloadedOnly={() => setDownloadedOnly((v) => !v)}
+        downloadedCount={downloadedCount}
       />
 
       <SvgGrid
@@ -328,6 +423,10 @@ function SignedInApp({ user, onSignOut }) {
           onDiscardRevision={handleDiscardRevision}
           modelTier={reviseModelTier}
           onModelTierChange={setReviseModelTier}
+          pendingUpload={pendingUpload}
+          onPendingUploadChange={setPendingUpload}
+          onAcceptUpload={handleAcceptUpload}
+          onDiscardUpload={handleDiscardUpload}
         />
       )}
 
@@ -339,6 +438,14 @@ function SignedInApp({ user, onSignOut }) {
           onAccept={handleNewAccept}
           onClose={handleCloseGenerateNew}
           onJumpToExisting={handleJumpToExisting}
+        />
+      )}
+
+      {showDownloadApproved && (
+        <DownloadApprovedModal
+          approvedItems={approvedItems}
+          onClose={() => setShowDownloadApproved(false)}
+          onConfirm={handleConfirmDownload}
         />
       )}
 

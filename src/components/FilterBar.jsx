@@ -5,7 +5,19 @@ import { STATUSES, STATUS_CONFIG } from "../lib/constants.js";
 // Filter solo behavior: clicking a status when all are shown solos that
 // status. Clicking the soloed status restores all four. This is preserved
 // from the original artifact and is intentional.
-export default function FilterBar({ filters, statusCounts, onToggleFilter, onAllDraftsToIdea }) {
+//
+// The "Downloaded" toggle is an independent boolean that intersects with
+// (not replaces) the status filter set. When on, only items with
+// last_exported_at != null remain visible.
+export default function FilterBar({
+  filters,
+  statusCounts,
+  onToggleFilter,
+  onAllDraftsToIdea,
+  downloadedOnly,
+  onToggleDownloadedOnly,
+  downloadedCount,
+}) {
   return (
     <div
       style={{
@@ -46,6 +58,27 @@ export default function FilterBar({ filters, statusCounts, onToggleFilter, onAll
           </button>
         );
       })}
+      <button
+        onClick={onToggleDownloadedOnly}
+        style={{
+          fontSize: 12,
+          padding: "4px 10px",
+          borderRadius: "var(--border-radius-md)",
+          cursor: "pointer",
+          background: downloadedOnly
+            ? "var(--color-background-secondary)"
+            : "transparent",
+          color: downloadedOnly
+            ? "var(--color-text-primary)"
+            : "var(--color-text-tertiary)",
+          border: downloadedOnly
+            ? "2px solid var(--color-text-primary)"
+            : "0.5px solid var(--color-border-tertiary)",
+          fontWeight: downloadedOnly ? 500 : 400,
+        }}
+      >
+        Downloaded ({downloadedCount || 0})
+      </button>
       <span style={{ flex: 1 }} />
       <button
         onClick={onAllDraftsToIdea}

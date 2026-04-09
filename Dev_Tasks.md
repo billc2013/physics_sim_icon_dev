@@ -14,18 +14,19 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
 Done locally:
 - ✓ Tasks 1, 2, 3, 6, 7
+- ✓ Task 10 zip export (shipped ahead of Task 9; production walkthrough still pending)
 
 Remaining:
-- Tasks 4, 5, 8, 9, 10
+- Tasks 4, 5, 8, 9, and the production-walkthrough piece of 10
 
-The app works end-to-end on `vercel dev` (login → grid → review → both generate flows → audit log). What's missing is multi-user (Realtime), production deploy, the keep-alive job, Duncan's bootstrap, and the zip export.
+The app works end-to-end on `vercel dev` (login → grid → review → both generate flows → audit log → manual download/upload → zip export with manifest). What's missing is multi-user (Realtime), production deploy, the keep-alive job, Duncan's bootstrap, and the prod walkthrough of the zip export.
 
 **Suggested next-task order from here:**
-1. **Task 9** (deploy) — unlocks Duncan signing up via the production URL
+1. **Task 9** (deploy) — unlocks Duncan signing up via the production URL AND unblocks the remaining production-walkthrough piece of Task 10
 2. **Task 4** (insert Duncan into project_members) — 10-second SQL after he signs up
 3. **Task 5** (Realtime) — multi-user live sync, biggest UX win once Duncan is in
 4. **Task 8** (keep_alive) — prevents Supabase free tier from pausing
-5. **Task 10** (zip export + final polish)
+5. Finish **Task 10** prod walkthrough
 
 ---
 
@@ -218,23 +219,40 @@ This unblocks Duncan signing up (Task 4). Probably the most "yak shaving for the
 
 ---
 
-### 10. End-to-end test + zip export of approved SVGs `[ ]`
+### 10. End-to-end test + zip export of approved SVGs `[~]`
 
-**Scope**
-- Walk through a full session against production: log in, generate a new object, give feedback, revise, approve
-- Implement zip export of approved SVGs (small client-side helper, JSZip is fine — `npm install jszip`)
-- Wire up the existing "Download approved" Header button (currently a stub that toasts "ships in Phase 4")
-- Each SVG in the zip named after `physics_svgs.name` (e.g. `wooden_block.svg`)
-- Optionally include a `feedback-log.json` per the original artifact's design
+**Zip export: done locally (+ stale-detection fix).** Shipped ahead of the Task 9 deploy because it turned out to be a useful standalone feature. What landed:
+
+**Stale-detection fix (follow-up, 2026-04-09):** the initial v1 used `version > lastExportedVersion` as the stale predicate. Two bugs surfaced during Bill's first real export:
+1. Uploading a replacement SVG bumped version in the DB via the archive trigger, but the optimistic update in `updateSvgContent` didn't propagate the new version back to local state — so the dot and dialog were wrong until the next browser refresh.
+2. Color-tag changes don't bump version at all (the archive trigger only fires on content/status). But `color_tag` IS in the manifest, so those changes should re-export.
+
+Fix: added migration 11b (`mark_svgs_exported` RPC, server-side stamp so `updated_at == last_exported_at` exactly within one transaction), switched the stale predicate to `updatedAt > lastExportedAt` via the shared `isStale(item)` / `needsExport(item)` helpers in [useSvgs.js](src/hooks/useSvgs.js), and refactored all physics_svgs mutations to chain `.select("version, updated_at").single()` so the optimistic update actually reflects the server's post-update values. **Bill must run migration 11b before testing.**
+
+What landed in the initial v1:
+- Schema migration: four new nullable columns on `physics_svgs` — `last_exported_at`, `last_exported_version`, `last_exported_by`, `physical_properties` (jsonb). Added to [gist-supabase-schema.sql](gist-supabase-schema.sql) section 11a as an idempotent `alter ... if not exists` block; table definition and `svgs_with_details` view also updated inline. **Bill must run the migration in Supabase SQL editor once before the feature works.**
+- `jszip@3.10.1` installed as a direct dep
+- [DownloadApprovedModal.jsx](src/components/DownloadApprovedModal.jsx) — dialog with scope radio (new-or-updated vs all-approved, counts inline) + manifest checkbox (default on). Gated `Download` button when the selected scope is empty.
+- `useSvgs.markExported(uuids)` — bulk stamp in one `Promise.all` of column-level UPDATEs. Doesn't fire the archive-version trigger because it only touches `last_exported_*` columns.
+- JSZip-based zip build in `handleConfirmDownload` (App.jsx). Zip filename `physics-sim-svgs-YYYY-MM-DD.zip`. Manifest shape is `{ manifest_version: 1, exported_at, exported_by, export_mode, items: [...] }` emitting `physical_properties` for each item.
+- Grid stale-export dot in [SvgCard.jsx](src/components/SvgCard.jsx) (amber 8px, bottom-right) when `version > lastExportedVersion`.
+- Exported-as line in [DetailModal.jsx](src/components/DetailModal.jsx) reading `Exported as v3 · 2026-04-08 · Bill` with `(changes since)` in amber when stale.
+- [FilterBar.jsx](src/components/FilterBar.jsx) gained a `Downloaded (N)` toggle that intersects with the status filter.
+
+**Remaining scope (deferred until Task 9 deploy)**
+- Walk through a full session against the **production URL** (not just localhost): log in, generate, revise, approve, download. Verifies Vercel prod env vars, Supabase RLS from a non-localhost origin, and the real-world cold-start feel of Modal.
+- Consider whether we want a `feedback-log.json` in the zip too, like the original artifact's design. Not obviously useful since the physics pipeline doesn't consume feedback, so let's punt unless Duncan asks.
 
 **Out of scope**
 - Per-status export, per-color export — backlog
 - Server-side zip generation — pointless for ~50 small SVGs
 
-**Acceptance**
-- Zip downloads from production
-- Contains valid SVG files with the right names
-- All approved items present, no unapproved leakage
+**Acceptance (local)**
+- ✓ Zip downloads from localhost
+- ✓ Contains valid SVG files named with snake_case from `physics_svgs.name`
+- ✓ manifest.json present when the checkbox is on and carries `physical_properties`
+- ✓ `last_exported_*` columns stamp correctly; stale dot / changes-since line appear after a post-export revision
+- ☐ Same, from production URL (waits on Task 9)
 
 ---
 
@@ -255,4 +273,7 @@ This unblocks Duncan signing up (Task 4). Probably the most "yak shaving for the
 - **Streaming generation responses** (Modal SSE → Vercel SSE → React EventSource). Cooler UX than the current 5–15s spinner. Deferred from Task 7.
 - **Delete the `GeneratePanel.jsx` stub** left over from Task 2 (Flow A is in `GenerateNewModal.jsx` instead).
 - **Delete `gist-svg-manager.jsx`** once it's no longer useful as reference.
+- **Physical-properties editor in DetailModal.** Task 10 shipped the `physical_properties jsonb` column and the manifest emits its contents verbatim, but there's currently no UI to edit those fields — Bill and Duncan have to set them via SQL. Eventual UI: a small form in DetailModal under the SVG preview with four inputs (`mass_kg`, `length_m`, `width_m`, `notes`), saving through a new `useSvgs.updatePhysicalProperties` mutation. Keep the input open-ended so experimenting with new fields (e.g. pendulum-specific `string_length_m`) is just a matter of adding a row, not a schema change. Only wire up after the v1 schema settles — premature UI makes the schema harder to change.
 - **Modal-side defense in depth:** add `requires_proxy_auth=True` to `generate_svg_http` and rotate Modal API tokens through Vercel. Currently relies on URL secrecy.
+- **Sanitize Claude-generated SVGs through DOMPurify too.** Manual uploads in DetailModal already get sanitized via DOMPurify (`USE_PROFILES: { svg: true, svgFilters: true }`) before being staged in `pendingUpload`. Claude output still flows directly into `dangerouslySetInnerHTML` without sanitization, which is inconsistent. The fix is small: pipe `useGeneration` results through the same sanitizer before exposing them on the preview, OR sanitize at render time inside the Card/Modal components. Either is fine; pick one place. Claude is unlikely to inject XSS into an SVG, but "trust no input at the boundary" is the right default.
+- **Inkscape namespace handling on upload.** Inkscape adds `inkscape:` and `sodipodi:` namespaced elements/attributes to its saved SVGs (editor metadata, not graphics). DOMPurify in default SVG mode may strip these as non-standard, which would fire the "something was removed" warning on every Inkscape upload — even though the visible drawing is unaffected. If this turns out to be noisy in practice, allow-list those namespaces via DOMPurify's `ADD_TAGS` / `ADD_ATTR` or a custom hook so the warning only fires for actual security strips. Don't pre-optimize: ship the simple version, see whether real Inkscape uploads trigger the warning routinely, and only then add the allow-list.

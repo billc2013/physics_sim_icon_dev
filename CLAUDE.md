@@ -136,16 +136,22 @@ Do not violate these without explicit discussion:
 
 `useSvgs` transforms Postgres rows into the artifact's item shape so the components don't need to know the schema. **This mapping is load-bearing — components rely on it.**
 
-| Component / artifact field | Schema source                         | Notes |
-|----------------------------|---------------------------------------|-------|
-| `item.id` (string)         | `physics_svgs.name`                   | Used as React keys, item lookup, and as `object_name` for generation |
-| `item.label` (string)      | `physics_svgs.display_name`           | Human-readable, capitalized in UI |
-| `item.svg` (string)        | `physics_svgs.svg_content`            | Inline SVG markup |
-| `item.status` (enum)       | `physics_svgs.status`                 | draft / revised / approved / idea_only |
-| `item.notes` (string)      | `physics_svgs.notes`                  | Used by idea_only items |
-| `item.colorTag` (string)   | joined `color_palettes.name`          | e.g. "blue"; null if no palette set |
-| `item.feedback` (array)    | `svg_feedback` rows for this svg_id   | `[{text, date}]` shape |
-| `item._uuid` (string)      | `physics_svgs.id`                     | **Private**. Only used for write paths and as `svg_id` in revisions. |
+| Component / artifact field     | Schema source                              | Notes |
+|--------------------------------|--------------------------------------------|-------|
+| `item.id` (string)             | `physics_svgs.name`                        | Used as React keys, item lookup, and as `object_name` for generation |
+| `item.label` (string)          | `physics_svgs.display_name`                | Human-readable, capitalized in UI |
+| `item.svg` (string)            | `physics_svgs.svg_content`                 | Inline SVG markup |
+| `item.status` (enum)           | `physics_svgs.status`                      | draft / revised / approved / idea_only |
+| `item.notes` (string)          | `physics_svgs.notes`                       | Used by idea_only items |
+| `item.colorTag` (string)       | joined `color_palettes.name`               | e.g. "blue"; null if no palette set |
+| `item.feedback` (array)        | `svg_feedback` rows for this svg_id        | `[{text, date}]` shape |
+| `item.version` (int)           | `physics_svgs.version`                     | Bumped by the archive trigger on content/status change |
+| `item.updatedAt`               | `physics_svgs.updated_at`                  | Auto-bumped by `moddatetime` on every UPDATE. Compared against `lastExportedAt` for the stale check. |
+| `item.lastExportedAt`          | `physics_svgs.last_exported_at`            | ISO timestamp or null — set by the Download approved flow via the `mark_svgs_exported` RPC |
+| `item.lastExportedVersion`     | `physics_svgs.last_exported_version`       | `version` value at time of last export. Displayed in the "Exported as v3" line; NOT used for the stale check. |
+| `item.lastExportedByName`      | joined `project_members.display_name` via `last_exported_by` | Who last exported this item |
+| `item.physicalProperties`      | `physics_svgs.physical_properties` (jsonb) | Free-form, v1 shape is `{mass_kg, length_m, width_m, notes}`. Emitted in manifest.json |
+| `item._uuid` (string)          | `physics_svgs.id`                          | **Private**. Only used for write paths and as `svg_id` in revisions. |
 
 When writing back: `useSvgs` looks up `_uuid` via `findUuid(id)`, translates `colorTag` (string) → `color_id` (UUID) via a cached `paletteIdByNameRef`, and always sets `updated_by = user.id` so the version-archive trigger attributes the OLD row correctly.
 
@@ -169,6 +175,22 @@ Both flows hit the same backend chain: browser → `/api/generate` (Vercel) → 
 - On Accept: `useSvgs.updateSvgContent(id, newSvg)` → UPDATE `physics_svgs` (trigger archives prior version, bumps version int)
 
 App.jsx holds **two independent `useGeneration` instances** (`newGeneration` for Flow A, `reviseGeneration` for Flow B) so they can run concurrently without state collision.
+
+### Download approved (zip export)
+
+Header **"Download approved"** opens [DownloadApprovedModal.jsx](src/components/DownloadApprovedModal.jsx), which presents a scope radio + manifest checkbox and calls `handleConfirmDownload` in App.jsx on confirm.
+
+- **Two scopes:** `new_or_updated` (default) and `all_approved`. Counts shown inline so you know what you're committing to. The scope filter uses `needsExport(item)` from [useSvgs.js](src/hooks/useSvgs.js) (`lastExportedAt == null || isStale(item)`).
+- **Manifest (default on):** `manifest.json` emitted into the zip with shape `{ manifest_version: 1, exported_at, exported_by, export_mode, items: [{ name, display_name, status, version, color_tag, physical_properties }] }`. The downstream physics-sim pipeline reads this to pick up metadata (mass, length, width) that's not encoded in the SVG itself. Bump `manifest_version` when the shape changes.
+- **Zip filename:** `physics-sim-svgs-YYYY-MM-DD.zip`. Re-exporting the same day means your browser auto-renames `(1)`, `(2)`, etc.
+- **JSZip** does the zipping in-browser. No server-side zip function. ~50 × 1 KB files takes milliseconds.
+- **DB stamping via RPC:** after a successful zip, `useSvgs.markExported(uuids)` calls the `mark_svgs_exported` Postgres RPC (schema migration 11b). Server-side because `updated_at` and `last_exported_at` need to end up set to the SAME transaction-local `now()` — a client-supplied ISO string diverges from moddatetime's server timestamp by the network round trip, and that's enough to make the stale check fire on items you just exported. The RPC runs SECURITY DEFINER with an `auth.uid()` project-membership gate so it's safe from client tampering.
+- **Failure mode:** if the zip download succeeds but `markExported` fails (e.g. RLS/network), we show a toast explaining the mismatch but we don't try to "undo" the download. The next export will re-include the un-stamped items — harmless, just slightly inefficient.
+- **Stale predicate — single source of truth.** `isStale(item)` from [useSvgs.js](src/hooks/useSvgs.js) is `lastExportedAt != null && updatedAt > lastExportedAt`. Used by **SvgCard** (amber dot bottom-right), **DetailModal** (the "(changes since)" suffix on the exported-as line), and transitively by **DownloadApprovedModal** via `needsExport`. All three MUST use this helper so they always agree — diverging predicates confuse users about which items will be in the next export.
+- **Why `updatedAt > lastExportedAt`, not `version > lastExportedVersion`?** The archive-version trigger only bumps `version` on content/status changes. A color-tag change or a physical_properties change bumps `updated_at` (via moddatetime) but NOT `version`, and those changes matter because `color_tag` and `physical_properties` are both in the manifest. The updatedAt predicate catches them; the version predicate doesn't. Slight side effect: notes-only changes also mark stale even though notes aren't in the manifest. Harmless false positive — a re-export just re-ships identical files.
+- **Optimistic-update contract:** mutations that touch `physics_svgs` (`updateStatus`, `updateNotes`, `updateColor`, `updateSvgContent`, and the status-promotion branch of `addFeedback`) all chain `.select("version, updated_at").single()` and return those values from `dbWrite` so `optimisticUpdate` can patch them back into local state. Without this, the client's local `updatedAt` drifts from the DB after any mutation and the stale check silently misses changes until the next refresh.
+- **Exported-as line in DetailModal:** single 11px line below the SVG image, shown only when `lastExportedAt != null`, reading `Exported as v3 · 2026-04-09 · Bill` with an amber `(changes since)` suffix driven by `isStale(item)`. Hidden for idea_only items.
+- **FilterBar "Downloaded" toggle:** independent boolean that intersects with the status filter set. When on, only items with `lastExportedAt != null` are visible. Counts show `Downloaded (N)` regardless of the status filter so it always reflects the global project state.
 
 ### Model tiers
 
@@ -243,8 +265,11 @@ These are intentional design decisions, not bugs:
 - **Filter solo behavior.** Clicking a status filter when all are shown solos that status. Clicking the soloed filter restores all four. More intuitive than separate all/none controls.
 - **Idea-only modal variant.** When `status === "idea_only"`, the DetailModal shows a "Notes" textarea (how the concept maps to the physics engine) instead of the feedback form.
 - **Per-revision history via the DB.** The `archive_svg_version` trigger snapshots every status/content change to `svg_versions`. The artifact's in-memory undo stack was dropped in Task 3 because "undo" against a shared DB has weird multi-user semantics; a "restore previous version" UI built on `svg_versions` is the planned replacement.
-- **Auto-promote draft → revised on feedback OR on revision accept.** Adding feedback to a draft, or accepting a Claude revision on a draft, promotes the status to `revised`. Other statuses are left alone.
+- **Auto-promote draft → revised on feedback OR on revision accept.** Adding feedback to a draft, or accepting a Claude revision on a draft, promotes the status to `revised`. Other statuses are left alone. **Manual uploads also auto-promote** because they go through the same `updateSvgContent` path.
 - **Two-flow generation.** Generate-new vs revise-existing are separate UIs with separate state — don't try to unify them.
+- **Manual SVG download/upload in DetailModal.** Inline `↓ Download` / `↑ Upload` row directly under the existing SVG image. Hidden when `status === "idea_only"`. Workflow: download → edit in Inkscape (or any external editor) → upload → preview → Accept. Upload goes through `useSvgs.updateSvgContent` — same path as Claude revisions — so the version-archive trigger fires and a draft auto-promotes to revised. From the schema's POV an uploaded SVG and a Claude-generated SVG are indistinguishable; only `generation_sessions` records "Claude was involved".
+- **SVG sanitization on upload.** All uploaded SVGs are sanitized with [DOMPurify](https://github.com/cure53/DOMPurify) (`USE_PROFILES: { svg: true, svgFilters: true }`) before they hit state. This strips `<script>`, `on*` event attrs, `javascript:` URLs, `<foreignObject>` HTML payloads, and external `<use href>` exfiltration. If the sanitized output differs from the input the preview surfaces a non-blocking yellow warning so silent stripping isn't a mystery. **Note:** Claude-generated SVGs are NOT yet sanitized; that's a backlog item in [Dev_Tasks.md](Dev_Tasks.md).
+- **Upload size cap: 100 KB.** Existing files are ~1 KB; cap exists to catch "wrong file" disasters, not as a real budget.
 - **Keyboard nav.** Esc closes modal/system-prompt overlay; ← / → navigate visible items in modal. (Cmd/Ctrl+Z undo was removed in Task 3.)
 
 ## Commands

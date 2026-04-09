@@ -1,9 +1,15 @@
 import { STATUS_CONFIG, COLOR_RAMPS } from "../lib/constants.js";
+import { isStale } from "../hooks/useSvgs.js";
 
 // One cell in the SVG grid. Renders the SVG, label, status badge, and
-// optional feedback-count and color-tag indicators.
+// optional feedback-count / color-tag / stale-export indicators.
 export default function SvgCard({ item, onClick }) {
   const config = STATUS_CONFIG[item.status];
+  // "Stale export" = this item has been exported at least once, and has
+  // changed since. It'll re-ship on the next Download approved. The
+  // predicate lives in useSvgs.js so the grid dot, the DetailModal suffix,
+  // and the export-dialog scope filter all agree.
+  const isStaleExport = isStale(item);
 
   return (
     <div
@@ -79,6 +85,20 @@ export default function SvgCard({ item, onClick }) {
             height: 8,
             borderRadius: "50%",
             background: COLOR_RAMPS[item.colorTag]?.m,
+          }}
+        />
+      )}
+      {isStaleExport && (
+        <div
+          title="Changes since last export"
+          style={{
+            position: "absolute",
+            bottom: 4,
+            right: 4,
+            width: 8,
+            height: 8,
+            borderRadius: "50%",
+            background: "#F59E0B",
           }}
         />
       )}

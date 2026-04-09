@@ -14,14 +14,20 @@ import { supabase } from "../lib/supabase.js";
 //
 // Item shape (matches the artifact 1:1, plus a private _uuid field):
 //   {
-//     id: string,           // schema's `name`, e.g. "wooden_block"
-//     label: string,        // schema's `display_name`
-//     svg: string,          // schema's `svg_content`
+//     id: string,                     // schema's `name`, e.g. "wooden_block"
+//     label: string,                  // schema's `display_name`
+//     svg: string,                    // schema's `svg_content`
 //     status: enum,
 //     notes: string,
-//     colorTag: string|null, // ramp name, e.g. "blue", or null
+//     colorTag: string|null,          // ramp name, e.g. "blue", or null
 //     feedback: [{ text, date }],
-//     _uuid: string,        // schema's `id` (UUID), used for writes
+//     version: int,                   // physics_svgs.version
+//     updatedAt: string|null,         // ISO timestamp of the last update
+//     lastExportedAt: string|null,    // ISO timestamp or null
+//     lastExportedVersion: int|null,  // version at time of last export
+//     lastExportedByName: string|null,// display name of last exporter
+//     physicalProperties: object|null,// free-form jsonb (mass_kg etc.)
+//     _uuid: string,                  // schema's `id` (UUID), used for writes
 //   }
 
 function shapeItem(svgRow, feedbackRows) {
@@ -35,8 +41,45 @@ function shapeItem(svgRow, feedbackRows) {
     feedback: feedbackRows
       .filter((f) => f.svg_id === svgRow.id)
       .map((f) => ({ text: f.body, date: f.created_at })),
+    version: svgRow.version,
+    updatedAt: svgRow.updated_at ?? null,
+    lastExportedAt: svgRow.last_exported_at ?? null,
+    lastExportedVersion: svgRow.last_exported_version ?? null,
+    lastExportedByName: svgRow.last_exported_by_name ?? null,
+    physicalProperties: svgRow.physical_properties ?? null,
     _uuid: svgRow.id,
   };
+}
+
+// ---- Stale-export predicates ----
+//
+// The three sites that care about "has this changed since last export?" —
+// SvgCard's dot, DetailModal's "(changes since)" suffix, and
+// DownloadApprovedModal's "new or updated" scope filter — all need to use
+// the same definition or users get confused. These helpers are the single
+// source of truth.
+//
+// We compare updatedAt vs lastExportedAt rather than version vs
+// lastExportedVersion because the archive-version trigger only fires on
+// svg_content/status changes — a color or physical_properties change bumps
+// updated_at (via moddatetime) but NOT version, and we want those to count
+// as "needs re-export" because they change manifest.json.
+//
+// Server-side invariant: after the mark_svgs_exported RPC runs, updated_at
+// and last_exported_at are set to the same transaction-local now() value,
+// so they compare as exactly equal and isStale returns false.
+
+// True when an item has been exported at least once AND has changed since.
+export function isStale(item) {
+  if (item.lastExportedAt == null) return false;
+  if (item.updatedAt == null) return false;
+  return new Date(item.updatedAt) > new Date(item.lastExportedAt);
+}
+
+// True when an item should be in the "new or updated" export scope:
+// either never exported, or stale.
+export function needsExport(item) {
+  return item.lastExportedAt == null || isStale(item);
 }
 
 export function useSvgs(user) {
@@ -85,7 +128,11 @@ export function useSvgs(user) {
   }, [refresh]);
 
   // Optimistic patch helper: applies `patch` to the matching item locally,
-  // then runs `dbWrite`. Rolls back on error.
+  // then runs `dbWrite`. If `dbWrite` returns an object, that object is
+  // merged into the item AFTER the write succeeds — useful for patching
+  // server-assigned fields like `version` (bumped by the archive trigger)
+  // and `updatedAt` (set by moddatetime) back into local state without
+  // needing a full refresh. Rolls back to the snapshot on error.
   const optimisticUpdate = useCallback(
     async (id, patch, dbWrite) => {
       const previous = items;
@@ -93,7 +140,14 @@ export function useSvgs(user) {
         prev ? prev.map((item) => (item.id === id ? { ...item, ...patch } : item)) : prev
       );
       try {
-        await dbWrite();
+        const postPatch = await dbWrite();
+        if (postPatch) {
+          setItems((prev) =>
+            prev
+              ? prev.map((item) => (item.id === id ? { ...item, ...postPatch } : item))
+              : prev
+          );
+        }
       } catch (e) {
         setItems(previous);
         throw e;
@@ -107,16 +161,27 @@ export function useSvgs(user) {
     [items]
   );
 
+  // Mutations that touch physics_svgs all use `.select("version, updated_at")
+  // .single()` so the server-authoritative version and updated_at flow back
+  // into local state. Without this, the stale-check (updatedAt >
+  // lastExportedAt) would be computed against a stale local updatedAt and
+  // miss recent changes until the next refresh().
+  const SVG_RETURN_COLS = "version, updated_at";
+  const toPostPatch = (row) => ({ version: row.version, updatedAt: row.updated_at });
+
   const updateStatus = useCallback(
     async (id, status) => {
       const uuid = findUuid(id);
       if (!uuid || !user) return;
       await optimisticUpdate(id, { status }, async () => {
-        const { error: dbError } = await supabase
+        const { data, error: dbError } = await supabase
           .from("physics_svgs")
           .update({ status, updated_by: user.id })
-          .eq("id", uuid);
+          .eq("id", uuid)
+          .select(SVG_RETURN_COLS)
+          .single();
         if (dbError) throw dbError;
+        return toPostPatch(data);
       });
     },
     [findUuid, optimisticUpdate, user]
@@ -127,11 +192,14 @@ export function useSvgs(user) {
       const uuid = findUuid(id);
       if (!uuid || !user) return;
       await optimisticUpdate(id, { notes }, async () => {
-        const { error: dbError } = await supabase
+        const { data, error: dbError } = await supabase
           .from("physics_svgs")
           .update({ notes, updated_by: user.id })
-          .eq("id", uuid);
+          .eq("id", uuid)
+          .select(SVG_RETURN_COLS)
+          .single();
         if (dbError) throw dbError;
+        return toPostPatch(data);
       });
     },
     [findUuid, optimisticUpdate, user]
@@ -143,11 +211,14 @@ export function useSvgs(user) {
       if (!uuid || !user) return;
       const colorId = colorTag ? paletteIdByNameRef.current?.[colorTag] ?? null : null;
       await optimisticUpdate(id, { colorTag }, async () => {
-        const { error: dbError } = await supabase
+        const { data, error: dbError } = await supabase
           .from("physics_svgs")
           .update({ color_id: colorId, updated_by: user.id })
-          .eq("id", uuid);
+          .eq("id", uuid)
+          .select(SVG_RETURN_COLS)
+          .single();
         if (dbError) throw dbError;
+        return toPostPatch(data);
       });
     },
     [findUuid, optimisticUpdate, user]
@@ -178,12 +249,23 @@ export function useSvgs(user) {
           if (insertError) throw insertError;
 
           if (promotedStatus !== item.status) {
-            const { error: updateError } = await supabase
+            // Promotion branch: this UPDATE bumps version via the archive
+            // trigger AND updated_at via moddatetime. Return both so the
+            // local state reflects the new values and the stale-check
+            // against last_exported_at is correct without a refresh.
+            const { data, error: updateError } = await supabase
               .from("physics_svgs")
               .update({ status: promotedStatus, updated_by: user.id })
-              .eq("id", uuid);
+              .eq("id", uuid)
+              .select(SVG_RETURN_COLS)
+              .single();
             if (updateError) throw updateError;
+            return toPostPatch(data);
           }
+          // Non-promotion branch: feedback insert only, no physics_svgs
+          // UPDATE, no updated_at bump. This is correct — feedback isn't in
+          // the manifest, so feedback-only changes should NOT mark stale.
+          return undefined;
         }
       );
     },
@@ -214,9 +296,12 @@ export function useSvgs(user) {
   );
 
   // Replace the SVG markup of an existing item. Used by Flow B in
-  // DetailModal after the user accepts a revision. The
+  // DetailModal after the user accepts a revision, and by the manual
+  // upload flow in DetailModal after the user accepts a local edit. The
   // `archive_svg_version` trigger automatically snapshots the prior
-  // version into svg_versions and bumps the version number.
+  // version into svg_versions and bumps the version number — we return
+  // the bumped `version` and the fresh `updated_at` from the server so
+  // the local stale-check works immediately without a refresh.
   //
   // Promotes draft -> revised so the badge reflects the change.
   const updateSvgContent = useCallback(
@@ -231,19 +316,67 @@ export function useSvgs(user) {
         id,
         { svg: newSvgContent, status: promotedStatus },
         async () => {
-          const { error: dbError } = await supabase
+          const { data, error: dbError } = await supabase
             .from("physics_svgs")
             .update({
               svg_content: newSvgContent,
               status: promotedStatus,
               updated_by: user.id,
             })
-            .eq("id", uuid);
+            .eq("id", uuid)
+            .select(SVG_RETURN_COLS)
+            .single();
           if (dbError) throw dbError;
+          return toPostPatch(data);
         }
       );
     },
     [findUuid, items, optimisticUpdate, user]
+  );
+
+  // Stamp a batch of items as "exported right now" after a successful zip
+  // download. Calls the server-side `mark_svgs_exported` RPC (see schema
+  // migration 11b) so that `updated_at` and `last_exported_at` end up
+  // set to the same transaction-local now() value and the stale-check
+  // (`updatedAt > lastExportedAt`) resolves to "not stale" for the
+  // just-exported rows. A client-side UPDATE can't guarantee this
+  // because moddatetime bumps updated_at to server's now() and that
+  // diverges from any client-supplied last_exported_at ISO string.
+  //
+  // Optimistic local patch uses a client-side ISO string for BOTH fields
+  // (so they're locally equal and not-stale), and will self-correct to
+  // the real server timestamps on the next refresh().
+  const markExported = useCallback(
+    async (uuids) => {
+      if (!user || !items || !uuids || uuids.length === 0) return;
+      const nowIso = new Date().toISOString();
+      const previous = items;
+      setItems((prev) =>
+        prev?.map((item) =>
+          uuids.includes(item._uuid)
+            ? {
+                ...item,
+                lastExportedAt: nowIso,
+                lastExportedVersion: item.version,
+                updatedAt: nowIso,
+                // lastExportedByName isn't set optimistically — we don't
+                // have the display name in hand here. The next refresh
+                // will pull it from the view via pm_exported join.
+              }
+            : item
+        ) ?? prev
+      );
+      try {
+        const { error: rpcError } = await supabase.rpc("mark_svgs_exported", {
+          svg_ids: uuids,
+        });
+        if (rpcError) throw rpcError;
+      } catch (e) {
+        setItems(previous);
+        throw e;
+      }
+    },
+    [items, user]
   );
 
   // Bulk action: promote every draft to idea_only. One UPDATE statement.
@@ -277,5 +410,6 @@ export function useSvgs(user) {
     promoteAllDraftsToIdea,
     insertSvg,
     updateSvgContent,
+    markExported,
   };
 }

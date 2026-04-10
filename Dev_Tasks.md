@@ -15,11 +15,18 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done
 Done locally:
 - ✓ Tasks 1, 2, 3, 6, 7
 - ✓ Task 10 zip export (shipped ahead of Task 9; production walkthrough still pending)
+- ✓ Batch generate by category (Flow C) + color variant generation (Flow D)
+- ✓ Generation queue: Flows B, C, D are fire-and-forget with sequential processing and QueuePanel review
+- ✓ Color variants insert as NEW items named `{color}_{objectName}` with `colorTag` set
 
 Remaining:
 - Tasks 4, 5, 8, 9, and the production-walkthrough piece of 10
 
-The app works end-to-end on `vercel dev` (login → grid → review → both generate flows → audit log → manual download/upload → zip export with manifest). What's missing is multi-user (Realtime), production deploy, the keep-alive job, Duncan's bootstrap, and the prod walkthrough of the zip export.
+The app works end-to-end on `vercel dev` (login → grid → review → four generate flows with queue → audit log → manual download/upload → zip export with manifest). What's missing is multi-user (Realtime), production deploy, the keep-alive job, Duncan's bootstrap, and the prod walkthrough of the zip export.
+
+**Batch generation + queue requires:**
+- `modal deploy modal_functions/generate_svg.py` (deploys the new `batch_generate_svg_http` endpoint)
+- `vercel env add MODAL_BATCH_ENDPOINT_URL development` (the URL printed by `modal deploy` for the batch endpoint)
 
 **Suggested next-task order from here:**
 1. **Task 9** (deploy) — unlocks Duncan signing up via the production URL AND unblocks the remaining production-walkthrough piece of Task 10
@@ -221,23 +228,25 @@ This unblocks Duncan signing up (Task 4). Probably the most "yak shaving for the
 
 ### 10. End-to-end test + zip export of approved SVGs `[~]`
 
-**Zip export: done locally (+ stale-detection fix).** Shipped ahead of the Task 9 deploy because it turned out to be a useful standalone feature. What landed:
+**Zip export: done locally.** Shipped ahead of the Task 9 deploy because it turned out to be a useful standalone feature.
 
-**Stale-detection fix (follow-up, 2026-04-09):** the initial v1 used `version > lastExportedVersion` as the stale predicate. Two bugs surfaced during Bill's first real export:
+What landed:
+- Schema: four new nullable columns on `physics_svgs` — `last_exported_at`, `last_exported_version`, `last_exported_by`, `physical_properties` (jsonb). Added to [gist-supabase-schema.sql](gist-supabase-schema.sql) section 11a as an idempotent `alter ... if not exists` block; table definition and `svgs_with_details` view also updated inline. Migration run by Bill on 2026-04-08.
+- Section 11b follow-up migration: `mark_svgs_exported(uuid[])` RPC (server-side stamp). See "Stale-detection fix" below for why. Migration run by Bill on 2026-04-09 and verified in both the stale-dot and new-or-updated-scope paths.
+- `jszip@3.10.1` installed as a direct dep
+- [DownloadApprovedModal.jsx](src/components/DownloadApprovedModal.jsx) — dialog with scope radio (new-or-updated vs all-approved, counts inline) + manifest checkbox (default on). Gated `Download` button when the selected scope is empty. Scope filter uses the shared `needsExport(item)` helper from [useSvgs.js](src/hooks/useSvgs.js).
+- `useSvgs.markExported(uuids)` — calls the `mark_svgs_exported` RPC so `updated_at` and `last_exported_at` end up equal within one server transaction.
+- JSZip-based zip build in `handleConfirmDownload` (App.jsx). Zip filename `physics-sim-svgs-YYYY-MM-DD.zip`. Manifest shape is `{ manifest_version: 1, exported_at, exported_by, export_mode, items: [...] }` emitting `physical_properties` for each item.
+- Grid stale-export dot in [SvgCard.jsx](src/components/SvgCard.jsx) (amber 8px, bottom-right) driven by the shared `isStale(item)` helper.
+- Exported-as line in [DetailModal.jsx](src/components/DetailModal.jsx) reading `Exported as v3 · 2026-04-09 · Bill` with `(changes since)` in amber when `isStale(item)` is true.
+- [FilterBar.jsx](src/components/FilterBar.jsx) gained a `Downloaded (N)` toggle that intersects with the status filter.
+- All five `physics_svgs`-touching mutations in `useSvgs.js` now chain `.select("version, updated_at").single()` and flow the server values back into local state via the `optimisticUpdate` post-patch contract.
+
+**Stale-detection fix (2026-04-09, verified working):** the initial v1 used `version > lastExportedVersion` as the stale predicate. Two bugs surfaced during Bill's first real export:
 1. Uploading a replacement SVG bumped version in the DB via the archive trigger, but the optimistic update in `updateSvgContent` didn't propagate the new version back to local state — so the dot and dialog were wrong until the next browser refresh.
 2. Color-tag changes don't bump version at all (the archive trigger only fires on content/status). But `color_tag` IS in the manifest, so those changes should re-export.
 
-Fix: added migration 11b (`mark_svgs_exported` RPC, server-side stamp so `updated_at == last_exported_at` exactly within one transaction), switched the stale predicate to `updatedAt > lastExportedAt` via the shared `isStale(item)` / `needsExport(item)` helpers in [useSvgs.js](src/hooks/useSvgs.js), and refactored all physics_svgs mutations to chain `.select("version, updated_at").single()` so the optimistic update actually reflects the server's post-update values. **Bill must run migration 11b before testing.**
-
-What landed in the initial v1:
-- Schema migration: four new nullable columns on `physics_svgs` — `last_exported_at`, `last_exported_version`, `last_exported_by`, `physical_properties` (jsonb). Added to [gist-supabase-schema.sql](gist-supabase-schema.sql) section 11a as an idempotent `alter ... if not exists` block; table definition and `svgs_with_details` view also updated inline. **Bill must run the migration in Supabase SQL editor once before the feature works.**
-- `jszip@3.10.1` installed as a direct dep
-- [DownloadApprovedModal.jsx](src/components/DownloadApprovedModal.jsx) — dialog with scope radio (new-or-updated vs all-approved, counts inline) + manifest checkbox (default on). Gated `Download` button when the selected scope is empty.
-- `useSvgs.markExported(uuids)` — bulk stamp in one `Promise.all` of column-level UPDATEs. Doesn't fire the archive-version trigger because it only touches `last_exported_*` columns.
-- JSZip-based zip build in `handleConfirmDownload` (App.jsx). Zip filename `physics-sim-svgs-YYYY-MM-DD.zip`. Manifest shape is `{ manifest_version: 1, exported_at, exported_by, export_mode, items: [...] }` emitting `physical_properties` for each item.
-- Grid stale-export dot in [SvgCard.jsx](src/components/SvgCard.jsx) (amber 8px, bottom-right) when `version > lastExportedVersion`.
-- Exported-as line in [DetailModal.jsx](src/components/DetailModal.jsx) reading `Exported as v3 · 2026-04-08 · Bill` with `(changes since)` in amber when stale.
-- [FilterBar.jsx](src/components/FilterBar.jsx) gained a `Downloaded (N)` toggle that intersects with the status filter.
+Fix (shipped and verified by Bill): switched the stale predicate to `updatedAt > lastExportedAt` via the shared `isStale(item)` / `needsExport(item)` helpers; added migration 11b so `updated_at` and `last_exported_at` get set to the same transaction-local `now()` inside the server-side RPC (a client-supplied ISO string would diverge from moddatetime's server timestamp by the round-trip latency and falsely mark just-exported items as stale); refactored all `physics_svgs` mutations to chain `.select("version, updated_at").single()` and return those values via the new `optimisticUpdate` post-patch path so the client reflects the real server values immediately. Both the upload-content-revision case and the color-change case now correctly mark items stale without a browser refresh, and just-exported items correctly do NOT appear stale.
 
 **Remaining scope (deferred until Task 9 deploy)**
 - Walk through a full session against the **production URL** (not just localhost): log in, generate, revise, approve, download. Verifies Vercel prod env vars, Supabase RLS from a non-localhost origin, and the real-world cold-start feel of Modal.
@@ -251,7 +260,10 @@ What landed in the initial v1:
 - ✓ Zip downloads from localhost
 - ✓ Contains valid SVG files named with snake_case from `physics_svgs.name`
 - ✓ manifest.json present when the checkbox is on and carries `physical_properties`
-- ✓ `last_exported_*` columns stamp correctly; stale dot / changes-since line appear after a post-export revision
+- ✓ `last_exported_*` columns stamp correctly via RPC
+- ✓ Stale dot / changes-since line appear after a post-export content revision (upload path) without a browser refresh
+- ✓ Stale dot / changes-since line appear after a post-export color-tag change without a browser refresh
+- ✓ Just-exported items do NOT immediately flag as stale
 - ☐ Same, from production URL (waits on Task 9)
 
 ---
@@ -273,6 +285,8 @@ What landed in the initial v1:
 - **Streaming generation responses** (Modal SSE → Vercel SSE → React EventSource). Cooler UX than the current 5–15s spinner. Deferred from Task 7.
 - **Delete the `GeneratePanel.jsx` stub** left over from Task 2 (Flow A is in `GenerateNewModal.jsx` instead).
 - **Delete `gist-svg-manager.jsx`** once it's no longer useful as reference.
+- **Queue persistence across page refreshes.** Currently the generation queue lives in React state — refreshing the browser clears all pending/ready jobs. The Claude call still happened (audit row in `generation_sessions`), but the result preview is lost. Two possible fixes: (a) persist the queue to localStorage and rehydrate on load, (b) build a "pending results" view that reads `generation_sessions` rows with `status = 'completed'` and no corresponding `physics_svgs` update. Either works; (a) is simpler for the common "I accidentally refreshed" case, (b) is more robust for "I closed the tab and came back tomorrow." Low priority — the queue processes fast and Bill typically reviews results within minutes.
+- **Review: "Pick" color variant sets both SVG content AND color tag.** Currently, picking a color variant in Flow D updates the SVG content and also sets the color tag to match. This keeps the manifest's `color_tag` field accurate, but couples two operations that might warrant separate control. If Bill/Duncan find cases where they want to apply a color-variant SVG but NOT change the tag metadata, we can decouple the two writes behind a checkbox or a separate "Apply SVG only" button. Low priority — watch for friction signals.
 - **Physical-properties editor in DetailModal.** Task 10 shipped the `physical_properties jsonb` column and the manifest emits its contents verbatim, but there's currently no UI to edit those fields — Bill and Duncan have to set them via SQL. Eventual UI: a small form in DetailModal under the SVG preview with four inputs (`mass_kg`, `length_m`, `width_m`, `notes`), saving through a new `useSvgs.updatePhysicalProperties` mutation. Keep the input open-ended so experimenting with new fields (e.g. pendulum-specific `string_length_m`) is just a matter of adding a row, not a schema change. Only wire up after the v1 schema settles — premature UI makes the schema harder to change.
 - **Modal-side defense in depth:** add `requires_proxy_auth=True` to `generate_svg_http` and rotate Modal API tokens through Vercel. Currently relies on URL secrecy.
 - **Sanitize Claude-generated SVGs through DOMPurify too.** Manual uploads in DetailModal already get sanitized via DOMPurify (`USE_PROFILES: { svg: true, svgFilters: true }`) before being staged in `pendingUpload`. Claude output still flows directly into `dangerouslySetInnerHTML` without sanitization, which is inconsistent. The fix is small: pipe `useGeneration` results through the same sanitizer before exposing them on the preview, OR sanitize at render time inside the Card/Modal components. Either is fine; pick one place. Claude is unlikely to inject XSS into an SVG, but "trust no input at the boundary" is the right default.

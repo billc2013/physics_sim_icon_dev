@@ -4,6 +4,7 @@ import { STATUSES, buildSystemPrompt } from "./lib/constants.js";
 import { useAuth } from "./hooks/useAuth.js";
 import { useSvgs } from "./hooks/useSvgs.js";
 import { useGeneration } from "./hooks/useGeneration.js";
+import { useGenerationQueue } from "./hooks/useGenerationQueue.js";
 import LoginPage from "./components/LoginPage.jsx";
 import Header from "./components/Header.jsx";
 import Toast from "./components/Toast.jsx";
@@ -12,7 +13,9 @@ import SvgGrid from "./components/SvgGrid.jsx";
 import DetailModal from "./components/DetailModal.jsx";
 import SystemPrompt from "./components/SystemPrompt.jsx";
 import GenerateNewModal from "./components/GenerateNewModal.jsx";
+import BatchGenerateModal from "./components/BatchGenerateModal.jsx";
 import DownloadApprovedModal from "./components/DownloadApprovedModal.jsx";
+import QueuePanel from "./components/QueuePanel.jsx";
 
 export default function App() {
   const auth = useAuth();
@@ -32,12 +35,10 @@ export default function App() {
 function SignedInApp({ user, onSignOut }) {
   const svgs = useSvgs(user);
 
-  // Two independent useGeneration instances so Flow A and Flow B don't
-  // step on each other (you could be reviewing one item's revision while
-  // also having a "Generate new" panel open). Each tracks its own status,
-  // result, and error state.
+  // Flow A (Generate one) stays blocking because you need to name the
+  // item. Everything else (Flows B, C, D) is fire-and-forget via the queue.
   const newGeneration = useGeneration();
-  const reviseGeneration = useGeneration();
+  const queue = useGenerationQueue();
 
   // UI state.
   const [modalItemId, setModalItemId] = useState(null);
@@ -55,7 +56,9 @@ function SignedInApp({ user, onSignOut }) {
   const [pendingUpload, setPendingUpload] = useState(null);
   const [showSystemPrompt, setShowSystemPrompt] = useState(false);
   const [showGenerateNew, setShowGenerateNew] = useState(false);
+  const [showBatchGenerate, setShowBatchGenerate] = useState(false);
   const [showDownloadApproved, setShowDownloadApproved] = useState(false);
+  const [showQueue, setShowQueue] = useState(false);
   // FilterBar "Downloaded" toggle — when on, further restricts the grid to
   // items that have been exported at least once. Composes with the status
   // filter set (AND, not OR).
@@ -69,24 +72,29 @@ function SignedInApp({ user, onSignOut }) {
     toastTimerRef.current = setTimeout(() => setToast(null), 2200);
   }, []);
 
+  // Wire queue completion/error toasts
+  useEffect(() => {
+    queue.setOnComplete((job) => {
+      showToast(`${job.label} ready — open Queue to review`);
+    });
+    queue.setOnError((job) => {
+      showToast(`${job.label} failed`);
+    });
+  }, [queue, showToast]);
+
   const closeModal = useCallback(() => {
     setModalItemId(null);
     setFeedbackText("");
     setReviseModelTier("standard");
     setPendingUpload(null);
-    reviseGeneration.reset();
-  }, [reviseGeneration]);
+  }, []);
 
-  const openModalForId = useCallback(
-    (id) => {
-      setModalItemId(id);
-      setFeedbackText("");
-      setReviseModelTier("standard");
-      setPendingUpload(null);
-      reviseGeneration.reset();
-    },
-    [reviseGeneration]
-  );
+  const openModalForId = useCallback((id) => {
+    setModalItemId(id);
+    setFeedbackText("");
+    setReviseModelTier("standard");
+    setPendingUpload(null);
+  }, []);
 
   // Filter + search applied to items, in render order. Memoised against
   // the items array reference so we don't re-filter on unrelated renders.
@@ -217,46 +225,47 @@ function SignedInApp({ user, onSignOut }) {
     openModalForId(name);
   };
 
+  // Batch generate: category mode (Header "Batch generate")
+  // Fire-and-forget: adds a job to the queue, closes the modal.
+  const handleOpenBatchGenerate = () => {
+    setShowBatchGenerate(true);
+  };
+  const handleCloseBatchGenerate = () => {
+    setShowBatchGenerate(false);
+  };
+  const handleBatchGenerate = ({ category, modelTier }) => {
+    queue.addJob({
+      type: "batch_category",
+      label: `${category} — batch 10`,
+      request: { mode: "category", category, count: 10, modelTier },
+    });
+    showToast("Batch generate queued");
+  };
+
   // Flow B: send the currently-open detail modal item to Claude for revision.
-  // Builds the context from the item's existing feedback + any pending
-  // unsaved feedbackText the user has typed. The tier is read from
-  // `reviseModelTier` state (owned by this component and shown in the
-  // DetailModal as a pill switch), so the backend picks Sonnet 4.6 vs
-  // Opus 4.6 for this specific call.
-  const handleSendToClaude = async (item) => {
+  // Fire-and-forget: adds a job to the queue. The user can close the
+  // DetailModal and review the result in QueuePanel when it's ready.
+  const handleSendToClaude = (item) => {
     const feedbackHistory = item.feedback.map((f) => f.text);
     if (feedbackText.trim()) feedbackHistory.push(feedbackText.trim());
-    try {
-      await reviseGeneration.generate({
+    queue.addJob({
+      type: "revise",
+      label: `${item.label} — revise`,
+      request: {
         objectName: item.id,
         colorTag: item.colorTag,
         svgId: item._uuid,
         feedbackHistory: feedbackHistory.length ? feedbackHistory : null,
         currentSvg: item.svg,
         modelTier: reviseModelTier,
-      });
-    } catch (e) {
-      showToast(`Error: ${e.message ?? e}`);
-    }
-  };
-  const handleAcceptRevision = async (id, newSvg) => {
-    try {
-      await svgs.updateSvgContent(id, newSvg);
-      reviseGeneration.reset();
-      showToast("Revision saved");
-    } catch (e) {
-      showToast(`Error: ${e.message ?? e}`);
-    }
-  };
-  const handleDiscardRevision = () => {
-    reviseGeneration.reset();
+        itemId: item.id,
+      },
+    });
+    showToast("Revision queued");
   };
 
-  // Manual SVG upload accept/discard. Goes through the same updateSvgContent
-  // path Claude revisions use, so the version-archive trigger fires and a
-  // draft auto-promotes to revised. From the schema's POV an uploaded SVG
-  // and a Claude-generated SVG are indistinguishable — only the
-  // generation_sessions table tracks "Claude was involved".
+  // Manual SVG upload accept/discard. Goes through updateSvgContent so
+  // versioning and draft→revised promotion work identically to revisions.
   const handleAcceptUpload = async (id) => {
     if (!pendingUpload) return;
     try {
@@ -269,6 +278,73 @@ function SignedInApp({ user, onSignOut }) {
   };
   const handleDiscardUpload = () => {
     setPendingUpload(null);
+  };
+
+  // Color variant generation: fire-and-forget to queue. Color variants
+  // are inserted as NEW items named {color}_{objectName}, not as
+  // replacements of the existing item.
+  const handleGenerateColorVariants = (item, colorTags, tierForVariants) => {
+    const feedbackHistory = item.feedback.map((f) => f.text);
+    if (feedbackText.trim()) feedbackHistory.push(feedbackText.trim());
+    queue.addJob({
+      type: "batch_colors",
+      label: `${item.label} — ${colorTags.length} colors`,
+      request: {
+        mode: "color_variants",
+        objectName: item.id,
+        svgId: item._uuid,
+        currentSvg: item.svg,
+        feedbackHistory: feedbackHistory.length ? feedbackHistory : null,
+        colorTags,
+        modelTier: tierForVariants,
+      },
+    });
+    showToast("Color variants queued");
+  };
+
+  // ---------- Queue accept handlers (called from QueuePanel) ----------
+
+  const handleQueueAcceptRevise = async (job) => {
+    try {
+      await svgs.updateSvgContent(job.request.itemId, job.result.svg);
+      queue.discardJob(job.id);
+      showToast("Revision saved");
+    } catch (e) {
+      showToast(`Error: ${e.message ?? e}`);
+    }
+  };
+
+  const handleQueueAcceptBatch = async (job, selectedItems) => {
+    try {
+      for (const item of selectedItems) {
+        await svgs.insertSvg({
+          name: item.name,
+          displayName: item.name.replace(/_/g, " "),
+          svgContent: item.svg,
+        });
+      }
+      queue.discardJob(job.id);
+      showToast(`Added ${selectedItems.length} SVGs`);
+    } catch (e) {
+      showToast(`Error: ${e.message ?? e}`);
+    }
+  };
+
+  const handleQueueAcceptColors = async (job, selectedItems) => {
+    try {
+      for (const item of selectedItems) {
+        await svgs.insertSvg({
+          name: item.name,
+          displayName: item.name.replace(/_/g, " "),
+          svgContent: item.svg,
+          colorTag: item.color,
+        });
+      }
+      queue.discardJob(job.id);
+      showToast(`Added ${selectedItems.length} color variants`);
+    } catch (e) {
+      showToast(`Error: ${e.message ?? e}`);
+    }
   };
 
   // "Download approved" — opens the scope/manifest dialog. The dialog
@@ -378,6 +454,9 @@ function SignedInApp({ user, onSignOut }) {
         userEmail={user.email}
         onSignOut={onSignOut}
         onGenerateMore={handleGenerateMore}
+        onBatchGenerate={handleOpenBatchGenerate}
+        onShowQueue={() => setShowQueue(true)}
+        queueCounts={queue}
         onShowSystemPrompt={() => setShowSystemPrompt(true)}
         onDownloadApproved={handleDownloadApproved}
       />
@@ -407,6 +486,7 @@ function SignedInApp({ user, onSignOut }) {
 
       {modalItem && (
         <DetailModal
+          key={modalItem.id}
           item={modalItem}
           feedbackText={feedbackText}
           onFeedbackTextChange={setFeedbackText}
@@ -418,9 +498,8 @@ function SignedInApp({ user, onSignOut }) {
           onPrevious={() => navigateModal(-1)}
           onNext={() => navigateModal(1)}
           onSendToClaude={handleSendToClaude}
-          generation={reviseGeneration}
-          onAcceptRevision={handleAcceptRevision}
-          onDiscardRevision={handleDiscardRevision}
+          onGenerateColorVariants={handleGenerateColorVariants}
+          itemQueueJobs={queue.getJobsForItem(modalItem.id)}
           modelTier={reviseModelTier}
           onModelTierChange={setReviseModelTier}
           pendingUpload={pendingUpload}
@@ -438,6 +517,26 @@ function SignedInApp({ user, onSignOut }) {
           onAccept={handleNewAccept}
           onClose={handleCloseGenerateNew}
           onJumpToExisting={handleJumpToExisting}
+        />
+      )}
+
+      {showBatchGenerate && (
+        <BatchGenerateModal
+          onGenerate={handleBatchGenerate}
+          onClose={handleCloseBatchGenerate}
+        />
+      )}
+
+      {showQueue && (
+        <QueuePanel
+          jobs={queue.jobs}
+          existingNames={existingNames}
+          onAcceptRevise={handleQueueAcceptRevise}
+          onAcceptBatch={handleQueueAcceptBatch}
+          onAcceptColors={handleQueueAcceptColors}
+          onDiscard={queue.discardJob}
+          onRetry={queue.retryJob}
+          onClose={() => setShowQueue(false)}
         />
       )}
 

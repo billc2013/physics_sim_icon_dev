@@ -29,6 +29,11 @@ export const COLOR_RAMPS = {
 // when Supabase queries replace localStorage.
 export const STORAGE_KEY = "gist-svg-v2";
 
+// Categories from shared/system_prompt.json, exported for the batch-generate
+// category dropdown. Adding one here (in the JSON) automatically updates
+// both the system prompt and the dropdown.
+export const CATEGORIES = systemPromptConfig.categories;
+
 // Builds the system prompt sent to Claude during generation. Includes the
 // full library of existing object names so Claude can avoid duplicates.
 //
@@ -39,8 +44,9 @@ export const STORAGE_KEY = "gist-svg-v2";
 // the Python side to pick up the change.
 export function buildSystemPrompt(items) {
   const rules = systemPromptConfig.rules.map((r) => `- ${r}`).join("\n");
+  const categories = `- Categories: ${systemPromptConfig.categories.join(", ")}`;
   const library = systemPromptConfig.librarySection
     .replace("{count}", items.length)
     .replace("{names}", items.map((i) => i.id).join(", "));
-  return `${systemPromptConfig.header}\n${rules}\n\n${library}`;
+  return `${systemPromptConfig.header}\n${rules}\n${categories}\n\n${library}`;
 }

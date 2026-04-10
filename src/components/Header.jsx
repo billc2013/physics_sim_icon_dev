@@ -9,9 +9,21 @@ export default function Header({
   userEmail,
   onSignOut,
   onGenerateMore,
+  onBatchGenerate,
+  onShowQueue,
+  queueCounts,
   onShowSystemPrompt,
   onDownloadApproved,
 }) {
+  const queueLabel = (() => {
+    if (!queueCounts || !queueCounts.hasActivity) return null;
+    const parts = [];
+    if (queueCounts.generating) parts.push(`${queueCounts.generating} running`);
+    if (queueCounts.queued) parts.push(`${queueCounts.queued} queued`);
+    if (queueCounts.ready) parts.push(`${queueCounts.ready} ready`);
+    if (queueCounts.errored) parts.push(`${queueCounts.errored} err`);
+    return parts.join(", ");
+  })();
   return (
     <div
       style={{
@@ -37,8 +49,26 @@ export default function Header({
       </div>
       <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
         <button onClick={onGenerateMore} style={{ fontSize: 13 }}>
-          Generate more &#8599;
+          Generate one &#8599;
         </button>
+        <button onClick={onBatchGenerate} style={{ fontSize: 13 }}>
+          Batch generate &#8599;
+        </button>
+        {queueLabel && (
+          <button
+            onClick={onShowQueue}
+            style={{
+              fontSize: 12,
+              padding: "4px 10px",
+              borderRadius: "var(--border-radius-md)",
+              background: queueCounts.ready > 0 ? "#E1F5EE" : "#DBEAFE",
+              color: queueCounts.ready > 0 ? "#085041" : "#1E3A8A",
+              fontWeight: 500,
+            }}
+          >
+            Queue ({queueLabel})
+          </button>
+        )}
         <button onClick={onShowSystemPrompt} style={{ fontSize: 13 }}>
           System prompt
         </button>

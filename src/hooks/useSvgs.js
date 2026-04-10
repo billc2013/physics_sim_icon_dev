@@ -272,18 +272,25 @@ export function useSvgs(user) {
     [findUuid, items, optimisticUpdate, user]
   );
 
-  // Insert a brand-new SVG into the library. Used by Flow A in
-  // GenerateNewModal after the user accepts a Claude-generated SVG.
+  // Insert a brand-new SVG into the library. Used by Flow A
+  // (GenerateNewModal), Flow C (batch category), and Flow D (color
+  // variants — each variant is inserted as a separate item with name
+  // `{color}_{objectName}`). Optional `colorTag` sets the color palette
+  // on insert so we don't need a separate updateColor call.
   // Returns the inserted item id (the schema's `name`) on success.
   const insertSvg = useCallback(
-    async ({ name, displayName, svgContent }) => {
+    async ({ name, displayName, svgContent, colorTag }) => {
       if (!user) return null;
+      const colorId = colorTag
+        ? paletteIdByNameRef.current?.[colorTag] ?? null
+        : null;
       const { error: dbError } = await supabase.from("physics_svgs").insert({
         name,
         display_name: displayName,
         svg_content: svgContent,
         status: "draft",
         notes: "",
+        color_id: colorId,
         created_by: user.id,
         updated_by: user.id,
       });

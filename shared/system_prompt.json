@@ -4,8 +4,11 @@
     "64x64 viewBox, simple silhouettes, Tailwind-inspired fills",
     "No external deps, inline styles only",
     "Monochromatic 3-tone (light/mid/dark from same hue)",
-    "People: modeled after traffic sign pictograms, no faces or details",
-    "Categories: vehicles, projectiles, blocks, people, connectors, planes, pendulums, everyday, lab, space, air resistance"
+    "People: modeled after traffic sign pictograms, no faces or details"
+  ],
+  "categories": [
+    "vehicles", "projectiles", "blocks", "people", "connectors",
+    "planes", "pendulums", "everyday", "lab", "space", "air resistance"
   ],
   "librarySection": "Library ({count}): {names}"
 }

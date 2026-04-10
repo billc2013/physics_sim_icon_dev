@@ -114,6 +114,30 @@ class GenerateRequest(BaseModel):
     model_tier: Optional[str] = DEFAULT_MODEL_TIER
 
 
+class BatchGenerateRequest(BaseModel):
+    """Request body for the batch HTTP endpoint. Two modes:
+
+    category: Generate `count` new SVGs for a given category. Claude picks
+              the names. Returns [{name, svg}].
+
+    color_variants: Generate an existing object in multiple color palettes.
+                    Returns [{color, svg}].
+    """
+
+    mode: str  # "category" or "color_variants"
+    requested_by: str
+    model_tier: Optional[str] = DEFAULT_MODEL_TIER
+    # Category mode
+    category: Optional[str] = None
+    count: int = 10
+    # Color variant mode
+    object_name: Optional[str] = None
+    svg_id: Optional[str] = None
+    current_svg: Optional[str] = None
+    feedback_history: Optional[list[str]] = None
+    color_palettes: Optional[list[dict]] = None  # [{name, light, mid, dark}]
+
+
 def build_system_prompt(library_names: list[str]) -> str:
     """
     Render the system prompt from shared/system_prompt.json.
@@ -126,12 +150,13 @@ def build_system_prompt(library_names: list[str]) -> str:
     with open(SYSTEM_PROMPT_REMOTE_PATH) as f:
         config = json.load(f)
     rules = "\n".join(f"- {rule}" for rule in config["rules"])
+    categories = f"- Categories: {', '.join(config['categories'])}"
     library = (
         config["librarySection"]
         .replace("{count}", str(len(library_names)))
         .replace("{names}", ", ".join(library_names))
     )
-    return f"{config['header']}\n{rules}\n\n{library}"
+    return f"{config['header']}\n{rules}\n{categories}\n\n{library}"
 
 
 def build_user_prompt(
@@ -179,6 +204,96 @@ def extract_svg_from_response(text: str) -> str:
             lines = lines[:-1]
         text = "\n".join(lines).strip()
     return text
+
+
+def build_batch_user_prompt_category(
+    category: str,
+    count: int,
+) -> str:
+    """Build the user prompt for the category batch mode."""
+    return (
+        f'Generate {count} new physics SVG icons for the "{category}" category.\n\n'
+        "For each, pick a unique snake_case name that doesn't already exist in "
+        "the library listed in the system prompt.\n\n"
+        "Return ONLY a JSON array where each element is "
+        '{"name": "snake_case_name", "svg": "<svg>...</svg>"}. '
+        "No commentary, no code fences."
+    )
+
+
+def build_batch_user_prompt_colors(
+    object_name: str,
+    color_palettes: list[dict],
+    current_svg: Optional[str],
+    feedback_history: Optional[list[str]],
+) -> str:
+    """Build the user prompt for the color-variant batch mode."""
+    parts = [f'Generate the "{object_name}" SVG in each of these color palettes:']
+    for pal in color_palettes:
+        parts.append(
+            f"- {pal['name']}: light={pal['light']}, mid={pal['mid']}, dark={pal['dark']}"
+        )
+    if feedback_history:
+        parts.append(f"\nFeedback so far: {'; '.join(feedback_history)}")
+    if current_svg:
+        parts.append(f"\nCurrent SVG:\n{current_svg}")
+    parts.append(
+        '\nReturn ONLY a JSON array where each element is '
+        '{"color": "palette_name", "svg": "<svg>...</svg>"}. '
+        "No commentary, no code fences."
+    )
+    return "\n".join(parts)
+
+
+def extract_json_from_response(text: str) -> list[dict]:
+    """Pull a JSON array out of Claude's response.
+
+    Claude usually returns just the JSON, but may wrap it in code fences
+    or add commentary before/after. We try several strategies:
+    1. Direct parse
+    2. Strip code fences then parse
+    3. Find the first '[' and last ']' and parse that substring
+    """
+    text = text.strip()
+
+    # 1. Direct parse
+    try:
+        result = json.loads(text)
+        if isinstance(result, list):
+            return result
+    except json.JSONDecodeError:
+        pass
+
+    # 2. Strip code fences
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        fenced = "\n".join(lines).strip()
+        try:
+            result = json.loads(fenced)
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError:
+            pass
+
+    # 3. Bracket extraction
+    first_bracket = text.find("[")
+    last_bracket = text.rfind("]")
+    if first_bracket != -1 and last_bracket > first_bracket:
+        try:
+            result = json.loads(text[first_bracket : last_bracket + 1])
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError(
+        f"Could not extract JSON array from Claude's response. "
+        f"First 200 chars: {text[:200]}"
+    )
 
 
 @app.function(
@@ -366,6 +481,192 @@ def generate_svg_http(payload: GenerateRequest) -> dict:
         color_palette=payload.color_palette,
         current_svg=payload.current_svg,
         model_tier=payload.model_tier,
+    )
+
+
+@app.function(
+    image=image,
+    secrets=[
+        modal.Secret.from_name("anthropic-api"),
+        modal.Secret.from_name("supabase_for_svg_gen"),
+    ],
+    timeout=300,  # batch calls produce much more output — generous timeout
+)
+def batch_generate_svg(
+    mode: str,
+    requested_by: str,
+    model_tier: Optional[str] = DEFAULT_MODEL_TIER,
+    category: Optional[str] = None,
+    count: int = 10,
+    object_name: Optional[str] = None,
+    svg_id: Optional[str] = None,
+    current_svg: Optional[str] = None,
+    feedback_history: Optional[list[str]] = None,
+    color_palettes: Optional[list[dict]] = None,
+) -> dict:
+    """
+    Batch-generate SVGs via a single Claude call. Two modes:
+
+    category: Generate `count` new SVGs for a category. Claude picks names.
+    color_variants: Generate an existing object in multiple color palettes.
+
+    Returns:
+        {
+          "items": [{"name": str, "svg": str, "color": str|None}, ...],
+          "session_id": "uuid",
+          "input_tokens": int,
+          "output_tokens": int,
+          "cost_usd": float,
+        }
+    """
+    from anthropic import Anthropic
+    from supabase import create_client
+
+    if mode not in ("category", "color_variants"):
+        raise ValueError(f"Unknown mode '{mode}'. Expected 'category' or 'color_variants'.")
+
+    tier_key = model_tier or DEFAULT_MODEL_TIER
+    if tier_key not in MODEL_TIERS:
+        raise ValueError(
+            f"Unknown model_tier '{tier_key}'. "
+            f"Expected one of: {sorted(MODEL_TIERS.keys())}"
+        )
+    tier = MODEL_TIERS[tier_key]
+    model_id = tier["model"]
+    input_price_per_mtok = tier["input_price_per_mtok"]
+    output_price_per_mtok = tier["output_price_per_mtok"]
+
+    anthropic_client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    supabase_client = create_client(
+        os.environ["SUPABASE_DATA_URL"],
+        os.environ["SUPABASE_SERVICE_ROLE_KEY"],
+    )
+
+    # Build prompts
+    library_result = (
+        supabase_client.from_("physics_svgs").select("name").execute()
+    )
+    library_names = sorted(row["name"] for row in (library_result.data or []))
+    system_prompt = build_system_prompt(library_names)
+
+    if mode == "category":
+        user_prompt = build_batch_user_prompt_category(category or "mixed", count)
+    else:
+        user_prompt = build_batch_user_prompt_colors(
+            object_name or "", color_palettes or [], current_svg, feedback_history
+        )
+
+    # Audit row
+    session_insert = (
+        supabase_client.from_("generation_sessions")
+        .insert(
+            {
+                "svg_id": svg_id,
+                "requested_by": requested_by,
+                "model": model_id,
+                "system_prompt": system_prompt,
+                "user_prompt": user_prompt,
+                "status": "pending",
+            }
+        )
+        .execute()
+    )
+    session_id = session_insert.data[0]["id"]
+
+    try:
+        # Batch calls produce much more output (10 SVGs × ~500-1000 tokens
+        # each), so we need a generous max_tokens.
+        message = anthropic_client.messages.create(
+            model=model_id,
+            max_tokens=32768,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+
+        response_text = "".join(
+            block.text for block in message.content if block.type == "text"
+        )
+        raw_items = extract_json_from_response(response_text)
+
+        # Normalize items into a consistent shape
+        items = []
+        for raw in raw_items:
+            svg = raw.get("svg", "")
+            svg = extract_svg_from_response(svg) if svg else ""
+            items.append({
+                "name": raw.get("name", object_name or "unknown"),
+                "svg": svg,
+                "color": raw.get("color", None),
+            })
+
+        input_tokens = message.usage.input_tokens
+        output_tokens = message.usage.output_tokens
+        cost_usd = (
+            input_tokens * input_price_per_mtok / 1_000_000
+            + output_tokens * output_price_per_mtok / 1_000_000
+        )
+
+        # Store the full JSON response text in response_svg for auditability
+        supabase_client.from_("generation_sessions").update(
+            {
+                "response_svg": response_text[:10000],
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cost_usd": round(cost_usd, 6),
+                "status": "completed",
+                "completed_at": "now()",
+            }
+        ).eq("id", session_id).execute()
+
+        return {
+            "items": items,
+            "session_id": session_id,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cost_usd": round(cost_usd, 6),
+        }
+
+    except Exception as exc:
+        supabase_client.from_("generation_sessions").update(
+            {
+                "status": "failed",
+                "error_message": str(exc)[:1000],
+                "completed_at": "now()",
+            }
+        ).eq("id", session_id).execute()
+        raise
+
+
+@app.function(
+    image=image,
+    secrets=[
+        modal.Secret.from_name("anthropic-api"),
+        modal.Secret.from_name("supabase_for_svg_gen"),
+    ],
+    timeout=300,
+)
+@modal.fastapi_endpoint(method="POST")
+def batch_generate_svg_http(payload: BatchGenerateRequest) -> dict:
+    """
+    HTTPS POST endpoint for batch generation. Called by the Vercel proxy
+    `api/batch-generate.ts`.
+
+    Deploy:
+        modal deploy modal_functions/generate_svg.py
+    Modal will print the new endpoint URL on stdout. Copy it into Vercel as
+    `MODAL_BATCH_ENDPOINT_URL`.
+    """
+    return batch_generate_svg.local(
+        mode=payload.mode,
+        requested_by=payload.requested_by,
+        model_tier=payload.model_tier,
+        category=payload.category,
+        count=payload.count,
+        object_name=payload.object_name,
+        svg_id=payload.svg_id,
+        current_svg=payload.current_svg,
+        feedback_history=payload.feedback_history,
+        color_palettes=payload.color_palettes,
     )
 
 

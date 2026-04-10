@@ -1,6 +1,6 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import DOMPurify from "dompurify";
-import { STATUSES, STATUS_CONFIG } from "../lib/constants.js";
+import { STATUSES, STATUS_CONFIG, COLOR_RAMPS } from "../lib/constants.js";
 import { isStale } from "../hooks/useSvgs.js";
 import ColorPaletteTag from "./ColorPaletteTag.jsx";
 import FeedbackHistory from "./FeedbackHistory.jsx";
@@ -29,12 +29,18 @@ const SVG_SANITIZE_CONFIG = { USE_PROFILES: { svg: true, svgFilters: true } };
 //
 // `modelTier` / `onModelTierChange` are owned by the parent (App.jsx) and
 // reset to "standard" whenever a new item is opened, alongside the other
-// per-item state (feedbackText, reviseGeneration). This keeps Advanced
-// from being sticky across items.
+// per-item state (feedbackText). This keeps Advanced from being sticky
+// across items.
 //
-// Manual upload uses the same preview/Accept/Discard pattern as the
-// Claude revision flow and goes through `updateSvgContent`, so versioning
-// and draft→revised promotion work identically. `pendingUpload` shape:
+// "Send to Claude" and "Generate in N colors" are fire-and-forget: they
+// add a job to the generation queue. The user can close the modal and
+// review results in the QueuePanel later. `itemQueueJobs` is the filtered
+// subset of queue jobs relevant to this item (for showing inline status
+// like "Generating..." or "1 result ready — open queue to review").
+//
+// Manual upload uses the same preview/Accept/Discard pattern and goes
+// through `updateSvgContent`, so versioning and draft→revised promotion
+// work identically. `pendingUpload` shape:
 //   { svg: string, warning: string|null } | null
 export default function DetailModal({
   item,
@@ -48,9 +54,8 @@ export default function DetailModal({
   onPrevious,
   onNext,
   onSendToClaude,
-  generation,
-  onAcceptRevision,
-  onDiscardRevision,
+  onGenerateColorVariants,
+  itemQueueJobs,
   modelTier,
   onModelTierChange,
   pendingUpload,
@@ -61,6 +66,13 @@ export default function DetailModal({
   const textareaRef = useRef(null);
   const fileInputRef = useRef(null);
   const isIdeaOnly = item.status === "idea_only";
+
+  // Multi-color selection for "Generate in all colors". Resets per-item
+  // because App.jsx renders DetailModal with key={modalItem.id}, so React
+  // remounts this component (resetting all useState) on item navigation.
+  const [selectedColors, setSelectedColors] = useState(
+    () => (item.colorTag ? new Set([item.colorTag]) : new Set())
+  );
 
   // Auto-focus the textarea (feedback or notes) when the modal opens or
   // navigates to a new item.
@@ -273,7 +285,6 @@ export default function DetailModal({
             </button>
             <button
               onClick={handleUploadClick}
-              disabled={generation?.status === "generating"}
               style={{
                 fontSize: 12,
                 color: "var(--color-text-secondary)",
@@ -385,83 +396,30 @@ export default function DetailModal({
           </div>
         )}
 
-        {generation?.status === "error" && generation.error && (
+        {/* Queue status for this item — lightweight inline indicator so
+            the user knows their fire-and-forget request is in flight or
+            ready for review in the QueuePanel. */}
+        {itemQueueJobs && itemQueueJobs.length > 0 && (
           <div
             style={{
               marginBottom: 12,
-              padding: "8px 10px",
+              padding: "6px 10px",
               borderRadius: "var(--border-radius-md)",
-              background: "#FECACA",
-              color: "#991B1B",
-              fontSize: 12,
+              background: "#DBEAFE",
+              color: "#1E3A8A",
+              fontSize: 11,
             }}
           >
-            {generation.error.message ?? String(generation.error)}
-          </div>
-        )}
-
-        {generation?.status === "ready" && generation.result && (
-          <div
-            style={{
-              marginBottom: 16,
-              padding: 12,
-              borderRadius: "var(--border-radius-md)",
-              border: "1px solid var(--color-border-secondary)",
-            }}
-          >
-            <div
-              style={{
-                fontSize: 12,
-                fontWeight: 500,
-                color: "var(--color-text-secondary)",
-                marginBottom: 6,
-              }}
-            >
-              Revision preview
-            </div>
-            <div
-              style={{
-                background: "var(--color-background-secondary)",
-                borderRadius: "var(--border-radius-md)",
-                padding: 24,
-                textAlign: "center",
-                marginBottom: 8,
-              }}
-            >
-              <div
-                dangerouslySetInnerHTML={{ __html: generation.result.svg }}
-                style={{ width: 180, height: 180, margin: "0 auto" }}
-              />
-            </div>
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-              }}
-            >
-              <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>
-                {generation.result.input_tokens}+{generation.result.output_tokens} tokens
-                &middot; ${generation.result.cost_usd.toFixed(4)}
-              </span>
-              <div style={{ display: "flex", gap: 6 }}>
-                <button onClick={onDiscardRevision} style={{ fontSize: 12 }}>
-                  Discard
-                </button>
-                <button
-                  onClick={() => onSendToClaude(item)}
-                  style={{ fontSize: 12 }}
-                >
-                  Try again
-                </button>
-                <button
-                  onClick={() => onAcceptRevision(item.id, generation.result.svg)}
-                  style={{ fontSize: 12, fontWeight: 500 }}
-                >
-                  Accept
-                </button>
-              </div>
-            </div>
+            {(() => {
+              const gen = itemQueueJobs.filter((j) => j.status === "generating").length;
+              const q = itemQueueJobs.filter((j) => j.status === "queued").length;
+              const r = itemQueueJobs.filter((j) => j.status === "ready").length;
+              const parts = [];
+              if (gen) parts.push(`${gen} generating`);
+              if (q) parts.push(`${q} queued`);
+              if (r) parts.push(`${r} ready`);
+              return `Queue: ${parts.join(", ")} — open Queue to review`;
+            })()}
           </div>
         )}
 
@@ -573,9 +531,68 @@ export default function DetailModal({
           <ModelTierToggle
             value={modelTier}
             onChange={onModelTierChange}
-            disabled={generation?.status === "generating"}
           />
         </div>
+
+        {/* Multi-color "Generate in all colors" — fire-and-forget to queue.
+            Color variants are inserted as NEW items named {color}_{objectName},
+            not as replacements of this item. Results reviewed in QueuePanel. */}
+        {!isIdeaOnly && (
+          <div style={{ marginTop: 10 }}>
+            <div
+              style={{
+                fontSize: 12,
+                fontWeight: 500,
+                color: "var(--color-text-secondary)",
+                marginBottom: 4,
+              }}
+            >
+              Generate in colors
+            </div>
+            <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginBottom: 6 }}>
+              {Object.entries(COLOR_RAMPS).map(([key, ramp]) => {
+                const isOn = selectedColors.has(key);
+                return (
+                  <button
+                    key={key}
+                    type="button"
+                    onClick={() => {
+                      setSelectedColors((prev) => {
+                        const next = new Set(prev);
+                        if (next.has(key)) next.delete(key);
+                        else next.add(key);
+                        return next;
+                      });
+                    }}
+                    title={ramp.n}
+                    style={{
+                      width: 24,
+                      height: 24,
+                      borderRadius: "50%",
+                      cursor: "pointer",
+                      padding: 0,
+                      background: `linear-gradient(135deg, ${ramp.l} 33%, ${ramp.m} 66%, ${ramp.d})`,
+                      border: isOn
+                        ? "2px solid var(--color-text-primary)"
+                        : "2px solid transparent",
+                      outline: isOn
+                        ? "2px solid var(--color-background-primary)"
+                        : "none",
+                      opacity: isOn ? 1 : 0.4,
+                    }}
+                  />
+                );
+              })}
+              <button
+                onClick={() => onGenerateColorVariants(item, [...selectedColors], modelTier)}
+                disabled={selectedColors.size === 0}
+                style={{ fontSize: 11, marginLeft: 6 }}
+              >
+                Generate in {selectedColors.size} color{selectedColors.size === 1 ? "" : "s"} &#8599;
+              </button>
+            </div>
+          </div>
+        )}
 
         <div
           style={{
@@ -592,12 +609,9 @@ export default function DetailModal({
           </button>
           <button
             onClick={() => onSendToClaude(item)}
-            disabled={generation?.status === "generating"}
             style={{ fontSize: 12 }}
           >
-            {generation?.status === "generating"
-              ? "Generating..."
-              : "Send to Claude \u2197"}
+            Send to Claude &#8599;
           </button>
           <button
             onClick={onNext}

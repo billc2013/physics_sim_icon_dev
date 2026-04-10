@@ -23,8 +23,9 @@ Working end-to-end **on localhost**:
 - ✓ Bill exists in `project_members` as owner; RLS enforced
 - ✓ Modal `generate_svg` deployed with both `modal run` entrypoint and `@modal.fastapi_endpoint` HTTP endpoint
 - ✓ Vercel `api/generate.ts` proxy validates JWTs and forwards to Modal (locally via `vercel dev`)
-- ✓ Two generation flows working end-to-end through the browser:
-  - **Flow A** (Header "Generate more"): brand-new SVG → INSERT into `physics_svgs`
+- ✓ Vercel `api/batch-generate.ts` proxy for batch generation (category + color variant modes)
+- ✓ Four generation flows working end-to-end through the browser:
+  - **Flow A** (Header "Generate one"): brand-new SVG → INSERT into `physics_svgs`
   - **Flow B** (DetailModal "Send to Claude"): revise existing SVG → UPDATE, auto-archives via trigger
 
 Not yet done:
@@ -155,26 +156,77 @@ Do not violate these without explicit discussion:
 
 When writing back: `useSvgs` looks up `_uuid` via `findUuid(id)`, translates `colorTag` (string) → `color_id` (UUID) via a cached `paletteIdByNameRef`, and always sets `updated_by = user.id` so the version-archive trigger attributes the OLD row correctly.
 
-## Generation pipeline (two flows)
+## Generation pipeline (four flows)
 
-Both flows hit the same backend chain: browser → `/api/generate` (Vercel) → Modal `generate_svg_http` HTTP endpoint → calls `generate_svg.local(...)` internally → Claude → Supabase audit log → JSON back.
+Single-object flows hit: browser → `/api/generate` (Vercel) → Modal `generate_svg_http` → `generate_svg.local(...)` → Claude → Supabase audit log → JSON back.
 
-### Flow A — Generate new
+Batch flows hit: browser → `/api/batch-generate` (Vercel) → Modal `batch_generate_svg_http` → `batch_generate_svg.local(...)` → Claude (single call returning JSON array) → audit log → JSON back.
 
-- Triggered by Header **"Generate more"** button
+### Flow A — Generate one
+
+- Triggered by Header **"Generate one"** button
 - Opens `<GenerateNewModal>` overlay
 - Collision detection on input change against `existingNames` Set passed in from App
 - On Accept: `useSvgs.insertSvg({ name, displayName, svgContent })` → INSERT into `physics_svgs` with `created_by = updated_by = user.id`, then `refresh()`
 
-### Flow B — Revise existing
+### Flow B — Revise existing (queued)
 
-- Triggered by DetailModal **"Send to Claude"** button (only visible when a modal item is open)
+- Triggered by DetailModal **"Send to Claude"** button
+- **Fire-and-forget**: adds a job to the generation queue and toasts "Revision queued". The user can close the DetailModal and work on other items immediately.
 - Includes the item's existing `feedback` AND any unsaved text in the feedback textarea
 - Sends `svg_id`, `current_svg`, `color_palette` derived from `colorTag`
-- Inline preview rendered below the existing SVG inside the DetailModal
+- When the job completes, a toast notifies the user. They open the **QueuePanel** (Header badge) to preview and Accept/Discard the revision.
 - On Accept: `useSvgs.updateSvgContent(id, newSvg)` → UPDATE `physics_svgs` (trigger archives prior version, bumps version int)
+- While on the item, a blue inline bar shows queue status: `Queue: 1 generating — open Queue to review`
 
-App.jsx holds **two independent `useGeneration` instances** (`newGeneration` for Flow A, `reviseGeneration` for Flow B) so they can run concurrently without state collision.
+### Flow C — Batch generate by category (queued)
+
+- Triggered by Header **"Batch generate"** button
+- Opens `<BatchGenerateModal>` — **setup only** (category dropdown from `shared/system_prompt.json` categories array, free-text "Other" option, model tier toggle). On Generate, adds a job to the queue and closes.
+- Fixed at 10 items per batch
+- One Claude call returns `[{name, svg}]` JSON array
+- Results reviewed in **QueuePanel**: cherry-pick grid with checkboxes. Items whose name already exists get auto-deselected with a red "(exists)" badge.
+- On Accept: loops through selected items, calling `useSvgs.insertSvg` for each
+- Batch endpoint: `batch_generate_svg` in [generate_svg.py](modal_functions/generate_svg.py) with mode `"category"`, proxied through [api/batch-generate.ts](api/batch-generate.ts). **Requires `MODAL_BATCH_ENDPOINT_URL` env var** in the Vercel project (separate from `MODAL_ENDPOINT_URL`). URL printed by `modal deploy`.
+
+### Flow D — Color variants (queued)
+
+- Triggered by DetailModal **"Generate in N colors"** button
+- **Fire-and-forget**: multi-select color swatches below the existing single-select `ColorPaletteTag`; defaults to the item's current color tag. On click, adds a job to the queue.
+- One Claude call returns `[{color, svg}]` JSON array using the same batch endpoint with mode `"color_variants"`
+- Results reviewed in **QueuePanel**: cherry-pick grid. Each variant is named `{color}_{objectName}` (e.g., `blue_bowling_ball`) and inserted as a **new separate item** with `colorTag` set — they are NOT replacements of the original item.
+- On Accept: loops through selected variants, calling `useSvgs.insertSvg` with `{ name, displayName, svgContent, colorTag }` for each
+
+### Generation queue
+
+[useGenerationQueue.js](src/hooks/useGenerationQueue.js) is a global sequential job queue. Flows B, C, and D all fire-and-forget into it; Flow A stays blocking because the user needs to type the item name.
+
+- **Sequential processing**: one job runs at a time. When a job finishes, the next queued job starts automatically. At Sonnet prices this means a 3-job queue takes ~30-45 seconds total.
+- **Job lifecycle**: `queued → generating → ready | error`. Ready jobs wait for the user to review in QueuePanel. Error jobs show the error with a Retry button.
+- **Toast notifications**: "X ready — open Queue to review" on completion, "X failed" on error. Fires while the user is working on other items.
+- **Header badge**: `Queue (1 running, 2 queued)` in blue, switches to green `(1 ready)` when results are available. Only shown when the queue has activity.
+- **DetailModal inline status**: when the currently-open item has jobs in the queue, a blue info bar shows the count without blocking the modal.
+- **State is ephemeral**: jobs live in React state only. Refreshing the browser clears the queue. The actual Claude call still happened (audit row exists in `generation_sessions`), but the result preview is lost. Acceptable for now.
+- **QueuePanel**: [QueuePanel.jsx](src/components/QueuePanel.jsx) is a modal opened from the Header badge. Shows all jobs as expandable cards with status badges. Each job type has its own review UI: revise (SVG preview + Accept), batch (cherry-pick grid + Accept N), colors (cherry-pick grid with `{color}_{object}` naming + Accept N).
+
+App.jsx holds **one `useGeneration`** instance (Flow A, blocking) and **one `useGenerationQueue`** instance (Flows B, C, D, fire-and-forget).
+
+### Batch endpoint details
+
+The `batch_generate_svg` Modal function and its HTTP wrapper live in [generate_svg.py](modal_functions/generate_svg.py). It:
+- Shares the same `MODEL_TIERS`, system-prompt builder, and Supabase/Anthropic client setup as the single-object function
+- Uses `max_tokens=32768` and `timeout=300` (vs 4096/120 for single)
+- Claude returns a JSON array; `extract_json_from_response` tries direct parse, code-fence stripping, and bracket-extraction fallback
+- Writes one `generation_sessions` audit row per batch call (the `response_svg` column stores the raw JSON response text for auditability)
+- The proxy [api/batch-generate.ts](api/batch-generate.ts) validates mode (`category` | `color_variants`), model tier, and per-mode required fields, then forwards to `MODAL_BATCH_ENDPOINT_URL`
+
+### System prompt categories
+
+The `categories` array in [shared/system_prompt.json](shared/system_prompt.json) is the single source of truth for:
+- The system prompt's `- Categories: ...` line (rendered by both JS and Python)
+- The category dropdown in `BatchGenerateModal` (imported as `CATEGORIES` from [constants.js](src/lib/constants.js))
+
+Adding a category to the JSON automatically updates both. Editing requires `modal deploy` for the Python side, same as any system prompt change.
 
 ### Download approved (zip export)
 
@@ -194,7 +246,7 @@ Header **"Download approved"** opens [DownloadApprovedModal.jsx](src/components/
 
 ### Model tiers
 
-Both flows let the user pick between two Claude models before firing a generation. The selector is a shared `<ModelTierToggle>` pill switch rendered in both [GenerateNewModal.jsx](src/components/GenerateNewModal.jsx) and [DetailModal.jsx](src/components/DetailModal.jsx).
+All four flows let the user pick between two Claude models before firing a generation. The selector is a shared `<ModelTierToggle>` pill switch rendered in [GenerateNewModal.jsx](src/components/GenerateNewModal.jsx), [DetailModal.jsx](src/components/DetailModal.jsx), and [BatchGenerateModal.jsx](src/components/BatchGenerateModal.jsx).
 
 | Tier       | Model ID              | Price (in/out per MTok) | When to use |
 |------------|-----------------------|-------------------------|-------------|
@@ -232,6 +284,7 @@ This caused a long debugging session at the end of Task 7. The fix is to put the
 vercel env add VITE_SUPABASE_URL development
 vercel env add VITE_SUPABASE_ANON_KEY development
 vercel env add MODAL_ENDPOINT_URL development
+vercel env add MODAL_BATCH_ENDPOINT_URL development
 ```
 
 Verify with `vercel env ls`. **For Task 9 (production deploy)**, repeat with `production` scope.

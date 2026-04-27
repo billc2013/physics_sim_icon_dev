@@ -64,6 +64,7 @@ export default function GenerateNewModal({
         name: normalizedName,
         displayName: normalizedName.replace(/_/g, " "),
         svgContent: generation.result.svg,
+        collider: generation.result.collider ?? null,
       });
       onClose();
     } catch {

@@ -31,10 +31,15 @@ Working end-to-end **on localhost**:
 Not yet done:
 
 - ✗ Realtime subscriptions (Task 5) — `useSvgs` reloads on mutation, no live cross-user sync
-- ✗ Modal `keep_alive()` weekly cron (Task 8) — Supabase free tier will pause after 7 days idle
+- ✓ Modal `keep_alive()` weekly cron (Task 8) — `modal_functions/keep_alive.py`, runs Sunday 06:00 UTC
 - ✗ Push to GitHub + Vercel auto-deploy (Task 9) — production URL doesn't exist yet
 - ✗ Duncan in `project_members` (Task 4) — happens after he signs up via the deployed app
 - ✗ Zip export of approved SVGs (Task 10)
+
+Done (off-task-list):
+
+- ✓ Collider system — schema, programmatic generator, interactive editor, LLM-generated colliders on Flows A/B/C
+- ✓ Parent-child parenting — `parent_id` FK, always-inherit physical_properties, color dots on parent cards, manifest uses effective props
 
 See [Dev_Tasks.md](Dev_Tasks.md) for the prioritized backlog and what each remaining task involves.
 
@@ -86,6 +91,8 @@ Do not violate these without explicit discussion:
 ├── modal_functions/
 │   ├── generate_svg.py           Modal function with both `modal run` entry
 │   │                              and `@modal.fastapi_endpoint` HTTP endpoint
+│   ├── keep_alive.py             Weekly cron: pings heartbeat table to prevent
+│   │                              Supabase free-tier pause. Separate Modal app.
 │   └── requirements.txt          Stale leftover from another Bill project — Modal
 │                                  reads deps from image.pip_install(), not this file
 ├── scripts/
@@ -98,15 +105,18 @@ Do not violate these without explicit discussion:
 │   ├── index.css                 Theme variables matching the artifact's
 │   │                              Claude.ai-style CSS variable references
 │   ├── components/
+│   │   ├── ColliderEditor.jsx    Interactive polygon editor overlay (drag/add/remove vertices)
+│   │   ├── ColliderPreview.jsx   Static collider overlay (blue dashed shape)
 │   │   ├── ColorPaletteTag.jsx
-│   │   ├── DetailModal.jsx       Has inline "revision preview" panel for Flow B
+│   │   ├── DetailModal.jsx       Has inline "revision preview" panel for Flow B,
+│   │   │                          collider generate/edit/save section, inheritance display
 │   │   ├── FeedbackHistory.jsx
 │   │   ├── FilterBar.jsx
 │   │   ├── GenerateNewModal.jsx  Flow A overlay with collision detection
 │   │   ├── GeneratePanel.jsx     STUB — leftover from Task 2, not used. Remove or repurpose.
 │   │   ├── Header.jsx
 │   │   ├── LoginPage.jsx
-│   │   ├── SvgCard.jsx
+│   │   ├── SvgCard.jsx           Color dots on parent cards, ↑parent on variant cards
 │   │   ├── SvgGrid.jsx
 │   │   ├── SystemPrompt.jsx
 │   │   └── Toast.jsx
@@ -116,6 +126,8 @@ Do not violate these without explicit discussion:
 │   │   └── useSvgs.js            Loads view + feedback, exposes mutations,
 │   │                              transforms schema rows into artifact item shape
 │   └── lib/
+│       ├── colliderGenerator.js  Programmatic SVG → collider (convex hull, no deps)
+│       ├── colliderSchema.js     Collider types, validation, editing helpers
 │       ├── constants.js          STATUSES, STATUS_CONFIG, COLOR_RAMPS,
 │       │                          buildSystemPrompt() — keep in sync with Python
 │       ├── seedData.js           SVG_DATA constant + createInitialItems()
@@ -151,10 +163,16 @@ Do not violate these without explicit discussion:
 | `item.lastExportedAt`          | `physics_svgs.last_exported_at`            | ISO timestamp or null — set by the Download approved flow via the `mark_svgs_exported` RPC |
 | `item.lastExportedVersion`     | `physics_svgs.last_exported_version`       | `version` value at time of last export. Displayed in the "Exported as v3" line; NOT used for the stale check. |
 | `item.lastExportedByName`      | joined `project_members.display_name` via `last_exported_by` | Who last exported this item |
-| `item.physicalProperties`      | `physics_svgs.physical_properties` (jsonb) | Free-form, v1 shape is `{mass_kg, length_m, width_m, notes}`. Emitted in manifest.json |
+| `item.physicalProperties`      | `physics_svgs.physical_properties` (jsonb) | Own physical props (null for children). V1 shape: `{collider, mass_kg, length_m, width_m, notes}` |
+| `item.parentId` (string\|null) | joined `physics_svgs.name` via `parent_id`  | Parent's item.id (name), null if root/standalone |
+| `item._parentUuid` (string\|null) | `physics_svgs.parent_id`                | **Private**. Parent's UUID for write paths |
 | `item._uuid` (string)          | `physics_svgs.id`                          | **Private**. Only used for write paths and as `svg_id` in revisions. |
+| `item.variants` (array)        | Computed client-side by `addVariantInfo()`  | `[{id, colorTag}]` — children of this item. Empty if not a parent. |
+| `item.effectivePhysicalProperties` | Computed client-side by `addVariantInfo()` | Parent's `physicalProperties` if child, own if root. **Always use this for reads.** |
 
 When writing back: `useSvgs` looks up `_uuid` via `findUuid(id)`, translates `colorTag` (string) → `color_id` (UUID) via a cached `paletteIdByNameRef`, and always sets `updated_by = user.id` so the version-archive trigger attributes the OLD row correctly.
+
+**Parenting rule:** `physical_properties` writes (collider, mass, etc.) always target the parent item for children. The `updatePhysicalProperties` mutation propagates changes optimistically to all children's `effectivePhysicalProperties`.
 
 ## Generation pipeline (four flows)
 
@@ -167,7 +185,7 @@ Batch flows hit: browser → `/api/batch-generate` (Vercel) → Modal `batch_gen
 - Triggered by Header **"Generate one"** button
 - Opens `<GenerateNewModal>` overlay
 - Collision detection on input change against `existingNames` Set passed in from App
-- On Accept: `useSvgs.insertSvg({ name, displayName, svgContent })` → INSERT into `physics_svgs` with `created_by = updated_by = user.id`, then `refresh()`
+- On Accept: `useSvgs.insertSvg({ name, displayName, svgContent, physicalProperties })` → INSERT into `physics_svgs` with collider from the LLM response baked into `physical_properties`, then `refresh()`
 
 ### Flow B — Revise existing (queued)
 
@@ -176,7 +194,7 @@ Batch flows hit: browser → `/api/batch-generate` (Vercel) → Modal `batch_gen
 - Includes the item's existing `feedback` AND any unsaved text in the feedback textarea
 - Sends `svg_id`, `current_svg`, `color_palette` derived from `colorTag`
 - When the job completes, a toast notifies the user. They open the **QueuePanel** (Header badge) to preview and Accept/Discard the revision.
-- On Accept: `useSvgs.updateSvgContent(id, newSvg)` → UPDATE `physics_svgs` (trigger archives prior version, bumps version int)
+- On Accept: `useSvgs.updateSvgContent(id, newSvg)` → UPDATE `physics_svgs` (trigger archives prior version, bumps version int). Also saves the LLM-generated collider to the **parent** item (or self if no parent) via `updatePhysicalProperties`.
 - While on the item, a blue inline bar shows queue status: `Queue: 1 generating — open Queue to review`
 
 ### Flow C — Batch generate by category (queued)
@@ -184,7 +202,7 @@ Batch flows hit: browser → `/api/batch-generate` (Vercel) → Modal `batch_gen
 - Triggered by Header **"Batch generate"** button
 - Opens `<BatchGenerateModal>` — **setup only** (category dropdown from `shared/system_prompt.json` categories array, free-text "Other" option, model tier toggle). On Generate, adds a job to the queue and closes.
 - Fixed at 10 items per batch
-- One Claude call returns `[{name, svg}]` JSON array
+- One Claude call returns `[{name, svg, collider}]` JSON array
 - Results reviewed in **QueuePanel**: cherry-pick grid with checkboxes. Items whose name already exists get auto-deselected with a red "(exists)" badge.
 - On Accept: loops through selected items, calling `useSvgs.insertSvg` for each
 - Batch endpoint: `batch_generate_svg` in [generate_svg.py](modal_functions/generate_svg.py) with mode `"category"`, proxied through [api/batch-generate.ts](api/batch-generate.ts). **Requires `MODAL_BATCH_ENDPOINT_URL` env var** in the Vercel project (separate from `MODAL_ENDPOINT_URL`). URL printed by `modal deploy`.
@@ -263,6 +281,42 @@ Behavior:
 
 To add/remove/rename a tier, edit both `MODEL_TIERS` in `generate_svg.py` AND the `ALLOWED_MODEL_TIERS` array in `api/generate.ts`, plus the `tiers` array in `ModelTierToggle.jsx`. All three must agree. (If this becomes a recurring chore, move the tier list to a shared JSON file alongside `shared/system_prompt.json`.)
 
+### Collider generation
+
+All generation flows (except Flow D) now ask Claude to return a `collider` object alongside the SVG. The collider schema, rules, and coordinate space are defined in `shared/system_prompt.json` under `colliderRules`.
+
+**Response format change:** Single-object flows (A/B) now expect JSON `{"svg": "...", "collider": {...}}` instead of raw SVG. The Python `extract_svg_and_collider()` function handles this with graceful fallback to raw-SVG-only if Claude doesn't return JSON (e.g., older cached prompts).
+
+**Per-flow behavior:**
+- **Flow A** (Generate one): collider baked into `physical_properties` on INSERT (single DB write)
+- **Flow B** (Revise existing): collider saved to the **parent** item (or self if root) via `updatePhysicalProperties` after the SVG update
+- **Flow C** (Batch by category): collider baked into each item's `physical_properties` on INSERT
+- **Flow D** (Color variants): no collider generated — inherits from parent
+
+**Programmatic fallback:** The DetailModal "Generate" button in the Collider section runs a client-side programmatic generator (`colliderGenerator.js`) that extracts vertices from SVG elements, computes a convex hull, and simplifies to ≤8 vertices. No LLM call. Useful for existing SVGs that pre-date the LLM collider feature, or when the LLM's collider needs correction.
+
+**Collider editor:** The DetailModal also has an interactive vertex editor (drag to move, click + to add, click × to remove) for fine-tuning colliders manually. Convexity is checked live with an amber warning if the polygon becomes concave.
+
+### Parent-child relationships (color variants)
+
+Color variants point to their canonical parent via `physics_svgs.parent_id` (self-referencing FK, added in migration 11c). Design rules:
+
+1. **One level only.** Variants always point to a root parent, never to another variant. If generating variants from a variant, `parent_id` resolves to the root.
+2. **Always inherit.** Children never store their own `physical_properties` — the frontend reads from the parent at display time via `item.effectivePhysicalProperties`.
+3. **Flat grid.** All items are visible in the grid. Parents show color dots (bottom-left) for their variants. Children show `↑ parent_name` (bottom-left).
+
+**Schema:** `parent_id uuid REFERENCES physics_svgs(id) ON DELETE SET NULL`. The `svgs_with_details` view joins to `physics_svgs parent` to return `parent_name`.
+
+**Frontend:** `addVariantInfo()` runs after loading all items — populates `item.variants[]` on parents and `item.effectivePhysicalProperties` on all items. `updatePhysicalProperties` optimistically propagates changes to all children.
+
+**Manifest export:** Each item's `physical_properties` in the manifest uses `effectivePhysicalProperties` (inherited from parent for children). A `parent` field is included so GIST knows which items are variants of the same physics object.
+
+**Backfill:** Existing variants are linked manually via SQL. Pattern:
+```sql
+UPDATE physics_svgs SET parent_id = (SELECT id FROM physics_svgs WHERE name = '<parent>')
+WHERE name IN ('<color>_<parent>', ...) AND parent_id IS NULL;
+```
+
 ## Modal secrets and env vars (Bill-specific naming)
 
 These names diverged from the original plan in CLAUDE.md after Bill set them up. Use these:
@@ -298,7 +352,7 @@ The Claude generation prompt lives in **[shared/system_prompt.json](shared/syste
 - [src/lib/constants.js](src/lib/constants.js) — `buildSystemPrompt(items)` imports the JSON at build time and renders it for the SystemPrompt overlay
 - [modal_functions/generate_svg.py](modal_functions/generate_svg.py) — `build_system_prompt(library_names)` reads `/root/system_prompt.json` from inside the Modal container and renders it for actual Claude calls
 
-Shape: `{ header, rules[], librarySection }`. Both renderers prefix each rule with `- ` and substitute `{count}` and `{names}` in `librarySection`. If you change the JSON shape (not the content), update both renderers in lockstep.
+Shape: `{ header, rules[], colliderRules[], categories[], librarySection }`. Both renderers prefix each rule with `- ` and substitute `{count}` and `{names}` in `librarySection`. `colliderRules` are rendered under a "Collider rules:" heading. If you change the JSON shape (not the content), update both renderers in lockstep.
 
 **Redeploy reminder: editing the JSON requires `modal deploy modal_functions/generate_svg.py`** to push the change to the Python side. The image definition uses `.add_local_file(...)` to bake the JSON into the container, so Modal only sees the version from the last deploy. The Vite side picks up JSON edits on the next dev reload / build automatically.
 

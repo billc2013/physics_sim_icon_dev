@@ -7,6 +7,7 @@ import { useGeneration } from "./hooks/useGeneration.js";
 import { useGenerationQueue } from "./hooks/useGenerationQueue.js";
 import LoginPage from "./components/LoginPage.jsx";
 import Header from "./components/Header.jsx";
+import TabStrip from "./components/TabStrip.jsx";
 import Toast from "./components/Toast.jsx";
 import FilterBar from "./components/FilterBar.jsx";
 import SvgGrid from "./components/SvgGrid.jsx";
@@ -16,6 +17,7 @@ import GenerateNewModal from "./components/GenerateNewModal.jsx";
 import BatchGenerateModal from "./components/BatchGenerateModal.jsx";
 import DownloadApprovedModal from "./components/DownloadApprovedModal.jsx";
 import QueuePanel from "./components/QueuePanel.jsx";
+import DataTransformPage from "./components/data/DataTransformPage.jsx";
 
 export default function App() {
   const auth = useAuth();
@@ -39,6 +41,10 @@ function SignedInApp({ user, onSignOut }) {
   // item. Everything else (Flows B, C, D) is fire-and-forget via the queue.
   const newGeneration = useGeneration();
   const queue = useGenerationQueue();
+
+  // Active top-level tool. "svg" = SVG Manager, "data" = Data Transforms.
+  // Both tools share auth and layout but their inner state stays scoped.
+  const [activeTab, setActiveTab] = useState("svg");
 
   // UI state.
   const [modalItemId, setModalItemId] = useState(null);
@@ -155,6 +161,7 @@ function SignedInApp({ user, onSignOut }) {
   const updateStatus = wrapMutation(svgs.updateStatus);
   const updateNotes = wrapMutation(svgs.updateNotes);
   const updateColor = wrapMutation(svgs.updateColor);
+  const updatePhysicalProperties = wrapMutation(svgs.updatePhysicalProperties);
 
   const addFeedback = async (id) => {
     if (!feedbackText.trim()) return;
@@ -209,9 +216,14 @@ function SignedInApp({ user, onSignOut }) {
   const handleNewGenerate = async ({ objectName, colorTag, modelTier }) => {
     await newGeneration.generate({ objectName, colorTag, modelTier });
   };
-  const handleNewAccept = async ({ name, displayName, svgContent }) => {
+  const handleNewAccept = async ({ name, displayName, svgContent, collider }) => {
     try {
-      await svgs.insertSvg({ name, displayName, svgContent });
+      await svgs.insertSvg({
+        name,
+        displayName,
+        svgContent,
+        physicalProperties: collider ? { collider } : null,
+      });
       showToast(`Added "${displayName}"`);
     } catch (e) {
       showToast(`Error: ${e.message ?? e}`);
@@ -233,11 +245,27 @@ function SignedInApp({ user, onSignOut }) {
   const handleCloseBatchGenerate = () => {
     setShowBatchGenerate(false);
   };
-  const handleBatchGenerate = ({ category, modelTier }) => {
+  const handleBatchGenerate = ({ category, count, modelTier, referenceIds }) => {
+    // Look up the full SVG markup for each selected reference so the
+    // Modal function can include it in the prompt. We filter out any ids
+    // that no longer exist (defensive — shouldn't happen in normal flow).
+    const referenceSvgs = (referenceIds || [])
+      .map((id) => {
+        const match = items?.find((it) => it.id === id);
+        return match ? { name: match.id, svg: match.svg } : null;
+      })
+      .filter(Boolean);
+
     queue.addJob({
       type: "batch_category",
-      label: `${category} — batch 10`,
-      request: { mode: "category", category, count: 10, modelTier },
+      label: `${category} — batch ${count}${referenceSvgs.length ? ` · ${referenceSvgs.length} ref` : ""}`,
+      request: {
+        mode: "category",
+        category,
+        count,
+        modelTier,
+        referenceSvgs,
+      },
     });
     showToast("Batch generate queued");
   };
@@ -307,6 +335,15 @@ function SignedInApp({ user, onSignOut }) {
   const handleQueueAcceptRevise = async (job) => {
     try {
       await svgs.updateSvgContent(job.request.itemId, job.result.svg);
+      if (job.result.collider) {
+        // Save collider to the parent (or self if no parent). This
+        // ensures all color variants inherit the updated collider.
+        const item = items?.find((i) => i.id === job.request.itemId);
+        const colliderTarget = item?.parentId ?? job.request.itemId;
+        await svgs.updatePhysicalProperties(colliderTarget, {
+          collider: job.result.collider,
+        });
+      }
       queue.discardJob(job.id);
       showToast("Revision saved");
     } catch (e) {
@@ -321,6 +358,7 @@ function SignedInApp({ user, onSignOut }) {
           name: item.name,
           displayName: item.name.replace(/_/g, " "),
           svgContent: item.svg,
+          physicalProperties: item.collider ? { collider: item.collider } : null,
         });
       }
       queue.discardJob(job.id);
@@ -332,12 +370,17 @@ function SignedInApp({ user, onSignOut }) {
 
   const handleQueueAcceptColors = async (job, selectedItems) => {
     try {
+      // The source item is the parent. If the source itself is a child,
+      // use its parent instead (one-level-only rule).
+      const sourceItem = items?.find((i) => i._uuid === job.request.svgId);
+      const parentUuid = sourceItem?._parentUuid || job.request.svgId;
       for (const item of selectedItems) {
         await svgs.insertSvg({
           name: item.name,
           displayName: item.name.replace(/_/g, " "),
           svgContent: item.svg,
           colorTag: item.color,
+          parentUuid,
         });
       }
       queue.discardJob(job.id);
@@ -381,7 +424,8 @@ function SignedInApp({ user, onSignOut }) {
           status: item.status,
           version: item.version,
           color_tag: item.colorTag,
-          physical_properties: item.physicalProperties,
+          parent: item.parentId ?? null,
+          physical_properties: item.effectivePhysicalProperties,
         })),
       };
       zip.file("manifest.json", JSON.stringify(manifest, null, 2));
@@ -412,21 +456,73 @@ function SignedInApp({ user, onSignOut }) {
     }
   };
 
-  // Loading / error states for the initial data load (separate from the
-  // auth gate above). Mutation errors get surfaced via toast in the
-  // wrapMutation helpers.
-  if (svgs.loading && !items) {
-    return <CenteredMessage>Loading library...</CenteredMessage>;
-  }
-  if (svgs.error && !items) {
+  const shellWrapperStyle = {
+    padding: "1rem",
+    fontFamily: "var(--font-sans)",
+    maxWidth: 960,
+    margin: "0 auto",
+  };
+
+  // The SVG Manager loads its dataset from Supabase, but the Data Transforms
+  // tool doesn't depend on that — only block on `svgs.loading` when the user
+  // is actually on the SVG tab.
+  if (activeTab === "svg" && svgs.loading && !items) {
     return (
-      <CenteredMessage>
-        Failed to load: {svgs.error.message ?? String(svgs.error)}
-      </CenteredMessage>
+      <div style={shellWrapperStyle}>
+        <TabStrip
+          activeTab={activeTab}
+          onChange={setActiveTab}
+          userEmail={user.email}
+          onSignOut={onSignOut}
+        />
+        <CenteredMessage>Loading library...</CenteredMessage>
+      </div>
     );
   }
+  if (activeTab === "svg" && svgs.error && !items) {
+    return (
+      <div style={shellWrapperStyle}>
+        <TabStrip
+          activeTab={activeTab}
+          onChange={setActiveTab}
+          userEmail={user.email}
+          onSignOut={onSignOut}
+        />
+        <CenteredMessage>
+          Failed to load: {svgs.error.message ?? String(svgs.error)}
+        </CenteredMessage>
+      </div>
+    );
+  }
+
+  if (activeTab === "data") {
+    return (
+      <div style={shellWrapperStyle}>
+        <Toast message={toast} />
+        <TabStrip
+          activeTab={activeTab}
+          onChange={setActiveTab}
+          userEmail={user.email}
+          onSignOut={onSignOut}
+        />
+        <DataTransformPage userEmail={user.email} />
+      </div>
+    );
+  }
+
+  // SVG tab — items are loaded.
   if (!items) {
-    return <CenteredMessage>No items.</CenteredMessage>;
+    return (
+      <div style={shellWrapperStyle}>
+        <TabStrip
+          activeTab={activeTab}
+          onChange={setActiveTab}
+          userEmail={user.email}
+          onSignOut={onSignOut}
+        />
+        <CenteredMessage>No items.</CenteredMessage>
+      </div>
+    );
   }
 
   const visibleItems = getVisibleItems();
@@ -439,20 +535,18 @@ function SignedInApp({ user, onSignOut }) {
   const systemPromptText = buildSystemPrompt(items);
 
   return (
-    <div
-      style={{
-        padding: "1rem",
-        fontFamily: "var(--font-sans)",
-        maxWidth: 960,
-        margin: "0 auto",
-      }}
-    >
+    <div style={shellWrapperStyle}>
       <Toast message={toast} />
+
+      <TabStrip
+        activeTab={activeTab}
+        onChange={setActiveTab}
+        userEmail={user.email}
+        onSignOut={onSignOut}
+      />
 
       <Header
         itemCount={items.length}
-        userEmail={user.email}
-        onSignOut={onSignOut}
         onGenerateMore={handleGenerateMore}
         onBatchGenerate={handleOpenBatchGenerate}
         onShowQueue={() => setShowQueue(true)}
@@ -506,6 +600,7 @@ function SignedInApp({ user, onSignOut }) {
           onPendingUploadChange={setPendingUpload}
           onAcceptUpload={handleAcceptUpload}
           onDiscardUpload={handleDiscardUpload}
+          onUpdatePhysicalProperties={updatePhysicalProperties}
         />
       )}
 
@@ -522,6 +617,7 @@ function SignedInApp({ user, onSignOut }) {
 
       {showBatchGenerate && (
         <BatchGenerateModal
+          items={items}
           onGenerate={handleBatchGenerate}
           onClose={handleCloseBatchGenerate}
         />

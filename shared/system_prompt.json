@@ -6,6 +6,15 @@
     "Monochromatic 3-tone (light/mid/dark from same hue)",
     "People: modeled after traffic sign pictograms, no faces or details"
   ],
+  "colliderRules": [
+    "Also return a physics collider for the object in the same 64x64 coordinate space",
+    "Collider types: \"circle\" (center + radius), \"box\" (center + width + height), or \"convex\" (vertex array, max 8 vertices, convex polygon only)",
+    "Circle: {\"type\":\"circle\",\"center\":[x,y],\"radius\":r}",
+    "Box: {\"type\":\"box\",\"center\":[x,y],\"width\":w,\"height\":h}",
+    "Convex: {\"type\":\"convex\",\"vertices\":[[x,y],...]} \u2014 max 8 vertices, must be convex",
+    "Pick the simplest collider that fits: circle for round objects, box for rectangular, convex polygon for irregular shapes",
+    "The collider should tightly approximate the visible silhouette, not the full 64x64 bounding box"
+  ],
   "categories": [
     "vehicles", "projectiles", "blocks", "people", "connectors",
     "planes", "pendulums", "everyday", "lab", "space", "air resistance"

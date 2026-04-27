@@ -12,7 +12,7 @@ import { supabase } from "../lib/supabase.js";
 //     Each mutation patches local state immediately, then writes to the DB.
 //     On DB error we roll back to the snapshot taken before the patch.
 //
-// Item shape (matches the artifact 1:1, plus a private _uuid field):
+// Item shape (matches the artifact 1:1, plus private/parenting fields):
 //   {
 //     id: string,                     // schema's `name`, e.g. "wooden_block"
 //     label: string,                  // schema's `display_name`
@@ -22,12 +22,19 @@ import { supabase } from "../lib/supabase.js";
 //     colorTag: string|null,          // ramp name, e.g. "blue", or null
 //     feedback: [{ text, date }],
 //     version: int,                   // physics_svgs.version
+//     createdAt: string|null,         // ISO timestamp of creation
 //     updatedAt: string|null,         // ISO timestamp of the last update
 //     lastExportedAt: string|null,    // ISO timestamp or null
 //     lastExportedVersion: int|null,  // version at time of last export
 //     lastExportedByName: string|null,// display name of last exporter
-//     physicalProperties: object|null,// free-form jsonb (mass_kg etc.)
+//     physicalProperties: object|null,// own physical_properties (null for children)
+//     parentId: string|null,          // parent's `name` (item.id), null if root/standalone
+//     _parentUuid: string|null,       // parent's UUID, for writes
 //     _uuid: string,                  // schema's `id` (UUID), used for writes
+//
+//     -- Computed after shaping (by addVariantInfo):
+//     variants: [{ id, colorTag }],   // children of this item (empty if not a parent)
+//     effectivePhysicalProperties: object|null, // inherited from parent if child, own if root
 //   }
 
 function shapeItem(svgRow, feedbackRows) {
@@ -42,13 +49,41 @@ function shapeItem(svgRow, feedbackRows) {
       .filter((f) => f.svg_id === svgRow.id)
       .map((f) => ({ text: f.body, date: f.created_at })),
     version: svgRow.version,
+    createdAt: svgRow.created_at ?? null,
     updatedAt: svgRow.updated_at ?? null,
     lastExportedAt: svgRow.last_exported_at ?? null,
     lastExportedVersion: svgRow.last_exported_version ?? null,
     lastExportedByName: svgRow.last_exported_by_name ?? null,
     physicalProperties: svgRow.physical_properties ?? null,
+    parentId: svgRow.parent_name ?? null,
+    _parentUuid: svgRow.parent_id ?? null,
     _uuid: svgRow.id,
+    // Populated by addVariantInfo after all items are shaped:
+    variants: [],
+    effectivePhysicalProperties: null,
   };
+}
+
+// After shaping all items, compute variant relationships and resolve
+// physical_properties inheritance. Children always inherit from their
+// parent (the "always inherit" rule).
+function addVariantInfo(items) {
+  const byUuid = new Map(items.map((i) => [i._uuid, i]));
+  for (const item of items) {
+    if (item._parentUuid) {
+      const parent = byUuid.get(item._parentUuid);
+      if (parent) {
+        parent.variants.push({ id: item.id, colorTag: item.colorTag });
+        item.effectivePhysicalProperties = parent.physicalProperties;
+      } else {
+        // Orphan — parent row was deleted. Fall back to own properties.
+        item.effectivePhysicalProperties = item.physicalProperties;
+      }
+    } else {
+      item.effectivePhysicalProperties = item.physicalProperties;
+    }
+  }
+  return items;
 }
 
 // ---- Stale-export predicates ----
@@ -114,7 +149,7 @@ export function useSvgs(user) {
       }
 
       const shaped = svgsResult.data.map((row) => shapeItem(row, feedbackResult.data));
-      setItems(shaped);
+      setItems(addVariantInfo(shaped));
     } catch (e) {
       setError(e);
     } finally {
@@ -276,15 +311,17 @@ export function useSvgs(user) {
   // (GenerateNewModal), Flow C (batch category), and Flow D (color
   // variants — each variant is inserted as a separate item with name
   // `{color}_{objectName}`). Optional `colorTag` sets the color palette
-  // on insert so we don't need a separate updateColor call.
-  // Returns the inserted item id (the schema's `name`) on success.
+  // on insert so we don't need a separate updateColor call. Optional
+  // `parentUuid` links the new item as a color variant of an existing
+  // parent (Flow D). Returns the inserted item id (the schema's `name`)
+  // on success.
   const insertSvg = useCallback(
-    async ({ name, displayName, svgContent, colorTag }) => {
+    async ({ name, displayName, svgContent, colorTag, parentUuid, physicalProperties }) => {
       if (!user) return null;
       const colorId = colorTag
         ? paletteIdByNameRef.current?.[colorTag] ?? null
         : null;
-      const { error: dbError } = await supabase.from("physics_svgs").insert({
+      const row = {
         name,
         display_name: displayName,
         svg_content: svgContent,
@@ -293,7 +330,10 @@ export function useSvgs(user) {
         color_id: colorId,
         created_by: user.id,
         updated_by: user.id,
-      });
+      };
+      if (parentUuid) row.parent_id = parentUuid;
+      if (physicalProperties) row.physical_properties = physicalProperties;
+      const { error: dbError } = await supabase.from("physics_svgs").insert(row);
       if (dbError) throw dbError;
       // Reload so the new row appears in the grid.
       await refresh();
@@ -386,6 +426,64 @@ export function useSvgs(user) {
     [items, user]
   );
 
+  // Update the free-form physical_properties jsonb column. Used by the
+  // collider generator to save computed collider data, and eventually by a
+  // physical-properties editor. Merges the patch into the existing value
+  // so callers can update individual keys without clobbering others.
+  //
+  // Because children always inherit physical_properties from their parent,
+  // this mutation also updates effectivePhysicalProperties on the target
+  // item AND all its children so the UI reflects the change immediately
+  // without a full refresh.
+  const updatePhysicalProperties = useCallback(
+    async (id, patch) => {
+      const uuid = findUuid(id);
+      if (!uuid || !user) return;
+      const item = items?.find((i) => i.id === id);
+      if (!item) return;
+      const merged = { ...(item.physicalProperties || {}), ...patch };
+
+      // Optimistic update: patch the target item's own + effective props.
+      const previous = items;
+      setItems((prev) =>
+        prev
+          ? prev.map((it) => {
+              if (it.id === id) {
+                // The target item itself.
+                return { ...it, physicalProperties: merged, effectivePhysicalProperties: merged };
+              }
+              if (it._parentUuid === uuid) {
+                // A child of the target — inherits effective props.
+                return { ...it, effectivePhysicalProperties: merged };
+              }
+              return it;
+            })
+          : prev
+      );
+
+      try {
+        const { data, error: dbError } = await supabase
+          .from("physics_svgs")
+          .update({ physical_properties: merged, updated_by: user.id })
+          .eq("id", uuid)
+          .select(SVG_RETURN_COLS)
+          .single();
+        if (dbError) throw dbError;
+        const post = toPostPatch(data);
+        // Apply server-returned version/updatedAt to the target item.
+        if (post) {
+          setItems((prev) =>
+            prev ? prev.map((it) => (it.id === id ? { ...it, ...post } : it)) : prev
+          );
+        }
+      } catch (e) {
+        setItems(previous);
+        throw e;
+      }
+    },
+    [findUuid, items, user]
+  );
+
   // Bulk action: promote every draft to idea_only. One UPDATE statement.
   const promoteAllDraftsToIdea = useCallback(async () => {
     if (!user || !items) return;
@@ -417,6 +515,7 @@ export function useSvgs(user) {
     promoteAllDraftsToIdea,
     insertSvg,
     updateSvgContent,
+    updatePhysicalProperties,
     markExported,
   };
 }

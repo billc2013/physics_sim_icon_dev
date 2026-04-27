@@ -118,7 +118,7 @@ class BatchGenerateRequest(BaseModel):
     """Request body for the batch HTTP endpoint. Two modes:
 
     category: Generate `count` new SVGs for a given category. Claude picks
-              the names. Returns [{name, svg}].
+              the names. Returns [{name, svg, collider}].
 
     color_variants: Generate an existing object in multiple color palettes.
                     Returns [{color, svg}].
@@ -130,6 +130,9 @@ class BatchGenerateRequest(BaseModel):
     # Category mode
     category: Optional[str] = None
     count: int = 10
+    # Optional style references — list of {name, svg} objects included
+    # verbatim in the user prompt so Claude matches the visual style.
+    reference_svgs: Optional[list[dict]] = None
     # Color variant mode
     object_name: Optional[str] = None
     svg_id: Optional[str] = None
@@ -150,13 +153,20 @@ def build_system_prompt(library_names: list[str]) -> str:
     with open(SYSTEM_PROMPT_REMOTE_PATH) as f:
         config = json.load(f)
     rules = "\n".join(f"- {rule}" for rule in config["rules"])
+    collider_rules = "\n".join(
+        f"- {rule}" for rule in config.get("colliderRules", [])
+    )
     categories = f"- Categories: {', '.join(config['categories'])}"
     library = (
         config["librarySection"]
         .replace("{count}", str(len(library_names)))
         .replace("{names}", ", ".join(library_names))
     )
-    return f"{config['header']}\n{rules}\n{categories}\n\n{library}"
+    prompt = f"{config['header']}\n{rules}\n{categories}"
+    if collider_rules:
+        prompt += f"\n\nCollider rules:\n{collider_rules}"
+    prompt += f"\n\n{library}"
+    return prompt
 
 
 def build_user_prompt(
@@ -185,7 +195,11 @@ def build_user_prompt(
     if current_svg:
         parts.append(f"Current SVG:\n{current_svg}")
 
-    parts.append("Return only the SVG markup, no commentary.")
+    parts.append(
+        'Return ONLY a JSON object with two keys: '
+        '"svg" (the SVG markup string) and "collider" (the physics collider object). '
+        "No commentary, no code fences."
+    )
     return "\n\n".join(parts)
 
 
@@ -206,19 +220,95 @@ def extract_svg_from_response(text: str) -> str:
     return text
 
 
+def extract_svg_and_collider(text: str) -> dict:
+    """
+    Extract both SVG markup and collider from Claude's JSON response.
+
+    Expected format: {"svg": "<svg>...</svg>", "collider": {...}}
+
+    Falls back gracefully:
+    - If JSON parse works → returns {"svg": ..., "collider": ...}
+    - If JSON parse fails but SVG is present → returns {"svg": ..., "collider": None}
+      (Claude may have returned raw SVG instead of JSON)
+    """
+    text = text.strip()
+
+    # Strip code fences if present.
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    # Try direct JSON parse.
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict) and "svg" in parsed:
+            return {
+                "svg": parsed["svg"],
+                "collider": parsed.get("collider"),
+            }
+    except json.JSONDecodeError:
+        pass
+
+    # Try to find a JSON object in the text (Claude may have added commentary).
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    if first_brace != -1 and last_brace > first_brace:
+        try:
+            parsed = json.loads(text[first_brace : last_brace + 1])
+            if isinstance(parsed, dict) and "svg" in parsed:
+                return {
+                    "svg": parsed["svg"],
+                    "collider": parsed.get("collider"),
+                }
+        except json.JSONDecodeError:
+            pass
+
+    # Fallback: treat the whole response as raw SVG (no collider).
+    return {
+        "svg": extract_svg_from_response(text),
+        "collider": None,
+    }
+
+
 def build_batch_user_prompt_category(
     category: str,
     count: int,
+    reference_svgs: Optional[list[dict]] = None,
 ) -> str:
-    """Build the user prompt for the category batch mode."""
-    return (
-        f'Generate {count} new physics SVG icons for the "{category}" category.\n\n'
-        "For each, pick a unique snake_case name that doesn't already exist in "
-        "the library listed in the system prompt.\n\n"
-        "Return ONLY a JSON array where each element is "
-        '{"name": "snake_case_name", "svg": "<svg>...</svg>"}. '
+    """Build the user prompt for the category batch mode.
+
+    If reference_svgs is provided, their full SVG markup is inlined so
+    Claude can match the visual style. Each ref is {"name": ..., "svg": ...}.
+    """
+    parts = [
+        f'Generate {count} new physics SVG icons for the "{category}" category.'
+    ]
+
+    if reference_svgs:
+        parts.append(
+            f"Match the visual style of these {len(reference_svgs)} reference "
+            f"object{'s' if len(reference_svgs) != 1 else ''}:"
+        )
+        for ref in reference_svgs:
+            name = ref.get("name", "unnamed")
+            svg = ref.get("svg", "")
+            parts.append(f"- {name}:\n{svg}")
+
+    parts.append(
+        "For each new item, pick a unique snake_case name that doesn't "
+        "already exist in the library listed in the system prompt."
+    )
+    parts.append(
+        'Return ONLY a JSON array where each element is '
+        '{"name": "snake_case_name", "svg": "<svg>...</svg>", '
+        '"collider": {collider object per the collider rules}}. '
         "No commentary, no code fences."
     )
+    return "\n\n".join(parts)
 
 
 def build_batch_user_prompt_colors(
@@ -403,7 +493,9 @@ def generate_svg(
         response_text = "".join(
             block.text for block in message.content if block.type == "text"
         )
-        svg_markup = extract_svg_from_response(response_text)
+        extracted = extract_svg_and_collider(response_text)
+        svg_markup = extracted["svg"]
+        collider = extracted["collider"]
 
         input_tokens = message.usage.input_tokens
         output_tokens = message.usage.output_tokens
@@ -426,6 +518,7 @@ def generate_svg(
 
         return {
             "svg": svg_markup,
+            "collider": collider,
             "session_id": session_id,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -503,6 +596,7 @@ def batch_generate_svg(
     current_svg: Optional[str] = None,
     feedback_history: Optional[list[str]] = None,
     color_palettes: Optional[list[dict]] = None,
+    reference_svgs: Optional[list[dict]] = None,
 ) -> dict:
     """
     Batch-generate SVGs via a single Claude call. Two modes:
@@ -550,7 +644,9 @@ def batch_generate_svg(
     system_prompt = build_system_prompt(library_names)
 
     if mode == "category":
-        user_prompt = build_batch_user_prompt_category(category or "mixed", count)
+        user_prompt = build_batch_user_prompt_category(
+            category or "mixed", count, reference_svgs=reference_svgs
+        )
     else:
         user_prompt = build_batch_user_prompt_colors(
             object_name or "", color_palettes or [], current_svg, feedback_history
@@ -588,16 +684,21 @@ def batch_generate_svg(
         )
         raw_items = extract_json_from_response(response_text)
 
-        # Normalize items into a consistent shape
+        # Normalize items into a consistent shape. Category mode (Flow C)
+        # includes colliders; color-variant mode (Flow D) does not because
+        # color variants inherit the parent's collider.
         items = []
         for raw in raw_items:
             svg = raw.get("svg", "")
             svg = extract_svg_from_response(svg) if svg else ""
-            items.append({
+            item = {
                 "name": raw.get("name", object_name or "unknown"),
                 "svg": svg,
                 "color": raw.get("color", None),
-            })
+            }
+            if mode == "category":
+                item["collider"] = raw.get("collider", None)
+            items.append(item)
 
         input_tokens = message.usage.input_tokens
         output_tokens = message.usage.output_tokens
@@ -667,6 +768,7 @@ def batch_generate_svg_http(payload: BatchGenerateRequest) -> dict:
         current_svg=payload.current_svg,
         feedback_history=payload.feedback_history,
         color_palettes=payload.color_palettes,
+        reference_svgs=payload.reference_svgs,
     )
 
 

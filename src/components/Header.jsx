@@ -1,13 +1,10 @@
-// Top header: title + object count + user info + button cluster
-// (Generate more, System prompt, Download approved, Sign out).
+// SVG Manager header: title + object count + button cluster
+// (Generate one, Batch generate, Queue badge, System prompt, Download approved).
 //
-// The "Generate more" and "Download approved" buttons are stubs in Task 3
-// that toast a "ships in Phase 3/4" message until the GeneratePanel UI and
-// zip exporter are built.
+// User email + sign-out live in TabStrip now (they're tool-agnostic) so they
+// don't need to be duplicated when we add sibling tools.
 export default function Header({
   itemCount,
-  userEmail,
-  onSignOut,
   onGenerateMore,
   onBatchGenerate,
   onShowQueue,
@@ -74,21 +71,6 @@ export default function Header({
         </button>
         <button onClick={onDownloadApproved} style={{ fontSize: 13 }}>
           Download approved &#8599;
-        </button>
-        <span
-          style={{
-            fontSize: 11,
-            color: "var(--color-text-tertiary)",
-            marginLeft: 6,
-          }}
-        >
-          {userEmail}
-        </span>
-        <button
-          onClick={onSignOut}
-          style={{ fontSize: 12, color: "var(--color-text-secondary)" }}
-        >
-          Sign out
         </button>
       </div>
     </div>

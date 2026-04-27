@@ -71,6 +71,10 @@ async function runBatch(request) {
   if (request.mode === "category") {
     body.category = request.category;
     body.count = request.count ?? 10;
+    // Optional style references: [{ name, svg }, ...]
+    if (request.referenceSvgs && request.referenceSvgs.length > 0) {
+      body.reference_svgs = request.referenceSvgs;
+    }
   } else {
     body.object_name = request.objectName;
     body.svg_id = request.svgId ?? null;

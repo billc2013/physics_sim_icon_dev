@@ -102,6 +102,48 @@ export default function SvgCard({ item, onClick }) {
           }}
         />
       )}
+      {/* Parent: show color dots for each variant */}
+      {item.variants.length > 0 && (
+        <div
+          title={`${item.variants.length} color variant${item.variants.length === 1 ? "" : "s"}`}
+          style={{
+            position: "absolute",
+            bottom: 4,
+            left: 4,
+            display: "flex",
+            gap: 2,
+          }}
+        >
+          {item.variants.map((v) => (
+            <div
+              key={v.id}
+              style={{
+                width: 7,
+                height: 7,
+                borderRadius: "50%",
+                background: v.colorTag ? (COLOR_RAMPS[v.colorTag]?.m ?? "#6B7280") : "#6B7280",
+                border: "1px solid var(--color-background-primary)",
+              }}
+            />
+          ))}
+        </div>
+      )}
+      {/* Child: subtle parent link */}
+      {item.parentId && (
+        <div
+          title={`Variant of ${item.parentId}`}
+          style={{
+            position: "absolute",
+            bottom: 3,
+            left: 4,
+            fontSize: 9,
+            color: "var(--color-text-tertiary)",
+            lineHeight: 1,
+          }}
+        >
+          &uarr; {item.parentId}
+        </div>
+      )}
     </div>
   );
 }

@@ -4,7 +4,9 @@
       "Bash(ls -la *.jsx *.md *.sql)",
       "Bash(ls -la .env*)",
       "Bash(python3 -c \"import ast; ast.parse\\(open\\('modal_functions/generate_svg.py'\\).read\\(\\)\\); print\\('ok'\\)\")",
-      "Bash(npm view:*)"
+      "Bash(npm view:*)",
+      "Bash(node -e ':*)",
+      "Bash(curl -s http://localhost:5173)"
     ]
   }
 }

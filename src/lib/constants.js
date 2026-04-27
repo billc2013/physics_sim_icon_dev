@@ -34,6 +34,13 @@ export const STORAGE_KEY = "gist-svg-v2";
 // both the system prompt and the dropdown.
 export const CATEGORIES = systemPromptConfig.categories;
 
+// Batch-generate limits. Kept in sync with api/batch-generate.ts and the
+// BatchGenerateRequest validation in modal_functions/generate_svg.py.
+// Raise carefully — too many items per call risks Claude output-token
+// truncation; too many references risks blowing up input tokens.
+export const MAX_BATCH_COUNT = 10;
+export const MAX_BATCH_REFERENCES = 5;
+
 // Builds the system prompt sent to Claude during generation. Includes the
 // full library of existing object names so Claude can avoid duplicates.
 //
@@ -44,9 +51,15 @@ export const CATEGORIES = systemPromptConfig.categories;
 // the Python side to pick up the change.
 export function buildSystemPrompt(items) {
   const rules = systemPromptConfig.rules.map((r) => `- ${r}`).join("\n");
+  const colliderRules = (systemPromptConfig.colliderRules || [])
+    .map((r) => `- ${r}`)
+    .join("\n");
   const categories = `- Categories: ${systemPromptConfig.categories.join(", ")}`;
   const library = systemPromptConfig.librarySection
     .replace("{count}", items.length)
     .replace("{names}", items.map((i) => i.id).join(", "));
-  return `${systemPromptConfig.header}\n${rules}\n${categories}\n\n${library}`;
+  let prompt = `${systemPromptConfig.header}\n${rules}\n${categories}`;
+  if (colliderRules) prompt += `\n\nCollider rules:\n${colliderRules}`;
+  prompt += `\n\n${library}`;
+  return prompt;
 }

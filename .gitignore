@@ -44,3 +44,4 @@ scripts/seed-output/
 .env*.local
 
 __pycache__/*/
+__pycache__/

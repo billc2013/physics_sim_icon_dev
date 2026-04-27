@@ -13,16 +13,19 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done
 ## Snapshot
 
 Done locally:
-- ✓ Tasks 1, 2, 3, 6, 7
+- ✓ Tasks 1, 2, 3, 6, 7, 8
 - ✓ Task 10 zip export (shipped ahead of Task 9; production walkthrough still pending)
 - ✓ Batch generate by category (Flow C) + color variant generation (Flow D)
 - ✓ Generation queue: Flows B, C, D are fire-and-forget with sequential processing and QueuePanel review
 - ✓ Color variants insert as NEW items named `{color}_{objectName}` with `colorTag` set
+- ✓ Task 8 keep_alive cron (modal_functions/keep_alive.py, Sunday 06:00 UTC)
+- ✓ Collider system: schema + validation, programmatic SVG→collider generator, interactive vertex editor, LLM-generated colliders on Flows A/B/C
+- ✓ Parent-child parenting: `parent_id` column, always-inherit physical_properties, color dots on parent cards, ↑parent on variant cards, manifest uses effectivePhysicalProperties
 
 Remaining:
-- Tasks 4, 5, 8, 9, and the production-walkthrough piece of 10
+- Tasks 4, 5, 9, and the production-walkthrough piece of 10
 
-The app works end-to-end on `vercel dev` (login → grid → review → four generate flows with queue → audit log → manual download/upload → zip export with manifest). What's missing is multi-user (Realtime), production deploy, the keep-alive job, Duncan's bootstrap, and the prod walkthrough of the zip export.
+The app works end-to-end on `vercel dev` (login → grid → review → four generate flows with queue + collider generation → audit log → manual download/upload → zip export with manifest + colliders). What's missing is multi-user (Realtime), production deploy, Duncan's bootstrap, and the prod walkthrough of the zip export.
 
 **Batch generation + queue requires:**
 - `modal deploy modal_functions/generate_svg.py` (deploys the new `batch_generate_svg_http` endpoint)
@@ -32,8 +35,7 @@ The app works end-to-end on `vercel dev` (login → grid → review → four gen
 1. **Task 9** (deploy) — unlocks Duncan signing up via the production URL AND unblocks the remaining production-walkthrough piece of Task 10
 2. **Task 4** (insert Duncan into project_members) — 10-second SQL after he signs up
 3. **Task 5** (Realtime) — multi-user live sync, biggest UX win once Duncan is in
-4. **Task 8** (keep_alive) — prevents Supabase free tier from pausing
-5. Finish **Task 10** prod walkthrough
+4. Finish **Task 10** prod walkthrough
 
 ---
 
@@ -169,21 +171,22 @@ Verified end-to-end via `vercel dev`:
 
 ---
 
-### 8. Build Modal `keep_alive()` weekly cron `[ ]`
+### 8. Build Modal `keep_alive()` weekly cron `[x]`
 
-**Scope**
-- `modal_functions/keep_alive.py` — pings the `heartbeat` table once a week so the free-tier Supabase project doesn't pause after 7 days idle
-- Reuse the existing `supabase_for_svg_gen` Modal secret (env vars `SUPABASE_DATA_URL`, `SUPABASE_SERVICE_ROLE_KEY`) — no new secret needed
-- Deploy as a Modal scheduled function (`@app.function(schedule=modal.Period(days=7))` or similar)
+Done. File: `modal_functions/keep_alive.py`.
 
-**Out of scope**
-- Slack/email alerting if the heartbeat fails — backlog
-- Multi-region redundancy — overkill for free tier
+What landed:
+- Separate Modal app (`gist-keep-alive`) with a single `keep_alive` function
+- Schedule: `modal.Cron("0 6 * * 0")` — every Sunday at 06:00 UTC (matches the pg_cron fallback in the schema)
+- Reuses the existing `supabase_for_svg_gen` Modal secret — no new secret needed
+- Updates the `heartbeat` singleton row (`id = 1`) with `last_ping = now()`
+- Includes a `modal run` local entrypoint for manual testing
+- Lightweight image: only `supabase==2.9.1`, no Anthropic dependency
 
-**Acceptance**
-- Function deployed and visible in Modal dashboard with a schedule
-- Heartbeat row's `last_ping` updates after manual `modal run` invocation
-- Document in CLAUDE.md that the cron exists so future Claude doesn't trip over an unfamiliar function
+Deploy: `modal deploy modal_functions/keep_alive.py`
+Test:   `modal run modal_functions/keep_alive.py`
+
+The schema (section 8) also has a `pg_cron` job that does the same update, but `pg_cron` can't fire if the project is already paused. The Modal cron is the external watchdog that prevents the pause from happening in the first place.
 
 ---
 
@@ -268,6 +271,31 @@ Fix (shipped and verified by Bill): switched the stale predicate to `updatedAt >
 
 ---
 
+## Completed off-task-list work
+
+### Collider system (2026-04-12) `[x]`
+
+What landed:
+- **Collider schema** (`src/lib/colliderSchema.js`): types (circle, box, convex ≤8 verts, compound), validation, `colliderToEditableVertices()`, `isConvexPolygon()`
+- **Programmatic generator** (`src/lib/colliderGenerator.js`): SVG → collider via DOMParser + convex hull (Andrew's monotone chain) + RDP simplification. Zero dependencies. Detects circles/boxes, falls back to convex polygon.
+- **ColliderPreview** (`src/components/ColliderPreview.jsx`): static blue dashed SVG overlay for all collider types
+- **ColliderEditor** (`src/components/ColliderEditor.jsx`): interactive polygon editor — drag vertices, click + to add on edges, click × to remove. Live convexity warning. Pointer capture for smooth drag. Coordinate mapping via `SVGSVGElement.getScreenCTM()`.
+- **DetailModal collider section**: Generate/Edit/Save/Remove/Show/Hide controls. Edit mode swaps preview for editor. Inheritance display for children ("inherited from {parent}"). Saves target the parent item for children.
+- **LLM-generated colliders**: system prompt includes `colliderRules`. Flows A/B/C return `{"svg", "collider"}` from Claude. Flow D skipped (inherits from parent). `extract_svg_and_collider()` in Python with graceful fallback.
+- **`useSvgs.updatePhysicalProperties`** mutation with optimistic update that propagates to children's `effectivePhysicalProperties`. `insertSvg` accepts optional `physicalProperties` for atomic insert+collider in Flows A/C.
+
+### Parent-child parenting for color variants (2026-04-12) `[x]`
+
+What landed:
+- **Schema migration 11c**: `parent_id uuid REFERENCES physics_svgs(id)` self-referencing FK + index. View updated with `parent_name` join.
+- **useSvgs item shape**: new fields `parentId`, `_parentUuid`, `variants[]`, `effectivePhysicalProperties`. `addVariantInfo()` computes inheritance after loading.
+- **Flow D**: `insertSvg` sets `parent_id` on color variant insert. One-level-only rule enforced (if source is itself a child, uses its parent).
+- **SvgCard**: color dots (from COLOR_RAMPS) on parent cards bottom-left. `↑ parent_name` text on variant cards.
+- **Manifest export**: uses `effectivePhysicalProperties` (inherited) + `parent` field per item.
+- **Manual backfill**: SQL template in migration 11c-backfill.
+
+---
+
 ## Backlog / nice-to-have (not yet scheduled)
 
 - **Restore-previous-version UI** built on `svg_versions`. Replaces the in-memory undo we dropped in Task 3.
@@ -287,7 +315,7 @@ Fix (shipped and verified by Bill): switched the stale predicate to `updatedAt >
 - **Delete `gist-svg-manager.jsx`** once it's no longer useful as reference.
 - **Queue persistence across page refreshes.** Currently the generation queue lives in React state — refreshing the browser clears all pending/ready jobs. The Claude call still happened (audit row in `generation_sessions`), but the result preview is lost. Two possible fixes: (a) persist the queue to localStorage and rehydrate on load, (b) build a "pending results" view that reads `generation_sessions` rows with `status = 'completed'` and no corresponding `physics_svgs` update. Either works; (a) is simpler for the common "I accidentally refreshed" case, (b) is more robust for "I closed the tab and came back tomorrow." Low priority — the queue processes fast and Bill typically reviews results within minutes.
 - **Review: "Pick" color variant sets both SVG content AND color tag.** Currently, picking a color variant in Flow D updates the SVG content and also sets the color tag to match. This keeps the manifest's `color_tag` field accurate, but couples two operations that might warrant separate control. If Bill/Duncan find cases where they want to apply a color-variant SVG but NOT change the tag metadata, we can decouple the two writes behind a checkbox or a separate "Apply SVG only" button. Low priority — watch for friction signals.
-- **Physical-properties editor in DetailModal.** Task 10 shipped the `physical_properties jsonb` column and the manifest emits its contents verbatim, but there's currently no UI to edit those fields — Bill and Duncan have to set them via SQL. Eventual UI: a small form in DetailModal under the SVG preview with four inputs (`mass_kg`, `length_m`, `width_m`, `notes`), saving through a new `useSvgs.updatePhysicalProperties` mutation. Keep the input open-ended so experimenting with new fields (e.g. pendulum-specific `string_length_m`) is just a matter of adding a row, not a schema change. Only wire up after the v1 schema settles — premature UI makes the schema harder to change.
+- **Physical-properties editor in DetailModal (non-collider fields).** The collider UI is done (generate, edit, save). The remaining `physical_properties` fields (`mass_kg`, `length_m`, `width_m`, `notes`) still need a small form in DetailModal. The `useSvgs.updatePhysicalProperties` mutation already exists — just needs UI inputs wired to it.
 - **Modal-side defense in depth:** add `requires_proxy_auth=True` to `generate_svg_http` and rotate Modal API tokens through Vercel. Currently relies on URL secrecy.
 - **Sanitize Claude-generated SVGs through DOMPurify too.** Manual uploads in DetailModal already get sanitized via DOMPurify (`USE_PROFILES: { svg: true, svgFilters: true }`) before being staged in `pendingUpload`. Claude output still flows directly into `dangerouslySetInnerHTML` without sanitization, which is inconsistent. The fix is small: pipe `useGeneration` results through the same sanitizer before exposing them on the preview, OR sanitize at render time inside the Card/Modal components. Either is fine; pick one place. Claude is unlikely to inject XSS into an SVG, but "trust no input at the boundary" is the right default.
 - **Inkscape namespace handling on upload.** Inkscape adds `inkscape:` and `sodipodi:` namespaced elements/attributes to its saved SVGs (editor metadata, not graphics). DOMPurify in default SVG mode may strip these as non-standard, which would fire the "something was removed" warning on every Inkscape upload — even though the visible drawing is unaffected. If this turns out to be noisy in practice, allow-list those namespaces via DOMPurify's `ADD_TAGS` / `ADD_ATTR` or a custom hook so the warning only fires for actual security strips. Don't pre-optimize: ship the simple version, see whether real Inkscape uploads trigger the warning routinely, and only then add the allow-list.

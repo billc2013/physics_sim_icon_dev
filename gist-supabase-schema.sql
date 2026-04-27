@@ -147,6 +147,10 @@ create table public.physics_svgs (
   -- All fields optional. SI units are baked into the key names so there's
   -- no ambiguity about what the numbers mean.
   physical_properties     jsonb null,
+  -- Parenting: color variants point to their canonical parent. Physical
+  -- properties (collider, mass, etc.) are ALWAYS inherited from the parent;
+  -- children never store their own. One level only — no grandparent chains.
+  parent_id               uuid references public.physics_svgs(id) on delete set null,
   created_by              uuid references auth.users(id) on delete set null,
   updated_by              uuid references auth.users(id) on delete set null,
   created_at              timestamptz not null default now(),
@@ -491,6 +495,8 @@ select
   s.last_exported_version,
   s.last_exported_by,
   s.physical_properties,
+  s.parent_id,
+  parent.name as parent_name,
   s.created_at,
   s.updated_at,
   c.name       as category_name,
@@ -508,6 +514,7 @@ select
 from public.physics_svgs s
 left join public.svg_categories c   on s.category_id = c.id
 left join public.color_palettes cp  on s.color_id = cp.id
+left join public.physics_svgs parent on s.parent_id = parent.id
 left join public.project_members pm_created  on s.created_by       = pm_created.user_id
 left join public.project_members pm_updated  on s.updated_by       = pm_updated.user_id
 left join public.project_members pm_exported on s.last_exported_by = pm_exported.user_id;
@@ -754,3 +761,86 @@ end;
 $$;
 
 grant execute on function public.mark_svgs_exported(uuid[]) to authenticated;
+
+
+-- -------------------------
+-- 11c. Parent-child relationships for color variants (Collider parenting)
+-- -------------------------
+-- Adds a self-referencing parent_id FK so color variants can inherit
+-- physical_properties (collider, mass, etc.) from their canonical parent.
+--
+-- Design decisions:
+--   - ONE level only. Variants always point to a root parent, never to
+--     another variant. The app enforces this; no DB constraint needed.
+--   - "Always inherit." Children never store their own physical_properties;
+--     the frontend reads from the parent at display time. The column on
+--     child rows stays NULL.
+--   - Flat grid. The UI shows all items but annotates parents with color
+--     dots for their variants, and variants with a "↑ parent" link.
+
+alter table public.physics_svgs
+  add column if not exists parent_id uuid
+    references public.physics_svgs(id) on delete set null;
+
+-- Fast lookup: "give me all children of this parent"
+create index if not exists idx_svgs_parent
+  on public.physics_svgs(parent_id)
+  where parent_id is not null;
+
+-- Re-create the view to include parent_id and parent_name.
+drop view if exists public.svgs_with_details;
+create view public.svgs_with_details
+with (security_invoker = true) as
+select
+  s.id,
+  s.name,
+  s.display_name,
+  s.svg_content,
+  s.status,
+  s.notes,
+  s.version,
+  s.last_exported_at,
+  s.last_exported_version,
+  s.last_exported_by,
+  s.physical_properties,
+  s.parent_id,
+  parent.name as parent_name,
+  s.created_at,
+  s.updated_at,
+  c.name       as category_name,
+  cp.name      as color_name,
+  cp.light_hex as color_light,
+  cp.mid_hex   as color_mid,
+  cp.dark_hex  as color_dark,
+  pm_created.display_name as created_by_name,
+  pm_updated.display_name as updated_by_name,
+  pm_exported.display_name as last_exported_by_name,
+  (
+    select count(*)::int from public.svg_feedback f
+    where f.svg_id = s.id
+  ) as feedback_count
+from public.physics_svgs s
+left join public.svg_categories c   on s.category_id = c.id
+left join public.color_palettes cp  on s.color_id = cp.id
+left join public.physics_svgs parent on s.parent_id = parent.id
+left join public.project_members pm_created  on s.created_by       = pm_created.user_id
+left join public.project_members pm_updated  on s.updated_by       = pm_updated.user_id
+left join public.project_members pm_exported on s.last_exported_by = pm_exported.user_id;
+
+-- No RLS changes needed: parent_id is just another column on physics_svgs,
+-- covered by existing "Members can view" and "Editors can update" policies.
+
+
+-- -------------------------
+-- 11c-backfill. Manual parent_id backfill for existing color variants
+-- -------------------------
+-- Run this AFTER 11c. Adjust to match actual data in your DB.
+-- Only uncomment lines for variants that actually exist.
+--
+-- Pattern: UPDATE physics_svgs SET parent_id = (SELECT id FROM physics_svgs WHERE name = '<parent>')
+--          WHERE name = '<color>_<parent>';
+--
+-- Example:
+--   UPDATE public.physics_svgs SET parent_id = (SELECT id FROM public.physics_svgs WHERE name = 'bike')
+--     WHERE name IN ('blue_bike', 'red_bike', 'gray_bike')
+--     AND parent_id IS NULL;

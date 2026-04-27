@@ -20,6 +20,9 @@ const MODAL_BATCH_ENDPOINT_URL = process.env.MODAL_BATCH_ENDPOINT_URL;
 
 const ALLOWED_MODES = ["category", "color_variants"] as const;
 const ALLOWED_MODEL_TIERS = ["standard", "advanced"] as const;
+// Kept in sync with src/lib/constants.js and modal_functions/generate_svg.py.
+const MAX_BATCH_COUNT = 10;
+const MAX_BATCH_REFERENCES = 5;
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST") {
@@ -78,7 +81,30 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(400).json({ error: "category is required for category mode" });
     }
     modalPayload.category = clientBody.category;
-    modalPayload.count = typeof clientBody.count === "number" ? clientBody.count : 10;
+
+    // Clamp count to [1, MAX_BATCH_COUNT]. Defends against a client that
+    // lies about the limit — Claude's output-token budget can't safely
+    // handle an arbitrarily large batch.
+    const rawCount = typeof clientBody.count === "number" ? clientBody.count : 10;
+    modalPayload.count = Math.max(1, Math.min(MAX_BATCH_COUNT, Math.floor(rawCount)));
+
+    // Optional style references: array of { name, svg } objects. We cap
+    // the count and validate the shape; the Modal function renders them
+    // into the user prompt so Claude can match the visual style.
+    if (Array.isArray(clientBody.reference_svgs)) {
+      const refs = clientBody.reference_svgs
+        .filter(
+          (r: unknown): r is { name: string; svg: string } =>
+            !!r &&
+            typeof r === "object" &&
+            typeof (r as Record<string, unknown>).name === "string" &&
+            typeof (r as Record<string, unknown>).svg === "string"
+        )
+        .slice(0, MAX_BATCH_REFERENCES);
+      if (refs.length > 0) {
+        modalPayload.reference_svgs = refs;
+      }
+    }
   } else {
     // color_variants
     if (!clientBody.object_name || typeof clientBody.object_name !== "string") {

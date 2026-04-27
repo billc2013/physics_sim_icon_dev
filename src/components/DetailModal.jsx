@@ -2,8 +2,19 @@ import { useEffect, useRef, useState } from "react";
 import DOMPurify from "dompurify";
 import { STATUSES, STATUS_CONFIG, COLOR_RAMPS } from "../lib/constants.js";
 import { isStale } from "../hooks/useSvgs.js";
+import { generateCollider } from "../lib/colliderGenerator.js";
+import {
+  validateCollider,
+  colliderToEditableVertices,
+  isConvexPolygon,
+  MAX_CONVEX_VERTICES,
+  VIEWBOX_SIZE,
+} from "../lib/colliderSchema.js";
 import ColorPaletteTag from "./ColorPaletteTag.jsx";
+import ColliderEditor from "./ColliderEditor.jsx";
+import ColliderPreview from "./ColliderPreview.jsx";
 import FeedbackHistory from "./FeedbackHistory.jsx";
+import GeometryInfo from "./GeometryInfo.jsx";
 import ModelTierToggle from "./ModelTierToggle.jsx";
 
 // Hard cap for manual SVG uploads. Existing library files are ~1 KB; Claude
@@ -62,6 +73,7 @@ export default function DetailModal({
   onPendingUploadChange,
   onAcceptUpload,
   onDiscardUpload,
+  onUpdatePhysicalProperties,
 }) {
   const textareaRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -73,6 +85,26 @@ export default function DetailModal({
   const [selectedColors, setSelectedColors] = useState(
     () => (item.colorTag ? new Set([item.colorTag]) : new Set())
   );
+
+  // Collider state. `previewCollider` is the locally-generated collider
+  // shown in the overlay; `showCollider` toggles the overlay visibility.
+  // If the item already has a saved collider, show it by default.
+  // For children, physical properties (including collider) inherit from
+  // the parent. The "effective" props are what we display; the "save target"
+  // is the parent's id when this is a child.
+  const isChild = !!item.parentId;
+  const effectiveProps = item.effectivePhysicalProperties;
+  const savedCollider = effectiveProps?.collider ?? null;
+  const [previewCollider, setPreviewCollider] = useState(savedCollider);
+  const [showCollider, setShowCollider] = useState(!!savedCollider);
+  const [colliderDebug, setColliderDebug] = useState(null);
+
+  // Collider edit mode. When active, the ColliderEditor overlay replaces
+  // the static ColliderPreview. `editVertices` holds the working vertex
+  // array; changes are live-previewed but not saved until the user clicks
+  // "Done".
+  const [editingCollider, setEditingCollider] = useState(false);
+  const [editVertices, setEditVertices] = useState(null);
 
   // Auto-focus the textarea (feedback or notes) when the modal opens or
   // navigates to a new item.
@@ -159,6 +191,95 @@ export default function DetailModal({
     onPendingUploadChange({ svg: sanitized, warning, error: null });
   };
 
+  const handleGenerateCollider = () => {
+    const { collider, debug } = generateCollider(item.svg);
+    const check = validateCollider(collider);
+    if (!check.valid) {
+      setColliderDebug({ error: check.error });
+      return;
+    }
+    setPreviewCollider(collider);
+    setShowCollider(true);
+    setColliderDebug(debug);
+  };
+
+  // Save/clear always target the parent (for children) or self (for
+  // root items). This enforces the "always inherit" rule — children
+  // never store their own physical_properties.
+  const colliderSaveTarget = item.parentId ?? item.id;
+
+  const handleSaveCollider = () => {
+    if (!previewCollider) return;
+    onUpdatePhysicalProperties(colliderSaveTarget, { collider: previewCollider });
+  };
+
+  const handleClearCollider = () => {
+    setPreviewCollider(null);
+    setShowCollider(false);
+    setColliderDebug(null);
+    setEditingCollider(false);
+    setEditVertices(null);
+    onUpdatePhysicalProperties(colliderSaveTarget, { collider: null });
+  };
+
+  const handleStartEdit = () => {
+    if (!previewCollider) return;
+    const verts = colliderToEditableVertices(previewCollider);
+    if (!verts) return; // compound not yet editable
+    setEditVertices(verts);
+    setEditingCollider(true);
+    setShowCollider(true);
+  };
+
+  const handleFinishEdit = () => {
+    if (!editVertices || editVertices.length < 3) {
+      setEditingCollider(false);
+      setEditVertices(null);
+      return;
+    }
+    const round2 = (n) => Math.round(n * 100) / 100;
+    const editedCollider = {
+      type: "convex",
+      vertices: editVertices.map(([x, y]) => [round2(x), round2(y)]),
+    };
+    setPreviewCollider(editedCollider);
+    setColliderDebug((prev) => ({
+      ...prev,
+      strategy: (prev?.strategy ?? "") + " (edited)",
+    }));
+    setEditingCollider(false);
+    setEditVertices(null);
+  };
+
+  const handleCancelEdit = () => {
+    setEditingCollider(false);
+    setEditVertices(null);
+  };
+
+  // Clamp every vertex to [0, 64] — quick rescue when the LLM or programmatic
+  // generator placed vertices too far outside the icon to grab even in the
+  // expanded editor canvas.
+  const handleSnapToBounds = () => {
+    if (!editVertices) return;
+    const clampCoord = (n) => Math.round(Math.max(0, Math.min(VIEWBOX_SIZE, n)) * 100) / 100;
+    setEditVertices(editVertices.map(([x, y]) => [clampCoord(x), clampCoord(y)]));
+  };
+
+  // Start over with a fresh programmatic collider from the SVG. Useful when
+  // the current collider is a mess and it's easier to regenerate than to
+  // drag individual vertices back into place.
+  const handleResetCollider = () => {
+    const { collider } = generateCollider(item.svg);
+    const verts = colliderToEditableVertices(collider);
+    if (verts) setEditVertices(verts);
+  };
+
+  // True if any vertex is outside [0, 64] in either dimension.
+  const hasOutOfBoundsVertex =
+    editVertices?.some(
+      ([x, y]) => x < 0 || y < 0 || x > VIEWBOX_SIZE || y > VIEWBOX_SIZE
+    ) ?? false;
+
   return (
     <div
       style={{
@@ -227,11 +348,26 @@ export default function DetailModal({
             marginBottom: isIdeaOnly ? 16 : 8,
           }}
         >
-          <div
-            dangerouslySetInnerHTML={{ __html: item.svg }}
-            style={{ width: 180, height: 180, margin: "0 auto" }}
-          />
+          <div style={{ position: "relative", width: 180, height: 180, margin: "0 auto" }}>
+            <div
+              dangerouslySetInnerHTML={{ __html: item.svg }}
+              style={{ width: "100%", height: "100%" }}
+            />
+            {editingCollider && editVertices ? (
+              <ColliderEditor vertices={editVertices} onChange={setEditVertices} />
+            ) : (
+              showCollider && <ColliderPreview collider={previewCollider} />
+            )}
+          </div>
         </div>
+
+        {/* Geometry info: viewBox scale check + content/collider bounds.
+            Lets reviewers catch scale mismatches before approving a
+            non-64×64 SVG, since GIST scales collider coords by the SVG's
+            viewBox. Hidden for idea-only items (no real SVG). */}
+        {!isIdeaOnly && (
+          <GeometryInfo svg={item.svg} collider={previewCollider} />
+        )}
 
         {/* Export status line. Only shown when this item has been exported
             at least once. If there have been revisions since the export,
@@ -306,6 +442,254 @@ export default function DetailModal({
           </div>
         )}
 
+        {/* Collider controls. Generate a best-guess physics collider from
+            the SVG geometry, preview the overlay, save to physical_properties. */}
+        {!isIdeaOnly && (
+          <div
+            style={{
+              marginBottom: 12,
+              padding: "8px 10px",
+              borderRadius: "var(--border-radius-md)",
+              border: "0.5px solid var(--color-border-tertiary)",
+              fontSize: 12,
+            }}
+          >
+            {editingCollider ? (
+              /* ---- Edit mode UI ---- */
+              <>
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    marginBottom: 6,
+                  }}
+                >
+                  <span style={{ fontWeight: 500, color: "var(--color-text-secondary)" }}>
+                    Editing collider
+                    <span
+                      style={{
+                        fontWeight: 400,
+                        color: "var(--color-text-tertiary)",
+                        marginLeft: 6,
+                      }}
+                    >
+                      {editVertices?.length ?? 0}/{MAX_CONVEX_VERTICES} vertices
+                    </span>
+                  </span>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    {hasOutOfBoundsVertex && (
+                      <button
+                        onClick={handleSnapToBounds}
+                        title="Clamp all vertices to the 0–64 icon bounds"
+                        style={{
+                          fontSize: 11,
+                          color: "#92400E",
+                          background: "transparent",
+                          border: "none",
+                          padding: "2px 4px",
+                          cursor: "pointer",
+                        }}
+                      >
+                        Snap to bounds
+                      </button>
+                    )}
+                    <button
+                      onClick={handleResetCollider}
+                      title="Start over with a fresh programmatic collider"
+                      style={{
+                        fontSize: 11,
+                        color: "var(--color-text-secondary)",
+                        background: "transparent",
+                        border: "none",
+                        padding: "2px 4px",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Reset
+                    </button>
+                    <button
+                      onClick={handleCancelEdit}
+                      style={{
+                        fontSize: 11,
+                        color: "var(--color-text-secondary)",
+                        background: "transparent",
+                        border: "none",
+                        padding: "2px 4px",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={handleFinishEdit}
+                      style={{ fontSize: 11, fontWeight: 500, padding: "2px 8px", cursor: "pointer" }}
+                    >
+                      Done
+                    </button>
+                  </div>
+                </div>
+                {editVertices && !isConvexPolygon(editVertices) && (
+                  <div
+                    style={{
+                      padding: "4px 6px",
+                      borderRadius: "var(--border-radius-md)",
+                      background: "#FEF3C7",
+                      color: "#92400E",
+                      fontSize: 11,
+                      marginBottom: 4,
+                    }}
+                  >
+                    Polygon is concave — physics engines require convex shapes.
+                    Adjust vertices or the engine will use the convex hull.
+                  </div>
+                )}
+                <div style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>
+                  Drag vertex to move &middot; Drag shape interior to translate
+                  &middot; Click{" "}
+                  <span style={{ color: "#10B981", fontWeight: 600 }}>+</span> to add
+                  &middot; Click{" "}
+                  <span style={{ color: "#EF4444", fontWeight: 600 }}>&times;</span> to
+                  remove
+                </div>
+              </>
+            ) : (
+              /* ---- Normal (non-editing) UI ---- */
+              <>
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    marginBottom: previewCollider ? 6 : 0,
+                  }}
+                >
+                  <span style={{ fontWeight: 500, color: "var(--color-text-secondary)" }}>
+                    Collider
+                    {previewCollider && (
+                      <span
+                        style={{
+                          fontWeight: 400,
+                          color: "var(--color-text-tertiary)",
+                          marginLeft: 6,
+                        }}
+                      >
+                        {previewCollider.type}
+                        {colliderDebug?.strategy ? ` · ${colliderDebug.strategy}` : ""}
+                      </span>
+                    )}
+                  </span>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    {previewCollider && (
+                      <>
+                        <button
+                          onClick={() => setShowCollider((v) => !v)}
+                          style={{
+                            fontSize: 11,
+                            color: "var(--color-text-secondary)",
+                            background: "transparent",
+                            border: "none",
+                            padding: "2px 4px",
+                            cursor: "pointer",
+                          }}
+                        >
+                          {showCollider ? "Hide" : "Show"}
+                        </button>
+                        <button
+                          onClick={handleStartEdit}
+                          style={{
+                            fontSize: 11,
+                            color: "var(--color-text-secondary)",
+                            background: "transparent",
+                            border: "none",
+                            padding: "2px 4px",
+                            cursor: "pointer",
+                          }}
+                        >
+                          Edit
+                        </button>
+                      </>
+                    )}
+                    <button
+                      onClick={handleGenerateCollider}
+                      style={{ fontSize: 11, padding: "2px 8px", cursor: "pointer" }}
+                    >
+                      {previewCollider ? "Regenerate" : "Generate"}
+                    </button>
+                  </div>
+                </div>
+
+                {previewCollider && (
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                    }}
+                  >
+                    <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>
+                      {savedCollider ? "Saved" : "Unsaved preview"}
+                      {isChild && savedCollider && ` · inherited from ${item.parentId}`}
+                      {colliderDebug?.extractedPoints != null &&
+                        ` · ${colliderDebug.extractedPoints} pts → ${
+                          previewCollider.type === "convex"
+                            ? previewCollider.vertices.length + " verts"
+                            : previewCollider.type
+                        }`}
+                    </span>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      {savedCollider && (
+                        <button
+                          onClick={handleClearCollider}
+                          style={{
+                            fontSize: 11,
+                            color: "#991B1B",
+                            background: "transparent",
+                            border: "none",
+                            padding: "2px 4px",
+                            cursor: "pointer",
+                          }}
+                        >
+                          Remove
+                        </button>
+                      )}
+                      {(!savedCollider ||
+                        JSON.stringify(savedCollider) !== JSON.stringify(previewCollider)) && (
+                        <button
+                          onClick={handleSaveCollider}
+                          style={{
+                            fontSize: 11,
+                            fontWeight: 500,
+                            padding: "2px 8px",
+                            cursor: "pointer",
+                          }}
+                        >
+                          Save
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+
+            {colliderDebug?.error && (
+              <div
+                style={{
+                  marginTop: 4,
+                  padding: "4px 6px",
+                  borderRadius: "var(--border-radius-md)",
+                  background: "#FECACA",
+                  color: "#991B1B",
+                  fontSize: 11,
+                }}
+              >
+                {colliderDebug.error}
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Manual upload preview panel. Mirrors the Claude revision preview
             visually but only shows Discard / Accept (no Try again). */}
         {pendingUpload && (
@@ -371,6 +755,11 @@ export default function DetailModal({
                     style={{ width: 180, height: 180, margin: "0 auto" }}
                   />
                 </div>
+                {/* Catch viewBox mismatches BEFORE the user accepts the
+                    upload. The accept path writes svg_content straight
+                    to physics_svgs, so a wrong viewBox here silently
+                    breaks the GIST scale downstream. */}
+                <GeometryInfo svg={pendingUpload.svg} compact />
               </>
             )}
 

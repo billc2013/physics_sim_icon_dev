@@ -198,3 +198,51 @@ export function isConvexPolygon(vertices) {
 function round(n) {
   return Math.round(n * 100) / 100;
 }
+
+/**
+ * Apply a uniform scale + translate to every coordinate in a collider.
+ * Used by the SVG rescale-to-fit flow to keep an aligned collider aligned
+ * after the SVG's content has been moved/scaled within its viewBox.
+ *
+ * Math: for any point p, p' = p * scale + (tx, ty). For circles/boxes the
+ * size scales but the angle is preserved (uniform scale).
+ *
+ * Returns a new collider; does not mutate the input. Returns null for an
+ * unrecognized type.
+ */
+export function transformCollider(collider, scale, tx, ty) {
+  if (!collider) return null;
+  const px = (x) => round(x * scale + tx);
+  const py = (y) => round(y * scale + ty);
+  const sz = (n) => round(n * scale);
+
+  switch (collider.type) {
+    case "circle":
+      return {
+        ...collider,
+        center: [px(collider.center[0]), py(collider.center[1])],
+        radius: sz(collider.radius),
+      };
+    case "box":
+      return {
+        ...collider,
+        center: [px(collider.center[0]), py(collider.center[1])],
+        width: sz(collider.width),
+        height: sz(collider.height),
+      };
+    case "convex":
+      return {
+        ...collider,
+        vertices: collider.vertices.map(([x, y]) => [px(x), py(y)]),
+      };
+    case "compound":
+      return {
+        ...collider,
+        parts: collider.parts
+          .map((p) => transformCollider(p, scale, tx, ty))
+          .filter(Boolean),
+      };
+    default:
+      return null;
+  }
+}

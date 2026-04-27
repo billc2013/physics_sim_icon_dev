@@ -5,6 +5,8 @@ import { useAuth } from "./hooks/useAuth.js";
 import { useSvgs } from "./hooks/useSvgs.js";
 import { useGeneration } from "./hooks/useGeneration.js";
 import { useGenerationQueue } from "./hooks/useGenerationQueue.js";
+import { generateCollider } from "./lib/colliderGenerator.js";
+import { validateCollider } from "./lib/colliderSchema.js";
 import LoginPage from "./components/LoginPage.jsx";
 import Header from "./components/Header.jsx";
 import TabStrip from "./components/TabStrip.jsx";
@@ -15,6 +17,8 @@ import DetailModal from "./components/DetailModal.jsx";
 import SystemPrompt from "./components/SystemPrompt.jsx";
 import GenerateNewModal from "./components/GenerateNewModal.jsx";
 import BatchGenerateModal from "./components/BatchGenerateModal.jsx";
+import ImportSvgModal from "./components/ImportSvgModal.jsx";
+import DuplicateSvgModal from "./components/DuplicateSvgModal.jsx";
 import DownloadApprovedModal from "./components/DownloadApprovedModal.jsx";
 import QueuePanel from "./components/QueuePanel.jsx";
 import DataTransformPage from "./components/data/DataTransformPage.jsx";
@@ -63,6 +67,10 @@ function SignedInApp({ user, onSignOut }) {
   const [showSystemPrompt, setShowSystemPrompt] = useState(false);
   const [showGenerateNew, setShowGenerateNew] = useState(false);
   const [showBatchGenerate, setShowBatchGenerate] = useState(false);
+  const [showImportSvg, setShowImportSvg] = useState(false);
+  // When non-null, the DuplicateSvgModal is open over DetailModal and this
+  // is the source item we're copying from.
+  const [duplicateSource, setDuplicateSource] = useState(null);
   const [showDownloadApproved, setShowDownloadApproved] = useState(false);
   const [showQueue, setShowQueue] = useState(false);
   // FilterBar "Downloaded" toggle — when on, further restricts the grid to
@@ -237,6 +245,68 @@ function SignedInApp({ user, onSignOut }) {
     openModalForId(name);
   };
 
+  // Import: bring in an SVG from disk and insert as a new draft. Auto-runs
+  // the programmatic collider generator so the new item lands with a
+  // starter collider — Bill can refine via the DetailModal collider editor
+  // or replace it later via Flow B.
+  const handleOpenImportSvg = () => setShowImportSvg(true);
+  const handleCloseImportSvg = () => setShowImportSvg(false);
+  const handleImportAccept = async ({ name, displayName, svgContent, colorTag }) => {
+    let physicalProperties = null;
+    try {
+      const { collider } = generateCollider(svgContent);
+      const check = validateCollider(collider);
+      if (check.valid) physicalProperties = { collider };
+    } catch {
+      // Generator failed (e.g. unparseable SVG). Insert without a collider;
+      // the user can generate one later from the DetailModal.
+    }
+    try {
+      await svgs.insertSvg({
+        name,
+        displayName,
+        svgContent,
+        colorTag,
+        physicalProperties,
+      });
+      showToast(`Imported "${displayName}"`);
+    } catch (e) {
+      showToast(`Error: ${e.message ?? e}`);
+      throw e;
+    }
+  };
+  const handleImportJumpToExisting = (name) => {
+    setShowImportSvg(false);
+    openModalForId(name);
+  };
+
+  // Duplicate: copy the current DetailModal item under a new name. Carries
+  // svg, effective physical_properties (so children's inherited collider
+  // becomes a concrete copy), and color tag. parent_id is intentionally
+  // not copied — the duplicate is a new independent root, not a variant.
+  const handleOpenDuplicate = (sourceItem) => setDuplicateSource(sourceItem);
+  const handleCloseDuplicate = () => setDuplicateSource(null);
+  const handleDuplicateAccept = async ({ newName }) => {
+    if (!duplicateSource) return;
+    try {
+      const newId = await svgs.insertSvg({
+        name: newName,
+        displayName: newName.replace(/_/g, " "),
+        svgContent: duplicateSource.svg,
+        colorTag: duplicateSource.colorTag,
+        physicalProperties: duplicateSource.effectivePhysicalProperties ?? null,
+      });
+      // Close the duplicate dialog and switch DetailModal to the new item
+      // so Bill can immediately Send to Claude on the duplicate.
+      setDuplicateSource(null);
+      if (newId) openModalForId(newId);
+      showToast(`Duplicated as "${newName}"`);
+    } catch (e) {
+      showToast(`Error: ${e.message ?? e}`);
+      throw e;
+    }
+  };
+
   // Batch generate: category mode (Header "Batch generate")
   // Fire-and-forget: adds a job to the queue, closes the modal.
   const handleOpenBatchGenerate = () => {
@@ -294,12 +364,22 @@ function SignedInApp({ user, onSignOut }) {
 
   // Manual SVG upload accept/discard. Goes through updateSvgContent so
   // versioning and draft→revised promotion work identically to revisions.
+  // If the pending change also carries a transformed collider (rescale
+  // path), save it too — to the parent (or self) so the always-inherit
+  // rule for variants holds.
   const handleAcceptUpload = async (id) => {
     if (!pendingUpload) return;
     try {
       await svgs.updateSvgContent(id, pendingUpload.svg);
+      if (pendingUpload.collider) {
+        const sourceItem = items?.find((i) => i.id === id);
+        const colliderTarget = sourceItem?.parentId ?? id;
+        await svgs.updatePhysicalProperties(colliderTarget, {
+          collider: pendingUpload.collider,
+        });
+      }
       setPendingUpload(null);
-      showToast("Upload saved");
+      showToast(pendingUpload.collider ? "Saved (SVG + collider)" : "Saved");
     } catch (e) {
       showToast(`Error: ${e.message ?? e}`);
     }
@@ -549,6 +629,7 @@ function SignedInApp({ user, onSignOut }) {
         itemCount={items.length}
         onGenerateMore={handleGenerateMore}
         onBatchGenerate={handleOpenBatchGenerate}
+        onImportSvg={handleOpenImportSvg}
         onShowQueue={() => setShowQueue(true)}
         queueCounts={queue}
         onShowSystemPrompt={() => setShowSystemPrompt(true)}
@@ -601,6 +682,7 @@ function SignedInApp({ user, onSignOut }) {
           onAcceptUpload={handleAcceptUpload}
           onDiscardUpload={handleDiscardUpload}
           onUpdatePhysicalProperties={updatePhysicalProperties}
+          onDuplicate={handleOpenDuplicate}
         />
       )}
 
@@ -620,6 +702,28 @@ function SignedInApp({ user, onSignOut }) {
           items={items}
           onGenerate={handleBatchGenerate}
           onClose={handleCloseBatchGenerate}
+        />
+      )}
+
+      {showImportSvg && (
+        <ImportSvgModal
+          existingNames={existingNames}
+          onAccept={handleImportAccept}
+          onClose={handleCloseImportSvg}
+          onJumpToExisting={handleImportJumpToExisting}
+        />
+      )}
+
+      {duplicateSource && (
+        <DuplicateSvgModal
+          sourceItem={duplicateSource}
+          existingNames={existingNames}
+          onAccept={handleDuplicateAccept}
+          onClose={handleCloseDuplicate}
+          onJumpToExisting={(name) => {
+            setDuplicateSource(null);
+            openModalForId(name);
+          }}
         />
       )}
 

@@ -188,3 +188,125 @@ function boundsFromPoints(points) {
 function round1(n) {
   return Math.round(n * 10) / 10;
 }
+
+// Container elements that don't render visible geometry on their own.
+// We skip them when computing the rescale bbox AND we leave them as
+// direct children of the <svg> rather than moving them into the transform
+// group (transforming a <defs> would silently shift gradient/pattern
+// coordinates that other elements reference).
+const NON_RENDERING_TAGS = new Set([
+  "defs",
+  "style",
+  "title",
+  "desc",
+  "metadata",
+  "clipPath",
+  "mask",
+  "linearGradient",
+  "radialGradient",
+  "pattern",
+  "filter",
+  "marker",
+  "symbol",
+  "view",
+  "hatch",
+]);
+
+/**
+ * Scale and recenter the SVG's content so its rendered bounding box fills
+ * the canonical 64×64 viewBox while preserving aspect ratio. Content is
+ * wrapped in a single <g transform="translate(...) scale(...)"> and the
+ * viewBox/width/height are normalized to 64.
+ *
+ * Why getBBox() and not vertex extraction: getBBox returns the true
+ * rendered bbox including stroke widths, text glyphs, and the effect of
+ * any pre-existing transforms on child elements. Vertex extraction
+ * (extractFilledVertices) only sees path/shape geometry and would
+ * mis-fit anything with strokes or text.
+ *
+ * Implementation note: getBBox() requires the element to be attached to
+ * a Document, so we mount into a hidden host on document.body and tear
+ * down before returning. Throws if called outside a browser environment.
+ *
+ * Returns `{ svg: newMarkup, scale, tx, ty }` on success, or null if the
+ * SVG had no measurable content.
+ */
+export function rescaleToFitViewBox(svgMarkup) {
+  if (typeof document === "undefined") {
+    throw new Error("rescaleToFitViewBox requires a browser environment");
+  }
+  if (!svgMarkup) return null;
+
+  const host = document.createElement("div");
+  host.setAttribute("aria-hidden", "true");
+  host.style.cssText =
+    "position:absolute;left:-9999px;top:-9999px;width:0;height:0;visibility:hidden;";
+  host.innerHTML = svgMarkup;
+  const svg = host.querySelector("svg");
+  if (!svg) return null;
+
+  document.body.appendChild(host);
+  try {
+    const renderable = [];
+    for (const child of Array.from(svg.children)) {
+      if (!NON_RENDERING_TAGS.has(child.tagName)) renderable.push(child);
+    }
+    if (renderable.length === 0) return null;
+
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const el of renderable) {
+      let b = null;
+      try {
+        b = el.getBBox();
+      } catch {
+        continue;
+      }
+      if (!b) continue;
+      // Skip degenerate boxes (e.g. an empty <g>). 0×0 carries no info but
+      // its x/y would distort the union toward (0,0).
+      if (b.width === 0 && b.height === 0) continue;
+      if (b.x < minX) minX = b.x;
+      if (b.y < minY) minY = b.y;
+      if (b.x + b.width > maxX) maxX = b.x + b.width;
+      if (b.y + b.height > maxY) maxY = b.y + b.height;
+    }
+    if (!Number.isFinite(minX)) return null;
+
+    const w = maxX - minX;
+    const h = maxY - minY;
+    if (w <= 0 || h <= 0) return null;
+
+    const scale = Math.min(VIEWBOX_SIZE / w, VIEWBOX_SIZE / h);
+    const tx = VIEWBOX_SIZE / 2 - (minX + w / 2) * scale;
+    const ty = VIEWBOX_SIZE / 2 - (minY + h / 2) * scale;
+
+    const round = (n) => Number(n.toFixed(4));
+    const transform = `translate(${round(tx)} ${round(ty)}) scale(${round(scale)})`;
+
+    // Wrap renderable children in a single transform group. defs/style
+    // and friends remain in place as direct children of <svg>.
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    const g = document.createElementNS(SVG_NS, "g");
+    g.setAttribute("transform", transform);
+    for (const el of renderable) {
+      svg.removeChild(el);
+      g.appendChild(el);
+    }
+    svg.appendChild(g);
+    svg.setAttribute("viewBox", `0 0 ${VIEWBOX_SIZE} ${VIEWBOX_SIZE}`);
+    // Drop any pre-existing width/height. They'd render the SVG at fixed
+    // pixel size regardless of container (e.g. width="64" in a 180-px
+    // preview makes the drawing look tiny), and downstream consumers
+    // (GIST, the export zip) read viewBox, not width/height.
+    svg.removeAttribute("width");
+    svg.removeAttribute("height");
+
+    const newMarkup = new XMLSerializer().serializeToString(svg);
+    return { svg: newMarkup, scale: round(scale), tx: round(tx), ty: round(ty) };
+  } finally {
+    document.body.removeChild(host);
+  }
+}

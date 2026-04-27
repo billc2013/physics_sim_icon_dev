@@ -7,6 +7,7 @@ export default function Header({
   itemCount,
   onGenerateMore,
   onBatchGenerate,
+  onImportSvg,
   onShowQueue,
   queueCounts,
   onShowSystemPrompt,
@@ -50,6 +51,9 @@ export default function Header({
         </button>
         <button onClick={onBatchGenerate} style={{ fontSize: 13 }}>
           Batch generate &#8599;
+        </button>
+        <button onClick={onImportSvg} style={{ fontSize: 13 }}>
+          Import SVG &#8593;
         </button>
         {queueLabel && (
           <button

@@ -7,6 +7,7 @@ import {
   validateCollider,
   colliderToEditableVertices,
   isConvexPolygon,
+  transformCollider,
   MAX_CONVEX_VERTICES,
   VIEWBOX_SIZE,
 } from "../lib/colliderSchema.js";
@@ -15,6 +16,7 @@ import ColliderEditor from "./ColliderEditor.jsx";
 import ColliderPreview from "./ColliderPreview.jsx";
 import FeedbackHistory from "./FeedbackHistory.jsx";
 import GeometryInfo from "./GeometryInfo.jsx";
+import { rescaleToFitViewBox } from "../lib/svgGeometry.js";
 import ModelTierToggle from "./ModelTierToggle.jsx";
 
 // Hard cap for manual SVG uploads. Existing library files are ~1 KB; Claude
@@ -74,6 +76,7 @@ export default function DetailModal({
   onAcceptUpload,
   onDiscardUpload,
   onUpdatePhysicalProperties,
+  onDuplicate,
 }) {
   const textareaRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -112,6 +115,18 @@ export default function DetailModal({
     if (textareaRef.current) textareaRef.current.focus();
   }, [item.id]);
 
+  // When the saved collider changes underneath us — e.g. after a Rescale
+  // Accept, App.jsx writes a new collider via updatePhysicalProperties
+  // and item.effectivePhysicalProperties updates — refresh previewCollider
+  // so the on-screen overlay matches the new SVG. Skipped while editing
+  // so an in-progress edit isn't clobbered.
+  useEffect(() => {
+    if (!editingCollider) {
+      setPreviewCollider(savedCollider);
+      setShowCollider(!!savedCollider);
+    }
+  }, [savedCollider, editingCollider]);
+
   // Download the current SVG to disk as `<id>.svg`. Snake_case to match
   // physics_svgs.name and the planned zip-export naming.
   const handleDownload = () => {
@@ -130,6 +145,77 @@ export default function DetailModal({
   // handleUploadFileChange after the user selects a file.
   const handleUploadClick = () => {
     fileInputRef.current?.click();
+  };
+
+  // Compute a rescaled version of the current SVG (content centered and
+  // scaled to fit the 64×64 viewBox). Stage it through pendingUpload so
+  // the user can visually verify before accepting — the existing accept
+  // path runs through updateSvgContent for free versioning + draft→revised
+  // promotion.
+  //
+  // If the item has an aligned collider, we also transform the collider
+  // by the same (tx, ty, scale) so it stays aligned after rescale. Two
+  // important wrinkles:
+  //   - For ROOT items, the collider lives on the item itself — safe to
+  //     transform and re-save.
+  //   - For CHILDREN, the collider lives on the parent and is shared
+  //     across all color-variant siblings. Rescaling one child's drawing
+  //     and writing a transformed collider to the parent would misalign
+  //     the siblings. So we skip the collider transform for children and
+  //     surface a warning.
+  const handleRescaleClick = () => {
+    try {
+      const result = rescaleToFitViewBox(item.svg);
+      if (!result) {
+        onPendingUploadChange({
+          svg: null,
+          warning: null,
+          error: "Couldn't measure the SVG — no renderable content found.",
+        });
+        return;
+      }
+
+      const pct = (result.scale * 100).toFixed(1);
+      const baseMessage = `Rescaled content to fit 64×64 viewBox (scale ${pct}%).`;
+
+      const sourceCollider = effectiveProps?.collider ?? null;
+      let transformedCollider = null;
+      let warning = baseMessage;
+
+      if (sourceCollider) {
+        if (isChild) {
+          warning =
+            `${baseMessage} The inherited collider was NOT transformed (it lives on the parent and is shared with sibling variants). Re-align manually if needed.`;
+        } else {
+          const candidate = transformCollider(
+            sourceCollider,
+            result.scale,
+            result.tx,
+            result.ty
+          );
+          const check = candidate ? validateCollider(candidate) : { valid: false };
+          if (check.valid) {
+            transformedCollider = candidate;
+            warning = `${baseMessage} Collider transformed to match.`;
+          } else {
+            warning = `${baseMessage} Collider transform failed validation; left unchanged.`;
+          }
+        }
+      }
+
+      onPendingUploadChange({
+        svg: result.svg,
+        warning,
+        error: null,
+        collider: transformedCollider,
+      });
+    } catch (e) {
+      onPendingUploadChange({
+        svg: null,
+        warning: null,
+        error: `Rescale failed: ${e.message ?? e}`,
+      });
+    }
   };
 
   // Validate, sanitize, and stage an uploaded SVG. Failures populate
@@ -348,7 +434,18 @@ export default function DetailModal({
             marginBottom: isIdeaOnly ? 16 : 8,
           }}
         >
-          <div style={{ position: "relative", width: 180, height: 180, margin: "0 auto" }}>
+          <div
+            style={{
+              position: "relative",
+              width: 180,
+              height: 180,
+              margin: "0 auto",
+              // Dashed outline marks the 64×64 viewBox edge so reviewers
+              // can spot content that doesn't fill the canvas (an outlier
+              // the rescale-to-fit didn't catch).
+              outline: "1px dashed var(--color-border-tertiary)",
+            }}
+          >
             <div
               dangerouslySetInnerHTML={{ __html: item.svg }}
               style={{ width: "100%", height: "100%" }}
@@ -431,6 +528,32 @@ export default function DetailModal({
               }}
             >
               &uarr; Upload
+            </button>
+            <button
+              onClick={() => onDuplicate?.(item)}
+              style={{
+                fontSize: 12,
+                color: "var(--color-text-secondary)",
+                background: "transparent",
+                border: "none",
+                padding: "2px 6px",
+                cursor: "pointer",
+              }}
+            >
+              &#x29C9; Duplicate as...
+            </button>
+            <button
+              onClick={handleRescaleClick}
+              style={{
+                fontSize: 12,
+                color: "var(--color-text-secondary)",
+                background: "transparent",
+                border: "none",
+                padding: "2px 6px",
+                cursor: "pointer",
+              }}
+            >
+              &#x2922; Rescale to fit
             </button>
             <input
               ref={fileInputRef}
@@ -690,8 +813,9 @@ export default function DetailModal({
           </div>
         )}
 
-        {/* Manual upload preview panel. Mirrors the Claude revision preview
-            visually but only shows Discard / Accept (no Try again). */}
+        {/* Pending change preview panel. Used by both manual uploads and
+            the in-place Rescale-to-fit button. Mirrors the Claude revision
+            preview visually but only shows Discard / Accept (no Try again). */}
         {pendingUpload && (
           <div
             style={{
@@ -709,7 +833,7 @@ export default function DetailModal({
                 marginBottom: 6,
               }}
             >
-              Upload preview
+              Pending change
             </div>
 
             {pendingUpload.error ? (
@@ -752,7 +876,12 @@ export default function DetailModal({
                 >
                   <div
                     dangerouslySetInnerHTML={{ __html: pendingUpload.svg }}
-                    style={{ width: 180, height: 180, margin: "0 auto" }}
+                    style={{
+                      width: 180,
+                      height: 180,
+                      margin: "0 auto",
+                      outline: "1px dashed var(--color-border-tertiary)",
+                    }}
                   />
                 </div>
                 {/* Catch viewBox mismatches BEFORE the user accepts the

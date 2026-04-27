@@ -47,7 +47,7 @@ export default function GeometryInfo({ svg, collider, compact = false }) {
           marginBottom: 6,
         }}
       >
-        viewBox {vbCheck.viewBox.width}×{vbCheck.viewBox.height} &check;
+        viewBox {vbCheck.viewBox.width}×{vbCheck.viewBox.height} ✓
       </div>
     );
   }

@@ -16,7 +16,7 @@ import ColliderEditor from "./ColliderEditor.jsx";
 import ColliderPreview from "./ColliderPreview.jsx";
 import FeedbackHistory from "./FeedbackHistory.jsx";
 import GeometryInfo from "./GeometryInfo.jsx";
-import { rescaleToFitViewBox } from "../lib/svgGeometry.js";
+import { rescaleToFitViewBox, parseViewBox } from "../lib/svgGeometry.js";
 import ModelTierToggle from "./ModelTierToggle.jsx";
 
 // Hard cap for manual SVG uploads. Existing library files are ~1 KB; Claude
@@ -98,6 +98,12 @@ export default function DetailModal({
   const isChild = !!item.parentId;
   const effectiveProps = item.effectivePhysicalProperties;
   const savedCollider = effectiveProps?.collider ?? null;
+  // Underlying SVG's viewBox dims drive the collider overlay's coord
+  // space, so a non-square viewBox (e.g. 35×64 after rescale) doesn't
+  // make the collider look stretched/shrunk relative to the SVG.
+  const itemViewBox = parseViewBox(item.svg);
+  const itemVbW = itemViewBox?.width ?? 64;
+  const itemVbH = itemViewBox?.height ?? 64;
   const [previewCollider, setPreviewCollider] = useState(savedCollider);
   const [showCollider, setShowCollider] = useState(!!savedCollider);
   const [colliderDebug, setColliderDebug] = useState(null);
@@ -116,16 +122,28 @@ export default function DetailModal({
   }, [item.id]);
 
   // When the saved collider changes underneath us — e.g. after a Rescale
-  // Accept, App.jsx writes a new collider via updatePhysicalProperties
-  // and item.effectivePhysicalProperties updates — refresh previewCollider
-  // so the on-screen overlay matches the new SVG. Skipped while editing
-  // so an in-progress edit isn't clobbered.
+  // Accept writes a new collider via updatePhysicalProperties — refresh
+  // previewCollider so the on-screen overlay matches the new SVG.
+  //
+  // We only sync when the user wasn't holding a separate candidate. A ref
+  // tracks the last savedCollider we synced from; if previewCollider still
+  // equals that prior value, the user has no in-progress edit and it's
+  // safe to follow the new save. If previewCollider has diverged (Generate
+  // or Edit-Done populated it with a candidate), we leave it alone so the
+  // Save button can appear and the user can commit their work.
+  //
+  // This deliberately does NOT depend on editingCollider: that would re-fire
+  // on every Edit-Done and clobber the just-set candidate.
+  const lastSyncedSavedColliderRef = useRef(savedCollider);
   useEffect(() => {
-    if (!editingCollider) {
-      setPreviewCollider(savedCollider);
-      setShowCollider(!!savedCollider);
+    if (savedCollider !== lastSyncedSavedColliderRef.current) {
+      if (previewCollider === lastSyncedSavedColliderRef.current) {
+        setPreviewCollider(savedCollider);
+        setShowCollider(!!savedCollider);
+      }
+      lastSyncedSavedColliderRef.current = savedCollider;
     }
-  }, [savedCollider, editingCollider]);
+  }, [savedCollider, previewCollider]);
 
   // Download the current SVG to disk as `<id>.svg`. Snake_case to match
   // physics_svgs.name and the planned zip-export naming.
@@ -153,16 +171,11 @@ export default function DetailModal({
   // path runs through updateSvgContent for free versioning + draft→revised
   // promotion.
   //
-  // If the item has an aligned collider, we also transform the collider
-  // by the same (tx, ty, scale) so it stays aligned after rescale. Two
-  // important wrinkles:
-  //   - For ROOT items, the collider lives on the item itself — safe to
-  //     transform and re-save.
-  //   - For CHILDREN, the collider lives on the parent and is shared
-  //     across all color-variant siblings. Rescaling one child's drawing
-  //     and writing a transformed collider to the parent would misalign
-  //     the siblings. So we skip the collider transform for children and
-  //     surface a warning.
+  // The collider (if any) is transformed by the same (scale, tx, ty) so
+  // it stays aligned. Family propagation — applying the same transform
+  // to the parent + all sibling variants so the family stays in lockstep —
+  // happens in App.jsx's accept handler, which has access to the full
+  // items list. We just stash scale/tx/ty in pendingUpload to signal it.
   const handleRescaleClick = () => {
     try {
       const result = rescaleToFitViewBox(item.svg);
@@ -176,31 +189,35 @@ export default function DetailModal({
       }
 
       const pct = (result.scale * 100).toFixed(1);
-      const baseMessage = `Rescaled content to fit 64×64 viewBox (scale ${pct}%).`;
+      const vbW = result.viewBoxWidth.toFixed(1).replace(/\.0$/, "");
+      const vbH = result.viewBoxHeight.toFixed(1).replace(/\.0$/, "");
+      const baseMessage = `Rescaled content (scale ${pct}%). New viewBox: ${vbW}×${vbH}.`;
 
       const sourceCollider = effectiveProps?.collider ?? null;
       let transformedCollider = null;
       let warning = baseMessage;
 
       if (sourceCollider) {
-        if (isChild) {
-          warning =
-            `${baseMessage} The inherited collider was NOT transformed (it lives on the parent and is shared with sibling variants). Re-align manually if needed.`;
+        const candidate = transformCollider(
+          sourceCollider,
+          result.scale,
+          result.tx,
+          result.ty
+        );
+        const check = candidate ? validateCollider(candidate) : { valid: false };
+        if (check.valid) {
+          transformedCollider = candidate;
+          warning = `${baseMessage} Collider transformed to match.`;
         } else {
-          const candidate = transformCollider(
-            sourceCollider,
-            result.scale,
-            result.tx,
-            result.ty
-          );
-          const check = candidate ? validateCollider(candidate) : { valid: false };
-          if (check.valid) {
-            transformedCollider = candidate;
-            warning = `${baseMessage} Collider transformed to match.`;
-          } else {
-            warning = `${baseMessage} Collider transform failed validation; left unchanged.`;
-          }
+          warning = `${baseMessage} Collider transform failed validation; left unchanged.`;
         }
+      }
+
+      // Note family propagation in the warning. The actual count of
+      // affected siblings is reported in the toast on Accept since the
+      // parent owns the items list, not this modal.
+      if (item.variants?.length > 0 || isChild) {
+        warning = `${warning} Same transform will apply to all family members on Accept.`;
       }
 
       onPendingUploadChange({
@@ -208,6 +225,11 @@ export default function DetailModal({
         warning,
         error: null,
         collider: transformedCollider,
+        scale: result.scale,
+        tx: result.tx,
+        ty: result.ty,
+        viewBoxWidth: result.viewBoxWidth,
+        viewBoxHeight: result.viewBoxHeight,
       });
     } catch (e) {
       onPendingUploadChange({
@@ -440,20 +462,29 @@ export default function DetailModal({
               width: 180,
               height: 180,
               margin: "0 auto",
-              // Dashed outline marks the 64×64 viewBox edge so reviewers
-              // can spot content that doesn't fill the canvas (an outlier
-              // the rescale-to-fit didn't catch).
-              outline: "1px dashed var(--color-border-tertiary)",
             }}
           >
             <div
+              className="svg-preview-host"
               dangerouslySetInnerHTML={{ __html: item.svg }}
               style={{ width: "100%", height: "100%" }}
             />
+            {/* Dashed overlay traces the actual viewBox edges. Uses an
+                inline SVG with the same viewBox + preserveAspectRatio as
+                the underlying SVG so it lands exactly on the viewBox
+                regardless of aspect ratio (e.g. a 64×15 viewBox renders
+                as a wide-and-short outline, not a square misframe). */}
+            <ViewBoxOutline svgMarkup={item.svg} />
             {editingCollider && editVertices ? (
               <ColliderEditor vertices={editVertices} onChange={setEditVertices} />
             ) : (
-              showCollider && <ColliderPreview collider={previewCollider} />
+              showCollider && (
+                <ColliderPreview
+                  collider={previewCollider}
+                  viewBoxWidth={itemVbW}
+                  viewBoxHeight={itemVbH}
+                />
+              )
             )}
           </div>
         </div>
@@ -875,14 +906,20 @@ export default function DetailModal({
                   }}
                 >
                   <div
-                    dangerouslySetInnerHTML={{ __html: pendingUpload.svg }}
                     style={{
+                      position: "relative",
                       width: 180,
                       height: 180,
                       margin: "0 auto",
-                      outline: "1px dashed var(--color-border-tertiary)",
                     }}
-                  />
+                  >
+                    <div
+                      className="svg-preview-host"
+                      dangerouslySetInnerHTML={{ __html: pendingUpload.svg }}
+                      style={{ width: "100%", height: "100%" }}
+                    />
+                    <ViewBoxOutline svgMarkup={pendingUpload.svg} />
+                  </div>
                 </div>
                 {/* Catch viewBox mismatches BEFORE the user accepts the
                     upload. The accept path writes svg_content straight
@@ -1140,5 +1177,40 @@ export default function DetailModal({
         </div>
       </div>
     </div>
+  );
+}
+
+// Dashed overlay that traces the SVG's actual viewBox edges. Renders an
+// inline SVG with the same viewBox + preserveAspectRatio as the underlying
+// SVG so the outline lands exactly on the viewBox no matter the aspect
+// ratio. vector-effect="non-scaling-stroke" keeps the stroke at 1 device
+// pixel regardless of the viewBox-to-pixel zoom.
+function ViewBoxOutline({ svgMarkup }) {
+  const vb = parseViewBox(svgMarkup);
+  if (!vb) return null;
+  return (
+    <svg
+      viewBox={`${vb.x} ${vb.y} ${vb.width} ${vb.height}`}
+      preserveAspectRatio="xMidYMid meet"
+      style={{
+        position: "absolute",
+        inset: 0,
+        width: "100%",
+        height: "100%",
+        pointerEvents: "none",
+      }}
+    >
+      <rect
+        x={vb.x}
+        y={vb.y}
+        width={vb.width}
+        height={vb.height}
+        fill="none"
+        stroke="var(--color-border-tertiary)"
+        strokeWidth="1"
+        strokeDasharray="2 2"
+        vectorEffect="non-scaling-stroke"
+      />
+    </svg>
   );
 }

@@ -4,19 +4,27 @@ import { VIEWBOX_SIZE } from "../lib/colliderSchema.js";
 // Positioned absolutely over the parent container, which should be the
 // same size as the SVG preview area in DetailModal.
 //
-// The overlay uses the same 64×64 viewBox as the icons so the collider
-// coordinates map 1:1 to the SVG content beneath.
+// The overlay's viewBox matches the underlying SVG's viewBox so collider
+// coordinates land exactly on the SVG content beneath. With non-square
+// viewBoxes (e.g. 35×64 for a tall balloon after rescale), defaulting to
+// 64×64 here would render the collider in a stretched coord space and
+// it'd appear smaller and offset relative to the SVG.
 
 const STROKE_COLOR = "#3B82F6"; // blue-500
 const FILL_COLOR = "rgba(59, 130, 246, 0.15)";
 const VERTEX_RADIUS = 1.5;
 
-export default function ColliderPreview({ collider }) {
+export default function ColliderPreview({
+  collider,
+  viewBoxWidth = VIEWBOX_SIZE,
+  viewBoxHeight = VIEWBOX_SIZE,
+}) {
   if (!collider) return null;
 
   return (
     <svg
-      viewBox={`0 0 ${VIEWBOX_SIZE} ${VIEWBOX_SIZE}`}
+      viewBox={`0 0 ${viewBoxWidth} ${viewBoxHeight}`}
+      preserveAspectRatio="xMidYMid meet"
       style={{
         position: "absolute",
         inset: 0,

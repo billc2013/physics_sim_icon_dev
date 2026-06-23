@@ -72,6 +72,120 @@ export function generateCollider(svgMarkup) {
   };
 }
 
+/**
+ * Compute a collider of a caller-specified type from SVG markup. Unlike
+ * generateCollider (which auto-detects), this trusts the caller's chosen
+ * type and produces deterministic geometry fit to the content.
+ *
+ * Use when the LLM provides a collider TYPE intent (circle/box/convex)
+ * but you want code-controlled geometry — LLM coordinate precision is not
+ * reliable for physics-grade alignment.
+ *
+ * Types:
+ *   "circle" — centroid + max-distance bounding circle of the convex hull
+ *   "box"    — axis-aligned bounding rect of the convex hull
+ *   "convex" — convex hull simplified to ≤ MAX_CONVEX_VERTICES
+ * Anything else falls back to "convex".
+ *
+ * Returns { collider, debug } in the same shape as generateCollider.
+ */
+export function computeColliderForType(svgMarkup, type) {
+  const points = extractFilledVertices(svgMarkup);
+
+  if (points.length < 3) {
+    return {
+      collider: {
+        type: "box",
+        center: [VIEWBOX_SIZE / 2, VIEWBOX_SIZE / 2],
+        width: VIEWBOX_SIZE,
+        height: VIEWBOX_SIZE,
+      },
+      debug: {
+        extractedPoints: points.length,
+        strategy: "fallback-full-box",
+        requestedType: type,
+      },
+    };
+  }
+
+  const hull = convexHull(points);
+
+  switch (type) {
+    case "circle": {
+      // Centroid + max-distance bounding circle. Strictly contains every
+      // hull vertex — slightly larger than Welzl's smallest-enclosing, but
+      // simpler and safer for physics (collider always covers content).
+      let cx = 0;
+      let cy = 0;
+      for (const [x, y] of hull) {
+        cx += x;
+        cy += y;
+      }
+      cx /= hull.length;
+      cy /= hull.length;
+      let maxR = 0;
+      for (const [x, y] of hull) {
+        const d = Math.hypot(x - cx, y - cy);
+        if (d > maxR) maxR = d;
+      }
+      return {
+        collider: {
+          type: "circle",
+          center: [round2(cx), round2(cy)],
+          radius: round2(maxR),
+        },
+        debug: {
+          extractedPoints: points.length,
+          hullPoints: hull.length,
+          strategy: "type-circle",
+        },
+      };
+    }
+    case "box": {
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      for (const [x, y] of hull) {
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+      }
+      return {
+        collider: {
+          type: "box",
+          center: [round2((minX + maxX) / 2), round2((minY + maxY) / 2)],
+          width: round2(maxX - minX),
+          height: round2(maxY - minY),
+        },
+        debug: {
+          extractedPoints: points.length,
+          hullPoints: hull.length,
+          strategy: "type-box",
+        },
+      };
+    }
+    case "convex":
+    default: {
+      const simplified = simplifyPolygon(hull, MAX_CONVEX_VERTICES);
+      return {
+        collider: {
+          type: "convex",
+          vertices: simplified.map(([x, y]) => [round2(x), round2(y)]),
+        },
+        debug: {
+          extractedPoints: points.length,
+          hullPoints: hull.length,
+          simplifiedTo: simplified.length,
+          strategy: "type-convex",
+          requestedType: type,
+        },
+      };
+    }
+  }
+}
+
 // ---- SVG Parsing ----
 
 /**

@@ -11,7 +11,15 @@
 // GeometryInfo.jsx.
 
 import { VIEWBOX_SIZE } from "./colliderSchema.js";
-import { extractFilledVertices } from "./colliderGenerator.js";
+import {
+  computeColliderForType,
+  extractFilledVertices,
+} from "./colliderGenerator.js";
+
+// LLM collider type contract: the system prompt instructs Claude to pick
+// from this set. Anything else (e.g. "compound", a typo, undefined) falls
+// back to "convex" inside normalizeForInsert.
+const ALLOWED_LLM_TYPES = ["circle", "box", "convex"];
 
 /**
  * Parse the viewBox from SVG markup. Falls back to the width/height
@@ -55,7 +63,10 @@ export function parseViewBox(svgMarkup) {
 }
 
 /**
- * Check whether the SVG's viewBox matches our expected 64×64 standard.
+ * Check whether the SVG's viewBox matches our convention: origin at (0, 0)
+ * with the longer dimension equal to VIEWBOX_SIZE (64). The shorter
+ * dimension may be smaller — that's how Rescale produces a tight viewBox
+ * for non-square content (e.g. a horizontal arrow becomes 64×15).
  *
  * Returns:
  *   { ok: true, viewBox }                              — good
@@ -73,12 +84,21 @@ export function checkViewBoxMatch(svgMarkup) {
       message: "No viewBox or width/height found. GIST can't know the scale.",
     };
   }
-  if (vb.width !== VIEWBOX_SIZE || vb.height !== VIEWBOX_SIZE) {
+  if (vb.width <= 0 || vb.height <= 0) {
     return {
       ok: false,
       reason: "size-mismatch",
       viewBox: vb,
-      message: `viewBox is ${vb.width}×${vb.height}, expected ${VIEWBOX_SIZE}×${VIEWBOX_SIZE}. Collider coords won't align.`,
+      message: `viewBox dimensions must be positive (got ${vb.width}×${vb.height}).`,
+    };
+  }
+  const maxDim = Math.max(vb.width, vb.height);
+  if (Math.abs(maxDim - VIEWBOX_SIZE) > 0.5) {
+    return {
+      ok: false,
+      reason: "size-mismatch",
+      viewBox: vb,
+      message: `viewBox is ${vb.width}×${vb.height}; longer side should equal ${VIEWBOX_SIZE}. Use "Rescale to fit" to normalize.`,
     };
   }
   if (vb.x !== 0 || vb.y !== 0) {
@@ -213,23 +233,140 @@ const NON_RENDERING_TAGS = new Set([
 ]);
 
 /**
- * Scale and recenter the SVG's content so its rendered bounding box fills
- * the canonical 64×64 viewBox while preserving aspect ratio. Content is
- * wrapped in a single <g transform="translate(...) scale(...)"> and the
- * viewBox/width/height are normalized to 64.
+ * Apply a translate-and-scale transform to an SVG by wrapping its
+ * renderable children in a single <g transform="translate(tx ty) scale(s)">.
+ * Also sets viewBox to (0, 0, viewBoxWidth, viewBoxHeight) and removes
+ * width/height (GIST and the in-app preview both rely on viewBox alone).
  *
- * Why getBBox() and not vertex extraction: getBBox returns the true
- * rendered bbox including stroke widths, text glyphs, and the effect of
- * any pre-existing transforms on child elements. Vertex extraction
- * (extractFilledVertices) only sees path/shape geometry and would
- * mis-fit anything with strokes or text.
+ * Used both as the second half of rescaleToFitViewBox AND directly to
+ * propagate a computed transform onto sibling/parent SVGs in a family
+ * rescale, so all family members end up with the same transform applied
+ * AND the same target viewBox.
  *
- * Implementation note: getBBox() requires the element to be attached to
- * a Document, so we mount into a hidden host on document.body and tear
- * down before returning. Throws if called outside a browser environment.
+ * Pure function — no DOM mounting required.
  *
- * Returns `{ svg: newMarkup, scale, tx, ty }` on success, or null if the
- * SVG had no measurable content.
+ * Returns the new SVG markup, or null if parsing failed or there were no
+ * renderable children to transform.
+ */
+export function applyTransformToSvg(
+  svgMarkup,
+  scale,
+  tx,
+  ty,
+  viewBoxWidth,
+  viewBoxHeight
+) {
+  if (!svgMarkup) return null;
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(svgMarkup, "image/svg+xml");
+  const svg = doc.querySelector("svg");
+  if (!svg) return null;
+
+  // Before adding our wrap, collapse any pre-existing chain of
+  // single-renderable-child <g transform> wrappers into a single <g>.
+  // Older rescale code (before getCTM-aware bbox) added a wrapper on
+  // every click, leaving SVGs with three+ nested groups whose composed
+  // scale drifted past 1 due to floating-point error — content then
+  // rendered slightly outside viewBox. Flattening here keeps markup
+  // clean and prevents future drift.
+  collapseTransformChain(svg);
+
+  const renderable = [];
+  for (const child of Array.from(svg.children)) {
+    if (!NON_RENDERING_TAGS.has(child.tagName)) renderable.push(child);
+  }
+  if (renderable.length === 0) return null;
+
+  const round = (n) => Number(n.toFixed(4));
+
+  // Skip wrapping when the transform is essentially identity. Avoids
+  // accumulating no-op <g> wrappers across repeated rescales. We still
+  // update viewBox/width/height because identity-transform doesn't imply
+  // identity-viewBox (e.g. content already at origin but viewBox larger
+  // than content needs to be tightened).
+  const isIdentity =
+    Math.abs(scale - 1) < 0.005 && Math.abs(tx) < 0.5 && Math.abs(ty) < 0.5;
+
+  if (!isIdentity) {
+    const transform = `translate(${round(tx)} ${round(ty)}) scale(${round(scale)})`;
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    const g = doc.createElementNS(SVG_NS, "g");
+    g.setAttribute("transform", transform);
+    for (const el of renderable) {
+      svg.removeChild(el);
+      g.appendChild(el);
+    }
+    svg.appendChild(g);
+  }
+
+  svg.setAttribute(
+    "viewBox",
+    `0 0 ${round(viewBoxWidth)} ${round(viewBoxHeight)}`
+  );
+  svg.removeAttribute("width");
+  svg.removeAttribute("height");
+
+  return new XMLSerializer().serializeToString(svg);
+}
+
+// If the SVG's renderable content is a chain of <g transform> wrappers
+// where each <g> has exactly one renderable child that is itself a
+// <g transform>, replace the chain with a single <g transform="..."> whose
+// transform attribute is the chain joined together. We don't compose into
+// a matrix because the browser will compose at render time anyway, and
+// keeping the original transforms preserves debuggability.
+function collapseTransformChain(svg) {
+  const directRenderable = Array.from(svg.children).filter(
+    (c) => !NON_RENDERING_TAGS.has(c.tagName)
+  );
+  if (directRenderable.length !== 1) return;
+  const top = directRenderable[0];
+  if (top.tagName !== "g" || !top.hasAttribute("transform")) return;
+
+  const transforms = [top.getAttribute("transform")];
+  let current = top;
+  while (true) {
+    const childRenderable = Array.from(current.children).filter(
+      (c) => !NON_RENDERING_TAGS.has(c.tagName)
+    );
+    if (childRenderable.length !== 1) break;
+    const child = childRenderable[0];
+    if (child.tagName !== "g" || !child.hasAttribute("transform")) break;
+    transforms.push(child.getAttribute("transform"));
+    current = child;
+  }
+  if (transforms.length < 2) return;
+
+  // current is the innermost wrap. Move its children up to top and replace
+  // top's transform with the joined chain.
+  const innerChildren = Array.from(current.children);
+  // Remove top from svg, build a fresh single <g> with composed transform,
+  // append inner children to it, place back under svg.
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  const replacement = svg.ownerDocument.createElementNS(SVG_NS, "g");
+  replacement.setAttribute("transform", transforms.join(" "));
+  for (const el of innerChildren) {
+    current.removeChild(el);
+    replacement.appendChild(el);
+  }
+  svg.removeChild(top);
+  svg.appendChild(replacement);
+}
+
+/**
+ * Scale the SVG so its longer content dimension fits the canonical
+ * VIEWBOX_SIZE target (64), and collapse the viewBox to hug the content
+ * tightly on the shorter axis. A horizontal arrow with content 80×20
+ * becomes a 64×16 viewBox with content filling it; a vertical arrow with
+ * content 20×80 becomes 16×64; a square shape stays 64×64.
+ *
+ * Bbox measurement combines getBBox() (local bbox ignoring own transform)
+ * with getCTM() (matrix from local to viewport coords). Critical for
+ * repeated rescales — an already-fit SVG measures correctly and produces
+ * scale=1, no-op.
+ *
+ * Returns `{ svg, scale, tx, ty, viewBoxWidth, viewBoxHeight }` on
+ * success, or null if the SVG had no measurable content.
  */
 export function rescaleToFitViewBox(svgMarkup) {
   if (typeof document === "undefined") {
@@ -258,20 +395,33 @@ export function rescaleToFitViewBox(svgMarkup) {
     let maxX = -Infinity;
     let maxY = -Infinity;
     for (const el of renderable) {
-      let b = null;
+      let local = null;
       try {
-        b = el.getBBox();
+        local = el.getBBox();
       } catch {
         continue;
       }
-      if (!b) continue;
-      // Skip degenerate boxes (e.g. an empty <g>). 0×0 carries no info but
-      // its x/y would distort the union toward (0,0).
-      if (b.width === 0 && b.height === 0) continue;
-      if (b.x < minX) minX = b.x;
-      if (b.y < minY) minY = b.y;
-      if (b.x + b.width > maxX) maxX = b.x + b.width;
-      if (b.y + b.height > maxY) maxY = b.y + b.height;
+      if (!local) continue;
+      if (local.width === 0 && local.height === 0) continue;
+
+      // Map the local bbox corners through the element's CTM to get the
+      // bbox in viewport coords. CTM may be null for elements that
+      // aren't yet rendered; fall back to local coords in that case.
+      const ctm = el.getCTM();
+      const corners = [
+        [local.x, local.y],
+        [local.x + local.width, local.y],
+        [local.x + local.width, local.y + local.height],
+        [local.x, local.y + local.height],
+      ];
+      for (const [lx, ly] of corners) {
+        const vx = ctm ? ctm.a * lx + ctm.c * ly + ctm.e : lx;
+        const vy = ctm ? ctm.b * lx + ctm.d * ly + ctm.f : ly;
+        if (vx < minX) minX = vx;
+        if (vy < minY) minY = vy;
+        if (vx > maxX) maxX = vx;
+        if (vy > maxY) maxY = vy;
+      }
     }
     if (!Number.isFinite(minX)) return null;
 
@@ -280,33 +430,115 @@ export function rescaleToFitViewBox(svgMarkup) {
     if (w <= 0 || h <= 0) return null;
 
     const scale = Math.min(VIEWBOX_SIZE / w, VIEWBOX_SIZE / h);
-    const tx = VIEWBOX_SIZE / 2 - (minX + w / 2) * scale;
-    const ty = VIEWBOX_SIZE / 2 - (minY + h / 2) * scale;
+    // Translate so content's top-left lands at (0, 0) in the new tight
+    // viewBox. The new viewBox is then (content_w * scale, content_h *
+    // scale): one dim hits VIEWBOX_SIZE, the other shrinks to fit.
+    const tx = -minX * scale;
+    const ty = -minY * scale;
+    const viewBoxWidth = w * scale;
+    const viewBoxHeight = h * scale;
 
     const round = (n) => Number(n.toFixed(4));
-    const transform = `translate(${round(tx)} ${round(ty)}) scale(${round(scale)})`;
-
-    // Wrap renderable children in a single transform group. defs/style
-    // and friends remain in place as direct children of <svg>.
-    const SVG_NS = "http://www.w3.org/2000/svg";
-    const g = document.createElementNS(SVG_NS, "g");
-    g.setAttribute("transform", transform);
-    for (const el of renderable) {
-      svg.removeChild(el);
-      g.appendChild(el);
-    }
-    svg.appendChild(g);
-    svg.setAttribute("viewBox", `0 0 ${VIEWBOX_SIZE} ${VIEWBOX_SIZE}`);
-    // Drop any pre-existing width/height. They'd render the SVG at fixed
-    // pixel size regardless of container (e.g. width="64" in a 180-px
-    // preview makes the drawing look tiny), and downstream consumers
-    // (GIST, the export zip) read viewBox, not width/height.
-    svg.removeAttribute("width");
-    svg.removeAttribute("height");
-
-    const newMarkup = new XMLSerializer().serializeToString(svg);
-    return { svg: newMarkup, scale: round(scale), tx: round(tx), ty: round(ty) };
+    const newSvg = applyTransformToSvg(
+      svgMarkup,
+      scale,
+      tx,
+      ty,
+      viewBoxWidth,
+      viewBoxHeight
+    );
+    if (!newSvg) return null;
+    return {
+      svg: newSvg,
+      scale: round(scale),
+      tx: round(tx),
+      ty: round(ty),
+      viewBoxWidth: round(viewBoxWidth),
+      viewBoxHeight: round(viewBoxHeight),
+    };
   } finally {
     document.body.removeChild(host);
   }
+}
+
+/**
+ * Normalize an LLM-generated SVG for insert: rescale to a tight *×64 or
+ * 64×* viewBox, then compute a collider whose TYPE matches the LLM's
+ * intent but whose geometry is deterministic. This is the "happy medium"
+ * pipeline — LLM picks the physics-shape intent, code computes vertices.
+ *
+ * The "longer axis = VIEWBOX_SIZE" invariant required by GIST is enforced
+ * here. rescaleToFitViewBox produces it by construction (scale =
+ * min(64/w, 64/h)), but we re-check after the fact so a future bug in
+ * rescale can't silently ship a non-conforming icon.
+ *
+ * `llmType` may be "circle" | "box" | "convex"; anything else (including
+ * undefined or "compound") is coerced to "convex".
+ *
+ * Returns `{ svg, collider, debug }` on success — svg is normalized
+ * markup, collider is in the new viewBox coord space, debug carries the
+ * rescale params and which type was chosen for diagnostics.
+ * Returns null if the SVG has no measurable content.
+ */
+export function normalizeForInsert(svgMarkup, llmType) {
+  const rescaled = rescaleToFitViewBox(svgMarkup);
+  if (!rescaled) return null;
+
+  const maxDim = Math.max(rescaled.viewBoxWidth, rescaled.viewBoxHeight);
+  if (Math.abs(maxDim - VIEWBOX_SIZE) > 0.5) {
+    throw new Error(
+      `normalizeForInsert: rescaled viewBox ${rescaled.viewBoxWidth}×${rescaled.viewBoxHeight} ` +
+        `violates longer-axis=${VIEWBOX_SIZE} invariant.`
+    );
+  }
+
+  const safeType = ALLOWED_LLM_TYPES.includes(llmType) ? llmType : "convex";
+  const { collider, debug } = computeColliderForType(rescaled.svg, safeType);
+
+  return {
+    svg: rescaled.svg,
+    collider,
+    debug: {
+      ...debug,
+      llmType: llmType ?? null,
+      typeUsed: safeType,
+      rescale: {
+        scale: rescaled.scale,
+        tx: rescaled.tx,
+        ty: rescaled.ty,
+      },
+      viewBox: {
+        width: rescaled.viewBoxWidth,
+        height: rescaled.viewBoxHeight,
+      },
+    },
+  };
+}
+
+/**
+ * SVG-only normalize for Flow D (color variants): rescale to tight
+ * *×64 or 64×* viewBox; no collider computation since variants inherit
+ * from the parent.
+ *
+ * Returns `{ svg, viewBox }` or null if no measurable content.
+ */
+export function normalizeSvgOnly(svgMarkup) {
+  const rescaled = rescaleToFitViewBox(svgMarkup);
+  if (!rescaled) return null;
+
+  const maxDim = Math.max(rescaled.viewBoxWidth, rescaled.viewBoxHeight);
+  if (Math.abs(maxDim - VIEWBOX_SIZE) > 0.5) {
+    throw new Error(
+      `normalizeSvgOnly: rescaled viewBox ${rescaled.viewBoxWidth}×${rescaled.viewBoxHeight} ` +
+        `violates longer-axis=${VIEWBOX_SIZE} invariant.`
+    );
+  }
+
+  return {
+    svg: rescaled.svg,
+    viewBox: {
+      width: rescaled.viewBoxWidth,
+      height: rescaled.viewBoxHeight,
+    },
+  };
 }

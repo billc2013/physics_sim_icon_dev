@@ -7,13 +7,10 @@
     "People: modeled after traffic sign pictograms, no faces or details"
   ],
   "colliderRules": [
-    "Also return a physics collider for the object in the same 64x64 coordinate space",
-    "Collider types: \"circle\" (center + radius), \"box\" (center + width + height), or \"convex\" (vertex array, max 8 vertices, convex polygon only)",
-    "Circle: {\"type\":\"circle\",\"center\":[x,y],\"radius\":r}",
-    "Box: {\"type\":\"box\",\"center\":[x,y],\"width\":w,\"height\":h}",
-    "Convex: {\"type\":\"convex\",\"vertices\":[[x,y],...]} \u2014 max 8 vertices, must be convex",
-    "Pick the simplest collider that fits: circle for round objects, box for rectangular, convex polygon for irregular shapes",
-    "The collider should tightly approximate the visible silhouette, not the full 64x64 bounding box"
+    "Also return a physics collider INTENT for the object \u2014 just the type. The client computes precise geometry from your SVG.",
+    "Pick the simplest type that matches the object's physical shape: \"circle\" for round objects (balls, wheels, planets), \"box\" for rectangular objects (crates, books, slabs), or \"convex\" for everything else (irregular silhouettes, organic shapes).",
+    "Format: {\"type\":\"circle\"} or {\"type\":\"box\"} or {\"type\":\"convex\"}.",
+    "Coordinates, radius, width, height, and vertices are NOT required and will be IGNORED if provided. Do not waste tokens computing them \u2014 type is all that matters."
   ],
   "categories": [
     "vehicles", "projectiles", "blocks", "people", "connectors",

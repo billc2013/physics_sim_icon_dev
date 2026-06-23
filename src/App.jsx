@@ -7,6 +7,11 @@ import { useGeneration } from "./hooks/useGeneration.js";
 import { useGenerationQueue } from "./hooks/useGenerationQueue.js";
 import { generateCollider } from "./lib/colliderGenerator.js";
 import { validateCollider } from "./lib/colliderSchema.js";
+import {
+  applyTransformToSvg,
+  normalizeForInsert,
+  normalizeSvgOnly,
+} from "./lib/svgGeometry.js";
 import LoginPage from "./components/LoginPage.jsx";
 import Header from "./components/Header.jsx";
 import TabStrip from "./components/TabStrip.jsx";
@@ -225,12 +230,19 @@ function SignedInApp({ user, onSignOut }) {
     await newGeneration.generate({ objectName, colorTag, modelTier });
   };
   const handleNewAccept = async ({ name, displayName, svgContent, collider }) => {
+    // Happy-medium normalize: LLM picks the collider TYPE intent; code
+    // rescales the SVG to a tight *×64 or 64×* viewBox and computes
+    // collider geometry deterministically in that space. Falls back to
+    // raw insert (no collider) if the SVG has no measurable content.
+    const normalized = normalizeForInsert(svgContent, collider?.type);
+    const finalSvg = normalized?.svg ?? svgContent;
+    const finalCollider = normalized?.collider ?? null;
     try {
       await svgs.insertSvg({
         name,
         displayName,
-        svgContent,
-        physicalProperties: collider ? { collider } : null,
+        svgContent: finalSvg,
+        physicalProperties: finalCollider ? { collider: finalCollider } : null,
       });
       showToast(`Added "${displayName}"`);
     } catch (e) {
@@ -362,15 +374,52 @@ function SignedInApp({ user, onSignOut }) {
     showToast("Revision queued");
   };
 
-  // Manual SVG upload accept/discard. Goes through updateSvgContent so
-  // versioning and draft→revised promotion work identically to revisions.
-  // If the pending change also carries a transformed collider (rescale
-  // path), save it too — to the parent (or self) so the always-inherit
-  // rule for variants holds.
+  // Manual SVG upload OR rescale accept. Goes through updateSvgContent
+  // so versioning and draft→revised promotion work identically to
+  // revisions. If pendingUpload carries:
+  //   - a `collider`: also save it to parent (or self) via
+  //     updatePhysicalProperties (always-inherit rule for variants).
+  //   - `scale/tx/ty`: this is a rescale; propagate the same transform
+  //     to all family members' SVGs so a parent + variants stay in
+  //     lockstep visually.
   const handleAcceptUpload = async (id) => {
     if (!pendingUpload) return;
+    const isRescale = typeof pendingUpload.scale === "number";
+
     try {
+      // Resolve the family BEFORE the first await so we read the SVGs as
+      // they were when the user clicked Rescale. Subsequent optimistic
+      // updates would otherwise change member.svg under us.
+      let familyMembers = [];
+      if (isRescale && items) {
+        const sourceItem = items.find((i) => i.id === id);
+        const anchor = sourceItem?._parentUuid ?? sourceItem?._uuid;
+        if (anchor) {
+          familyMembers = items.filter(
+            (it) =>
+              (it._uuid === anchor || it._parentUuid === anchor) && it.id !== id
+          );
+        }
+      }
+
       await svgs.updateSvgContent(id, pendingUpload.svg);
+
+      let propagatedCount = 0;
+      for (const member of familyMembers) {
+        const memberNewSvg = applyTransformToSvg(
+          member.svg,
+          pendingUpload.scale,
+          pendingUpload.tx,
+          pendingUpload.ty,
+          pendingUpload.viewBoxWidth,
+          pendingUpload.viewBoxHeight
+        );
+        if (memberNewSvg) {
+          await svgs.updateSvgContent(member.id, memberNewSvg);
+          propagatedCount += 1;
+        }
+      }
+
       if (pendingUpload.collider) {
         const sourceItem = items?.find((i) => i.id === id);
         const colliderTarget = sourceItem?.parentId ?? id;
@@ -378,8 +427,20 @@ function SignedInApp({ user, onSignOut }) {
           collider: pendingUpload.collider,
         });
       }
+
       setPendingUpload(null);
-      showToast(pendingUpload.collider ? "Saved (SVG + collider)" : "Saved");
+
+      if (isRescale) {
+        const total = 1 + propagatedCount;
+        const colliderNote = pendingUpload.collider ? " + collider" : "";
+        showToast(
+          propagatedCount > 0
+            ? `Rescaled ${total} family items${colliderNote}`
+            : `Rescaled${colliderNote}`
+        );
+      } else {
+        showToast(pendingUpload.collider ? "Saved (SVG + collider)" : "Saved");
+      }
     } catch (e) {
       showToast(`Error: ${e.message ?? e}`);
     }
@@ -413,15 +474,21 @@ function SignedInApp({ user, onSignOut }) {
   // ---------- Queue accept handlers (called from QueuePanel) ----------
 
   const handleQueueAcceptRevise = async (job) => {
+    // Normalize: rescale the LLM-revised SVG to a tight viewBox and
+    // recompute collider geometry from the LLM's type intent. Falls back
+    // to the raw LLM output if normalize has no measurable content.
+    const normalized = normalizeForInsert(job.result.svg, job.result.collider?.type);
+    const finalSvg = normalized?.svg ?? job.result.svg;
+    const finalCollider = normalized?.collider ?? job.result.collider ?? null;
     try {
-      await svgs.updateSvgContent(job.request.itemId, job.result.svg);
-      if (job.result.collider) {
+      await svgs.updateSvgContent(job.request.itemId, finalSvg);
+      if (finalCollider) {
         // Save collider to the parent (or self if no parent). This
         // ensures all color variants inherit the updated collider.
         const item = items?.find((i) => i.id === job.request.itemId);
         const colliderTarget = item?.parentId ?? job.request.itemId;
         await svgs.updatePhysicalProperties(colliderTarget, {
-          collider: job.result.collider,
+          collider: finalCollider,
         });
       }
       queue.discardJob(job.id);
@@ -434,11 +501,17 @@ function SignedInApp({ user, onSignOut }) {
   const handleQueueAcceptBatch = async (job, selectedItems) => {
     try {
       for (const item of selectedItems) {
+        // Per-item normalize: rescale + collider from LLM type. Failures
+        // (no measurable content) fall back to raw insert so a single bad
+        // item doesn't sink the whole batch.
+        const normalized = normalizeForInsert(item.svg, item.collider?.type);
+        const finalSvg = normalized?.svg ?? item.svg;
+        const finalCollider = normalized?.collider ?? null;
         await svgs.insertSvg({
           name: item.name,
           displayName: item.name.replace(/_/g, " "),
-          svgContent: item.svg,
-          physicalProperties: item.collider ? { collider: item.collider } : null,
+          svgContent: finalSvg,
+          physicalProperties: finalCollider ? { collider: finalCollider } : null,
         });
       }
       queue.discardJob(job.id);
@@ -455,10 +528,15 @@ function SignedInApp({ user, onSignOut }) {
       const sourceItem = items?.find((i) => i._uuid === job.request.svgId);
       const parentUuid = sourceItem?._parentUuid || job.request.svgId;
       for (const item of selectedItems) {
+        // Variants inherit the parent's collider, so we only rescale the
+        // SVG here — no collider geometry computed. Falls back to raw
+        // insert if normalize can't measure content.
+        const normalized = normalizeSvgOnly(item.svg);
+        const finalSvg = normalized?.svg ?? item.svg;
         await svgs.insertSvg({
           name: item.name,
           displayName: item.name.replace(/_/g, " "),
-          svgContent: item.svg,
+          svgContent: finalSvg,
           colorTag: item.color,
           parentUuid,
         });

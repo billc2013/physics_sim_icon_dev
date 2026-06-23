@@ -83,3 +83,15 @@ textarea:focus {
   outline: none;
   border-color: var(--color-border-secondary);
 }
+
+/* Inline SVGs injected via dangerouslySetInnerHTML have no inline style,
+ * and browsers without explicit width/height on the SVG element fall back
+ * to intrinsic sizing rules that vary by CSS context (sometimes a fixed
+ * 300x150, sometimes viewBox-aspect-extended past the parent). Force
+ * fill+aspect-fit on hosts marked for SVG preview, so they render at the
+ * same dimensions as our outline/collider overlays in the same parent. */
+.svg-preview-host > svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}

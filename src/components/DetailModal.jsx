@@ -77,10 +77,59 @@ export default function DetailModal({
   onDiscardUpload,
   onUpdatePhysicalProperties,
   onDuplicate,
+  onRename,
+  onTrash,
+  existingNames,
 }) {
   const textareaRef = useRef(null);
   const fileInputRef = useRef(null);
   const isIdeaOnly = item.status === "idea_only";
+
+  // Inline rename. The SLUG (name/item.id) is the primary field — it's the
+  // semantic handle the downstream LLM uses and what frees the name for reuse.
+  // The display label auto-follows the slug (underscores -> spaces), matching
+  // how insertSvg derives display names everywhere else, UNLESS the user edits
+  // the label directly (labelDirty). Slug is normalized to snake_case as you
+  // type; collision is checked live against active names (excluding self).
+  const [renaming, setRenaming] = useState(false);
+  const [renameLabel, setRenameLabel] = useState(item.label);
+  const [renameSlug, setRenameSlug] = useState(item.id);
+  const [labelDirty, setLabelDirty] = useState(false);
+  const [renameBusy, setRenameBusy] = useState(false);
+  const normalizeSlug = (v) =>
+    v.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  const deslugify = (v) => v.replace(/_/g, " ");
+  const handleSlugChange = (e) => {
+    const slug = normalizeSlug(e.target.value);
+    setRenameSlug(slug);
+    if (!labelDirty) setRenameLabel(deslugify(slug));
+  };
+  const handleLabelChange = (e) => {
+    setLabelDirty(true);
+    setRenameLabel(e.target.value);
+  };
+  const slugChanged = renameSlug !== item.id;
+  const slugCollides =
+    slugChanged && !!existingNames && existingNames.has(renameSlug);
+  const canSaveRename = renameSlug.trim().length > 0 && !slugCollides && !renameBusy;
+  const startRename = () => {
+    setRenameLabel(item.label);
+    setRenameSlug(item.id);
+    setLabelDirty(false);
+    setRenaming(true);
+  };
+  const saveRename = async () => {
+    if (!canSaveRename) return;
+    setRenameBusy(true);
+    try {
+      await onRename?.(item.id, { name: renameSlug.trim(), displayName: renameLabel.trim() });
+      setRenaming(false);
+    } catch {
+      // Error toast is surfaced by the App handler; keep the form open to retry.
+    } finally {
+      setRenameBusy(false);
+    }
+  };
 
   // Multi-color selection for "Generate in all colors". Resets per-item
   // because App.jsx renders DetailModal with key={modalItem.id}, so React
@@ -424,27 +473,93 @@ export default function DetailModal({
             marginBottom: 16,
           }}
         >
-          <div
-            style={{
-              fontSize: 16,
-              fontWeight: 500,
-              color: "var(--color-text-primary)",
-              textTransform: "capitalize",
-            }}
-          >
-            {item.label}
+          {renaming ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, flex: 1, marginRight: 12 }}>
+              <label style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>
+                Name (slug) — used by the GIST LLM
+              </label>
+              <input
+                type="text"
+                value={renameSlug}
+                onChange={handleSlugChange}
+                placeholder="object_name"
+                autoFocus
+                style={{ fontSize: 14, padding: "4px 8px", fontFamily: "monospace" }}
+              />
+              {slugCollides && (
+                <div style={{ fontSize: 11, color: "var(--color-danger, #B91C1C)" }}>
+                  "{renameSlug}" is already used by an active object — pick another.
+                </div>
+              )}
+              <label style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>
+                Display label
+              </label>
+              <input
+                type="text"
+                value={renameLabel}
+                onChange={handleLabelChange}
+                placeholder="Display label"
+                style={{ fontSize: 13, padding: "4px 8px" }}
+              />
+              <div style={{ display: "flex", gap: 6 }}>
+                <button onClick={saveRename} disabled={!canSaveRename} style={{ fontSize: 12 }}>
+                  {renameBusy ? "Saving…" : "Save"}
+                </button>
+                <button onClick={() => setRenaming(false)} style={{ fontSize: 12 }}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div style={{ display: "flex", alignItems: "baseline", gap: 8, minWidth: 0 }}>
+              <div
+                style={{
+                  fontSize: 16,
+                  fontWeight: 500,
+                  color: "var(--color-text-primary)",
+                  textTransform: "capitalize",
+                }}
+              >
+                {item.label}
+              </div>
+              <button
+                onClick={startRename}
+                style={{
+                  fontSize: 11,
+                  padding: "1px 6px",
+                  color: "var(--color-text-secondary)",
+                }}
+              >
+                Rename
+              </button>
+            </div>
+          )}
+          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            {!renaming && (
+              <button
+                onClick={() => onTrash?.(item)}
+                title="Move to trash"
+                style={{
+                  fontSize: 12,
+                  padding: "2px 8px",
+                  color: "var(--color-danger, #B91C1C)",
+                }}
+              >
+                Trash
+              </button>
+            )}
+            <button
+              onClick={onClose}
+              style={{
+                fontSize: 18,
+                lineHeight: 1,
+                padding: "2px 8px",
+                color: "var(--color-text-secondary)",
+              }}
+            >
+              &times;
+            </button>
           </div>
-          <button
-            onClick={onClose}
-            style={{
-              fontSize: 18,
-              lineHeight: 1,
-              padding: "2px 8px",
-              color: "var(--color-text-secondary)",
-            }}
-          >
-            &times;
-          </button>
         </div>
 
         <div

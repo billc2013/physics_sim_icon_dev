@@ -12,6 +12,8 @@ export default function Header({
   queueCounts,
   onShowSystemPrompt,
   onDownloadApproved,
+  trashCount,
+  onShowTrash,
 }) {
   const queueLabel = (() => {
     if (!queueCounts || !queueCounts.hasActivity) return null;
@@ -76,6 +78,11 @@ export default function Header({
         <button onClick={onDownloadApproved} style={{ fontSize: 13 }}>
           Download approved &#8599;
         </button>
+        {trashCount > 0 && (
+          <button onClick={onShowTrash} style={{ fontSize: 13 }}>
+            Trash ({trashCount})
+          </button>
+        )}
       </div>
     </div>
   );

@@ -844,3 +844,92 @@ left join public.project_members pm_exported on s.last_exported_by = pm_exported
 --   UPDATE public.physics_svgs SET parent_id = (SELECT id FROM public.physics_svgs WHERE name = 'bike')
 --     WHERE name IN ('blue_bike', 'red_bike', 'gray_bike')
 --     AND parent_id IS NULL;
+
+
+-- -------------------------
+-- 11d. Soft-delete ("trash can")
+-- -------------------------
+-- Adds a recoverable trash: trashing sets deleted_at instead of removing the
+-- row. The client splits rows into active (deleted_at is null) and trashed so
+-- a Trash panel can list, restore, or permanently delete them.
+--
+-- Filesystem semantics for names: trashing FREES the name immediately. The
+-- old global `unique (name)` constraint is replaced with a PARTIAL unique
+-- index that only applies to active rows, so:
+--   * only one ACTIVE row per name (DB-enforced),
+--   * any number of trashed rows may share a name with each other or with an
+--     active row (you culled "wheel" and made a new "wheel").
+-- On restore, if the name is already taken by an active row, the client makes
+-- the user pick a NEW name first (names are semantic input to the downstream
+-- GIST LLM, so we never auto-suffix to something like "wheel_old").
+--
+-- Idempotent: safe to re-run.
+
+alter table public.physics_svgs
+  add column if not exists deleted_at timestamptz null,
+  add column if not exists deleted_by uuid references auth.users(id) on delete set null;
+
+-- Swap the global unique(name) for an active-rows-only partial unique index.
+-- The auto-generated constraint name for `name text ... unique` is
+-- `physics_svgs_name_key`.
+alter table public.physics_svgs
+  drop constraint if exists physics_svgs_name_key;
+
+create unique index if not exists physics_svgs_name_active_key
+  on public.physics_svgs (name)
+  where deleted_at is null;
+
+-- Speeds up the active/trashed split and the Trash panel listing.
+create index if not exists idx_physics_svgs_deleted_at
+  on public.physics_svgs (deleted_at)
+  where deleted_at is not null;
+
+-- No RLS changes needed:
+--   * trash / restore are UPDATEs  -> covered by "Editors can update SVGs"
+--   * permanent delete is a DELETE -> covered by "Owners can delete SVGs"
+-- So editors can trash/restore, but only owners can permanently purge.
+
+-- Re-create the view to expose deleted_at / deleted_by / deleted_by_name.
+-- We deliberately do NOT filter trashed rows here; the client does the split.
+drop view if exists public.svgs_with_details;
+create view public.svgs_with_details
+with (security_invoker = true) as
+select
+  s.id,
+  s.name,
+  s.display_name,
+  s.svg_content,
+  s.status,
+  s.notes,
+  s.version,
+  s.last_exported_at,
+  s.last_exported_version,
+  s.last_exported_by,
+  s.physical_properties,
+  s.parent_id,
+  parent.name as parent_name,
+  s.deleted_at,
+  s.deleted_by,
+  s.created_at,
+  s.updated_at,
+  c.name       as category_name,
+  cp.name      as color_name,
+  cp.light_hex as color_light,
+  cp.mid_hex   as color_mid,
+  cp.dark_hex  as color_dark,
+  pm_created.display_name  as created_by_name,
+  pm_updated.display_name  as updated_by_name,
+  pm_exported.display_name as last_exported_by_name,
+  pm_deleted.display_name  as deleted_by_name,
+  (
+    select count(*)::int from public.svg_feedback f
+    where f.svg_id = s.id
+  ) as feedback_count
+from public.physics_svgs s
+left join public.svg_categories c    on s.category_id = c.id
+left join public.color_palettes cp   on s.color_id = cp.id
+left join public.physics_svgs parent on s.parent_id = parent.id
+left join public.project_members pm_created  on s.created_by       = pm_created.user_id
+left join public.project_members pm_updated  on s.updated_by       = pm_updated.user_id
+left join public.project_members pm_exported on s.last_exported_by = pm_exported.user_id
+left join public.project_members pm_deleted  on s.deleted_by       = pm_deleted.user_id;

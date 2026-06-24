@@ -91,7 +91,7 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
         "anthropic==0.91.0",  # bumped from 0.39.0: supports current models; works with httpx 0.28 (no proxies= bug)
-        "supabase==2.28.3",  # 2.9.1 regex-rejected non-JWT keys; 2.28.x accepts sb_secret_ format
+        "supabase==2.28.3",  # >=2.28 accepts the new sb_secret_ key format (2.9.1's regex rejected non-JWT keys). Prereq for the key migration; Modal secret still holds the legacy service_role JWT — swap pending, see Dev_Tasks.md task 11.
         "fastapi==0.115.0",
         "pydantic==2.11.7",  # bumped from 2.9.2: supabase 2.28.3 -> realtime requires pydantic>=2.11.7
     )

@@ -40,6 +40,7 @@ Done (off-task-list):
 
 - ✓ Collider system — schema, programmatic generator, interactive editor, LLM-generated colliders on Flows A/B/C
 - ✓ Parent-child parenting — `parent_id` FK, always-inherit physical_properties, color dots on parent cards, manifest uses effective props
+- ✓ Trash (soft delete) + rename — `deleted_at`/`deleted_by` columns, active-only partial unique index, TrashPanel restore/purge, DetailModal rename of slug + label (schema migration 11d). See [Trash and rename](#trash-soft-delete-and-rename)
 
 See [Dev_Tasks.md](Dev_Tasks.md) for the prioritized backlog and what each remaining task involves.
 
@@ -164,6 +165,8 @@ Do not violate these without explicit discussion:
 | `item.lastExportedVersion`     | `physics_svgs.last_exported_version`       | `version` value at time of last export. Displayed in the "Exported as v3" line; NOT used for the stale check. |
 | `item.lastExportedByName`      | joined `project_members.display_name` via `last_exported_by` | Who last exported this item |
 | `item.physicalProperties`      | `physics_svgs.physical_properties` (jsonb) | Own physical props (null for children). V1 shape: `{collider, mass_kg, length_m, width_m, notes}` |
+| `item.deletedAt` (string\|null) | `physics_svgs.deleted_at`                 | ISO timestamp if trashed, else null. Trashed items live in `trashedItems`, NOT `items`. |
+| `item.deletedByName` (string\|null) | joined `project_members.display_name` via `deleted_by` | Who trashed it |
 | `item.parentId` (string\|null) | joined `physics_svgs.name` via `parent_id`  | Parent's item.id (name), null if root/standalone |
 | `item._parentUuid` (string\|null) | `physics_svgs.parent_id`                | **Private**. Parent's UUID for write paths |
 | `item._uuid` (string)          | `physics_svgs.id`                          | **Private**. Only used for write paths and as `svg_id` in revisions. |
@@ -317,6 +320,22 @@ UPDATE physics_svgs SET parent_id = (SELECT id FROM physics_svgs WHERE name = '<
 WHERE name IN ('<color>_<parent>', ...) AND parent_id IS NULL;
 ```
 
+## Trash (soft delete) and rename
+
+Both features live in [useSvgs.js](src/hooks/useSvgs.js) (mutations), [DetailModal.jsx](src/components/DetailModal.jsx) (rename + trash buttons), [TrashPanel.jsx](src/components/TrashPanel.jsx), and the Header `Trash (N)` button. Schema is migration **11d** in [gist-supabase-schema.sql](gist-supabase-schema.sql) (run by Bill 2026-06-24).
+
+**Soft delete, not hard delete.** Trashing sets `physics_svgs.deleted_at`/`deleted_by` instead of removing the row. `useSvgs.refresh()` splits rows: active (`deleted_at is null`) go into `items`, trashed go into a separate `trashedItems` list. **Because trashed rows are excluded from `items`, every existing consumer — the grid, export scope, `existingNames` collision checks, `addVariantInfo` inheritance — automatically ignores them with no extra filtering.**
+
+**Names are unique among ACTIVE items only.** Migration 11d drops the global `unique (name)` constraint and replaces it with a partial unique index `physics_svgs_name_active_key on (name) where deleted_at is null`. Filesystem semantics: trashing frees the name instantly (you can immediately create a new `wheel`), multiple trashed rows may share a name, but only one active row per name (DB-enforced). Collision checks (creation, rename, restore) compare against active names only.
+
+**Restore with rename-on-collision.** Restore is keyed by `_uuid` (trashed names can collide, so `id` is not unique in the trash). If the original name is still free, it restores as-is; if an active item now holds that name, [TrashPanel.jsx](src/components/TrashPanel.jsx) makes the user type a NEW slug before restoring. **We never auto-suffix to something like `wheel_old`** — the `name`/slug is semantic input the downstream GIST LLM uses to pick objects per the teacher's prompt, so a junk slug degrades selection. See [[project_gist_pipeline]].
+
+**Cascade to variants.** Trash/restore/permanent-delete on a **parent** cascade to its color variants (children always inherit physical_properties, so they move as a set). `trashSvg` does it in one `.or("id.eq.X,parent_id.eq.X")` UPDATE; DetailModal confirms with the variant count first.
+
+**RLS permission split (no new policies needed):** trash/restore are UPDATEs → editors allowed; permanent delete is a DELETE → owners only (existing "Owners can delete SVGs" policy). On permanent delete, `svg_versions`/`svg_feedback` cascade and `generation_sessions.svg_id` nulls (audit preserved).
+
+**Rename changes BOTH the slug (`name`/`item.id`) and the display label (`display_name`).** In DetailModal the **slug is the primary, autofocused field**; the display label auto-follows it (underscores → spaces, matching how `insertSvg` derives display names) until the user edits the label directly. Because the slug IS `item.id` (the React key + the open modal's selector), `renameSvg` is DB-first and calls an `onRenamed(newId)` callback so App re-points `modalItemId` in the same render tick — never a frame where the modal's id matches no item. Renaming a parent doesn't break variant links (those are by UUID); children's `parentId` label is patched locally.
+
 ## Modal secrets and env vars (Bill-specific naming)
 
 These names diverged from the original plan in CLAUDE.md after Bill set them up. Use these:
@@ -327,6 +346,8 @@ These names diverged from the original plan in CLAUDE.md after Bill set them up.
 | `supabase_for_svg_gen`      | `SUPABASE_DATA_URL`, `SUPABASE_SERVICE_ROLE_KEY` |
 
 The function references both via `modal.Secret.from_name(...)` in [modal_functions/generate_svg.py](modal_functions/generate_svg.py).
+
+> **Key format note:** `SUPABASE_SERVICE_ROLE_KEY` currently holds the **legacy `service_role` JWT** (`eyJ…`), which Supabase has deprecated (legacy keys deleted late 2026). The browser side already uses the new `sb_publishable_…` format; the Modal server side has **not** migrated to `sb_secret_…` yet. The `supabase==2.28.3` pin is the prerequisite (it accepts non-JWT keys); the actual key swap is **Dev_Tasks.md task 11**. Don't assume the migration is done.
 
 ## Vercel env vars — important behavior
 

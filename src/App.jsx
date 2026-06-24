@@ -26,6 +26,7 @@ import ImportSvgModal from "./components/ImportSvgModal.jsx";
 import DuplicateSvgModal from "./components/DuplicateSvgModal.jsx";
 import DownloadApprovedModal from "./components/DownloadApprovedModal.jsx";
 import QueuePanel from "./components/QueuePanel.jsx";
+import TrashPanel from "./components/TrashPanel.jsx";
 import DataTransformPage from "./components/data/DataTransformPage.jsx";
 
 export default function App() {
@@ -78,6 +79,7 @@ function SignedInApp({ user, onSignOut }) {
   const [duplicateSource, setDuplicateSource] = useState(null);
   const [showDownloadApproved, setShowDownloadApproved] = useState(false);
   const [showQueue, setShowQueue] = useState(false);
+  const [showTrash, setShowTrash] = useState(false);
   // FilterBar "Downloaded" toggle — when on, further restricts the grid to
   // items that have been exported at least once. Composes with the status
   // filter set (AND, not OR).
@@ -182,6 +184,60 @@ function SignedInApp({ user, onSignOut }) {
       await svgs.addFeedback(id, feedbackText);
       setFeedbackText("");
       showToast("Feedback saved");
+    } catch (e) {
+      showToast(`Error: ${e.message ?? e}`);
+    }
+  };
+
+  // ---------- Rename / trash handlers ----------
+
+  // Rename flows through useSvgs.renameSvg with a callback that re-points the
+  // open DetailModal at the new id in the same tick (the slug IS item.id).
+  // Rethrows so DetailModal keeps its rename form open on failure.
+  const handleRename = async (id, fields) => {
+    try {
+      await svgs.renameSvg(id, fields, (newId) => setModalItemId(newId));
+      showToast("Renamed");
+    } catch (e) {
+      showToast(`Error: ${e.message ?? e}`);
+      throw e;
+    }
+  };
+
+  // Move to trash. Cascades to color variants — confirm with the count.
+  const handleTrash = async (item) => {
+    const variantCount = item.variants?.length ?? 0;
+    const extra =
+      variantCount > 0
+        ? ` This also trashes its ${variantCount} color variant${variantCount > 1 ? "s" : ""}.`
+        : "";
+    if (!window.confirm(`Move "${item.label}" to trash?${extra}`)) return;
+    try {
+      await svgs.trashSvg(item.id);
+      closeModal();
+      showToast(`Moved "${item.label}" to trash`);
+    } catch (e) {
+      showToast(`Error: ${e.message ?? e}`);
+    }
+  };
+
+  // Restore a trashed item (optionally under a new name when the original
+  // slug is taken by an active item). Rethrows so the TrashPanel row can keep
+  // its inline rename field open on a collision/error.
+  const handleRestore = async (uuid, newName) => {
+    try {
+      await svgs.restoreSvg(uuid, newName);
+      showToast("Restored");
+    } catch (e) {
+      showToast(`Error: ${e.message ?? e}`);
+      throw e;
+    }
+  };
+
+  const handleDeletePermanently = async (uuid) => {
+    try {
+      await svgs.deleteSvgPermanently(uuid);
+      showToast("Permanently deleted");
     } catch (e) {
       showToast(`Error: ${e.message ?? e}`);
     }
@@ -712,6 +768,8 @@ function SignedInApp({ user, onSignOut }) {
         queueCounts={queue}
         onShowSystemPrompt={() => setShowSystemPrompt(true)}
         onDownloadApproved={handleDownloadApproved}
+        trashCount={svgs.trashedItems.length}
+        onShowTrash={() => setShowTrash(true)}
       />
 
       <input
@@ -761,6 +819,9 @@ function SignedInApp({ user, onSignOut }) {
           onDiscardUpload={handleDiscardUpload}
           onUpdatePhysicalProperties={updatePhysicalProperties}
           onDuplicate={handleOpenDuplicate}
+          onRename={handleRename}
+          onTrash={handleTrash}
+          existingNames={existingNames}
         />
       )}
 
@@ -815,6 +876,16 @@ function SignedInApp({ user, onSignOut }) {
           onDiscard={queue.discardJob}
           onRetry={queue.retryJob}
           onClose={() => setShowQueue(false)}
+        />
+      )}
+
+      {showTrash && (
+        <TrashPanel
+          trashedItems={svgs.trashedItems}
+          existingNames={existingNames}
+          onRestore={handleRestore}
+          onDeletePermanently={handleDeletePermanently}
+          onClose={() => setShowTrash(false)}
         />
       )}
 

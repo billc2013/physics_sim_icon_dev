@@ -28,6 +28,8 @@ import { supabase } from "../lib/supabase.js";
 //     lastExportedVersion: int|null,  // version at time of last export
 //     lastExportedByName: string|null,// display name of last exporter
 //     physicalProperties: object|null,// own physical_properties (null for children)
+//     deletedAt: string|null,         // ISO timestamp if trashed, else null
+//     deletedByName: string|null,     // display name of who trashed it
 //     parentId: string|null,          // parent's `name` (item.id), null if root/standalone
 //     _parentUuid: string|null,       // parent's UUID, for writes
 //     _uuid: string,                  // schema's `id` (UUID), used for writes
@@ -55,6 +57,8 @@ function shapeItem(svgRow, feedbackRows) {
     lastExportedVersion: svgRow.last_exported_version ?? null,
     lastExportedByName: svgRow.last_exported_by_name ?? null,
     physicalProperties: svgRow.physical_properties ?? null,
+    deletedAt: svgRow.deleted_at ?? null,
+    deletedByName: svgRow.deleted_by_name ?? null,
     parentId: svgRow.parent_name ?? null,
     _parentUuid: svgRow.parent_id ?? null,
     _uuid: svgRow.id,
@@ -119,6 +123,12 @@ export function needsExport(item) {
 
 export function useSvgs(user) {
   const [items, setItems] = useState(null);
+  // Trashed (soft-deleted) items live in a separate list. They're excluded
+  // from `items` so every existing consumer (grid, export, collision checks,
+  // variant inheritance) keeps seeing only active rows. The TrashPanel reads
+  // this list. Rows here may share a `name` with each other or with an active
+  // item, so anything keying off trashed rows MUST use `_uuid`, not `id`.
+  const [trashedItems, setTrashedItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
@@ -149,7 +159,15 @@ export function useSvgs(user) {
       }
 
       const shaped = svgsResult.data.map((row) => shapeItem(row, feedbackResult.data));
-      setItems(addVariantInfo(shaped));
+      // Split active vs trashed. Variant inheritance is computed over the
+      // ACTIVE set only — a trashed parent shouldn't feed properties to a
+      // live child (and vice versa). Trashed rows keep their basic shape.
+      const active = shaped.filter((it) => it.deletedAt == null);
+      const trashed = shaped
+        .filter((it) => it.deletedAt != null)
+        .sort((a, b) => new Date(b.deletedAt) - new Date(a.deletedAt));
+      setItems(addVariantInfo(active));
+      setTrashedItems(trashed);
     } catch (e) {
       setError(e);
     } finally {
@@ -484,6 +502,144 @@ export function useSvgs(user) {
     [findUuid, items, user]
   );
 
+  // Rename an item: changes both the display label and the underlying
+  // `name`/slug (item.id). The slug is load-bearing (React key, generation
+  // object_name, zip filename, manifest name), so renaming it ripples — the
+  // caller (App) must point the open DetailModal at the returned new id.
+  //
+  // Collision is checked against ACTIVE names only; trashed rows may keep a
+  // colliding name. The DB partial unique index (physics_svgs_name_active_key)
+  // is the backstop. Renaming a parent also patches its children's `parentId`
+  // (the "↑ parent" label) locally; child ids are unchanged. Returns the new id.
+  //
+  // DB-first (not optimistic): the slug IS item.id, the React key and the open
+  // modal's selector. We write first, then in ONE tick call `onRenamed(newId)`
+  // (so the caller can re-point the modal) and patch local state — so there's
+  // never a render frame where the modal's id matches no item.
+  const renameSvg = useCallback(
+    async (id, { name: newName, displayName: newDisplayName }, onRenamed) => {
+      const uuid = findUuid(id);
+      if (!uuid || !user || !items) return;
+      const trimmedName = (newName ?? "").trim();
+      const trimmedLabel = (newDisplayName ?? "").trim();
+      if (!trimmedName) throw new Error("Name can't be empty.");
+      if (
+        trimmedName !== id &&
+        items.some((it) => it.id === trimmedName && it._uuid !== uuid)
+      ) {
+        throw new Error(`"${trimmedName}" is already used by an active object.`);
+      }
+      const { data, error: dbError } = await supabase
+        .from("physics_svgs")
+        .update({ name: trimmedName, display_name: trimmedLabel, updated_by: user.id })
+        .eq("id", uuid)
+        .select(SVG_RETURN_COLS)
+        .single();
+      if (dbError) throw dbError;
+      const post = toPostPatch(data);
+      onRenamed?.(trimmedName);
+      setItems((prev) =>
+        prev
+          ? prev.map((it) => {
+              if (it._uuid === uuid)
+                return { ...it, id: trimmedName, label: trimmedLabel, ...post };
+              if (it._parentUuid === uuid) return { ...it, parentId: trimmedName };
+              return it;
+            })
+          : prev
+      );
+      return trimmedName;
+    },
+    [findUuid, items, user]
+  );
+
+  // Move an item to the trash (soft delete). Cascades to color variants: a
+  // parent and its children are trashed together in one UPDATE (filtered to
+  // currently-active rows). Reloads after so the grid, trash list, and variant
+  // inheritance reconcile cleanly.
+  const trashSvg = useCallback(
+    async (id) => {
+      const uuid = findUuid(id);
+      if (!uuid || !user) return;
+      const nowIso = new Date().toISOString();
+      const { error: dbError } = await supabase
+        .from("physics_svgs")
+        .update({ deleted_at: nowIso, deleted_by: user.id })
+        .or(`id.eq.${uuid},parent_id.eq.${uuid}`)
+        .is("deleted_at", null);
+      if (dbError) throw dbError;
+      await refresh();
+    },
+    [findUuid, refresh, user]
+  );
+
+  // Restore a trashed item (and its trashed variants). Keyed by UUID because
+  // trashed names can collide. `newName` (optional) renames the primary row on
+  // the way out — the caller supplies it when the original name is already
+  // taken by an active item (we never auto-suffix; the name is semantic input
+  // to the downstream GIST LLM). Throws a clear message if a name still
+  // collides so the UI can prompt for a different one.
+  const restoreSvg = useCallback(
+    async (uuid, newName) => {
+      if (!uuid || !user) return;
+      const target = trashedItems.find((it) => it._uuid === uuid);
+      if (!target) return;
+      const finalName = (newName ?? target.id).trim();
+      if (!finalName) throw new Error("Name can't be empty.");
+      const activeNames = new Set((items ?? []).map((it) => it.id));
+      if (activeNames.has(finalName)) {
+        throw new Error(
+          `"${finalName}" is already taken by an active object — choose a different name.`
+        );
+      }
+      // Pre-check trashed variants that would come back with the parent.
+      const childCollisions = trashedItems
+        .filter((it) => it._parentUuid === uuid && activeNames.has(it.id))
+        .map((it) => it.id);
+      if (childCollisions.length) {
+        throw new Error(
+          `Variant name(s) ${childCollisions.join(", ")} are taken by active objects. ` +
+            "Resolve those before restoring this set."
+        );
+      }
+      // Primary row: clear trash + apply optional rename.
+      const primaryUpdate = { deleted_at: null, deleted_by: null, updated_by: user.id };
+      if (finalName !== target.id) primaryUpdate.name = finalName;
+      const { error: primaryError } = await supabase
+        .from("physics_svgs")
+        .update(primaryUpdate)
+        .eq("id", uuid);
+      if (primaryError) throw primaryError;
+      // Trashed variants (names unchanged).
+      const { error: childError } = await supabase
+        .from("physics_svgs")
+        .update({ deleted_at: null, deleted_by: null, updated_by: user.id })
+        .eq("parent_id", uuid)
+        .not("deleted_at", "is", null);
+      if (childError) throw childError;
+      await refresh();
+    },
+    [items, refresh, trashedItems, user]
+  );
+
+  // Permanently delete a trashed item and its trashed variants. Hard DELETE,
+  // owner-only (RLS "Owners can delete SVGs"). svg_versions + svg_feedback rows
+  // cascade; generation_sessions.svg_id nulls (audit kept). Scoped to trashed
+  // rows so a separately-restored child is never caught. Keyed by UUID.
+  const deleteSvgPermanently = useCallback(
+    async (uuid) => {
+      if (!uuid || !user) return;
+      const { error: dbError } = await supabase
+        .from("physics_svgs")
+        .delete()
+        .or(`id.eq.${uuid},parent_id.eq.${uuid}`)
+        .not("deleted_at", "is", null);
+      if (dbError) throw dbError;
+      await refresh();
+    },
+    [refresh, user]
+  );
+
   // Bulk action: promote every draft to idea_only. One UPDATE statement.
   const promoteAllDraftsToIdea = useCallback(async () => {
     if (!user || !items) return;
@@ -505,6 +661,7 @@ export function useSvgs(user) {
 
   return {
     items,
+    trashedItems,
     loading,
     error,
     refresh,
@@ -517,5 +674,9 @@ export function useSvgs(user) {
     updateSvgContent,
     updatePhysicalProperties,
     markExported,
+    renameSvg,
+    trashSvg,
+    restoreSvg,
+    deleteSvgPermanently,
   };
 }

@@ -23,7 +23,8 @@ Done locally:
 - ✓ Parent-child parenting: `parent_id` column, always-inherit physical_properties, color dots on parent cards, ↑parent on variant cards, manifest uses effectivePhysicalProperties
 
 Remaining:
-- Tasks 4, 5, 9, and the production-walkthrough piece of 10
+- Tasks 4, 5, 9, 11, and the production-walkthrough piece of 10
+- Task 11 (Supabase `sb_secret_` key migration) has a real external deadline: legacy keys deleted late 2026
 
 The app works end-to-end on `vercel dev` (login → grid → review → four generate flows with queue + collider generation → audit log → manual download/upload → zip export with manifest + colliders). What's missing is multi-user (Realtime), production deploy, Duncan's bootstrap, and the prod walkthrough of the zip export.
 
@@ -271,7 +272,57 @@ Fix (shipped and verified by Bill): switched the stale predicate to `updatedAt >
 
 ---
 
+### 11. Migrate Modal service-role key to the new `sb_secret_` format `[ ]`
+
+Supabase has deprecated the legacy JWT-based API keys (`anon`, `service_role`). The
+browser side already uses the new `sb_publishable_…` publishable key, but the
+**server side still holds the legacy `service_role` JWT** in the `supabase_for_svg_gen`
+Modal secret. Researched against the Supabase docs on 2026-06-24.
+
+**Why this matters (the real wins, not just deprecation):**
+- **Hard deadline:** legacy `anon`/`service_role` keys are deleted **late 2026 (exact month TBC)**. After removal, anything still using them breaks. ~6 months out.
+- **Independent rotation:** rotating a leaked legacy `service_role` key required rotating the project JWT secret, which logged out *every* signed-in user. The new `sb_secret_…` key rotates on its own in seconds with zero session impact — meaningful for a shared Bill+Duncan tool.
+- **Misuse guardrails:** a secret key returns 401 if used from a browser (User-Agent match); you can mint multiple secret keys and revoke them individually.
+
+**Prerequisite already done:** `supabase` pinned to `2.28.3` in both
+[generate_svg.py](modal_functions/generate_svg.py) and [keep_alive.py](modal_functions/keep_alive.py)
+(2.9.1's regex rejected non-JWT keys). The new secret keys aren't JWTs — they must be
+sent on the `apikey` header, not `Authorization: Bearer`; the modern client handles this.
+
+**Scope (low-risk — both key types work simultaneously):**
+- In the Supabase dashboard → Settings → API Keys, create a new **secret key** (`sb_secret_…`)
+- Update the **value** of the `supabase_for_svg_gen` Modal secret's `SUPABASE_SERVICE_ROLE_KEY` to the new key (env var **name** stays the same — three callers read it: both Modal apps + `scripts/seed.js`)
+- `modal deploy modal_functions/generate_svg.py` **and** `modal deploy modal_functions/keep_alive.py` (two separate Modal apps share the secret)
+- Test: trigger a generation (Flow A) and run `modal run modal_functions/keep_alive.py`
+- Check for any other server-side caller that embeds the key: the schema's `pg_cron` heartbeat job, `pg_net` / Database Webhooks (send the secret on the `apikey` header)
+- Once everything is verified on the new key, **delete the legacy `service_role` key** in the dashboard
+
+**Out of scope (separate track):**
+- Migrating Supabase **JWT signing keys** to asymmetric (JWKS) so [api/generate.ts](api/generate.ts) can verify user JWTs with a public key locally. Related modernization, NOT required for the API-key swap. Backlog.
+
+**Acceptance**
+- Generation flows + keep_alive cron both work on the new `sb_secret_…` key
+- Legacy `service_role` key deleted from the Supabase dashboard with nothing broken
+
+---
+
 ## Completed off-task-list work
+
+### Trash (soft delete) + rename (2026-06-24) `[x]`
+
+QoL: cull and redo objects, and fix slugs, without losing data or names.
+
+What landed:
+- **Schema migration 11d** (run by Bill 2026-06-24): `deleted_at`/`deleted_by` columns on `physics_svgs`; the global `unique (name)` constraint replaced with a partial unique index `physics_svgs_name_active_key on (name) where deleted_at is null`; `svgs_with_details` view recreated to expose `deleted_at`/`deleted_by`/`deleted_by_name`. Verified: trash → name freed → new object with the same name inserts → restore prompts for a new name.
+- **Filesystem name semantics:** names are unique only among ACTIVE items. Trashing frees the name; trashed rows can share names. Collision checks (create/rename/restore) compare against active names only.
+- **[useSvgs.js](src/hooks/useSvgs.js):** `items` excludes trashed; new `trashedItems` list; mutations `renameSvg` (DB-first + `onRenamed` callback), `trashSvg` (cascade via one `.or()` UPDATE), `restoreSvg` (keyed by `_uuid`, optional rename-on-collision), `deleteSvgPermanently` (owner-only cascade hard delete). Shape gained `deletedAt`/`deletedByName`.
+- **[DetailModal.jsx](src/components/DetailModal.jsx):** inline rename (slug primary + autofocused, display label auto-follows underscores→spaces until edited) and a Trash button (cascade-count confirm for parents).
+- **[TrashPanel.jsx](src/components/TrashPanel.jsx)** (new) + Header `Trash (N)` button: per-row Restore (blank rename field on collision — never auto-suffixed, because the slug is semantic LLM input) and owner-only Delete.
+- **RLS:** no new policies — trash/restore are UPDATEs (editor), permanent delete is a DELETE (owner).
+
+See [CLAUDE.md → Trash (soft delete) and rename](CLAUDE.md#trash-soft-delete-and-rename).
+
+**Backlog spun off:** none required. Possible future polish — replace the `window.confirm` trash/delete dialogs with styled modals; surface "(N variants)" cascade scope in the grid not just the modal.
 
 ### Collider system (2026-04-12) `[x]`
 

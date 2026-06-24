@@ -296,6 +296,38 @@ What landed:
 
 ---
 
+## Runbook: onboarding a tester / collaborator
+
+When someone new (e.g. Duncan, or a colleague helping test) signs up via the app
+but **sees no icons**, it's RLS: they're a valid `auth.users` row but have no
+`project_members` entry, so every data read returns zero rows (no error, just
+empty). Add them as a member in the **Supabase SQL editor** (runs as service
+role, bypasses the owner-only insert policy):
+
+```sql
+-- 1. Find their user ID (or use Authentication → Users in the dashboard)
+select id, email from auth.users where email = 'their@email.com';
+
+-- 2. Add the membership row
+insert into public.project_members (user_id, display_name, role)
+values ('<their-auth-user-id>', 'Their Name', 'editor');
+```
+
+- `role`: `editor` (review/annotate/revise, can't manage members), `owner`
+  (can add/remove members), or `viewer` (read-only).
+- `display_name` shows up in attribution lines ("Exported as v3 · … · Their Name").
+- They just **refresh the browser** afterward — no re-login needed.
+
+Other gotchas seen during local-test onboarding:
+
+- **`vercel dev` env vars come from their linked Vercel project, not `.env.local`.**
+  Each collaborator uses their own free Vercel account, links a new project, and
+  sets the four vars (`VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`,
+  `MODAL_ENDPOINT_URL`, `MODAL_BATCH_ENDPOINT_URL`) via `vercel env add ... development`.
+  The Modal URLs point at Bill's `billc2013` workspace (shared backend).
+- This is the manual version of Task 4 (Duncan in `project_members`) — replace
+  with a self-serve invite flow if onboarding becomes frequent.
+
 ## Backlog / nice-to-have (not yet scheduled)
 
 - **Restore-previous-version UI** built on `svg_versions`. Replaces the in-memory undo we dropped in Task 3.

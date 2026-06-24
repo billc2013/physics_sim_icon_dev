@@ -75,9 +75,9 @@ MODEL_TIERS = {
         "output_price_per_mtok": 15.00,
     },
     "advanced": {
-        "model": "claude-opus-4-6",
-        "input_price_per_mtok": 15.00,
-        "output_price_per_mtok": 75.00,
+        "model": "claude-opus-4-8",
+        "input_price_per_mtok": 5.00,
+        "output_price_per_mtok": 25.00,
     },
 }
 DEFAULT_MODEL_TIER = "standard"
@@ -90,10 +90,10 @@ DEFAULT_MODEL_TIER = "standard"
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
-        "anthropic==0.39.0",
-        "supabase==2.9.1",
+        "anthropic==0.91.0",  # bumped from 0.39.0: supports current models; works with httpx 0.28 (no proxies= bug)
+        "supabase==2.28.3",  # 2.9.1 regex-rejected non-JWT keys; 2.28.x accepts sb_secret_ format
         "fastapi==0.115.0",
-        "pydantic==2.9.2",
+        "pydantic==2.11.7",  # bumped from 2.9.2: supabase 2.28.3 -> realtime requires pydantic>=2.11.7
     )
     .add_local_file(
         local_path=str(SYSTEM_PROMPT_LOCAL_PATH),
@@ -414,7 +414,7 @@ def generate_svg(
         feedback_history: list of feedback strings collected so far.
         color_palette: optional dict with keys {name, light, mid, dark}.
         current_svg: existing SVG markup (for revision), else None.
-        model_tier: "standard" (Sonnet 4.6, default) or "advanced" (Opus 4.6).
+        model_tier: "standard" (Sonnet 4.6, default) or "advanced" (Opus 4.8).
                     Controls which Anthropic model handles the generation.
 
     Returns:
@@ -671,13 +671,16 @@ def batch_generate_svg(
 
     try:
         # Batch calls produce much more output (10 SVGs × ~500-1000 tokens
-        # each), so we need a generous max_tokens.
-        message = anthropic_client.messages.create(
+        # each), so we need a generous max_tokens. Stream because non-streaming
+        # requests above ~16K max_tokens hit SDK HTTP timeouts; get_final_message
+        # reassembles the full response so the rest of the code is unchanged.
+        with anthropic_client.messages.stream(
             model=model_id,
             max_tokens=32768,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
-        )
+        ) as stream:
+            message = stream.get_final_message()
 
         response_text = "".join(
             block.text for block in message.content if block.type == "text"

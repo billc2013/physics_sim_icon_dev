@@ -27,14 +27,14 @@ import modal
 app = modal.App("gist-keep-alive")
 
 image = modal.Image.debian_slim(python_version="3.12").pip_install(
-    "supabase==2.9.1",
+    "supabase==2.28.3",  # 2.9.1 regex-rejected non-JWT keys; 2.28.x accepts sb_secret_ format
 )
 
 
 @app.function(
     image=image,
     secrets=[modal.Secret.from_name("supabase_for_svg_gen")],
-    schedule=modal.Cron("0 6 * * 0"),  # every Sunday at 06:00 UTC
+    schedule=modal.Cron("0 6 * * *"),  # every day at 06:00 UTC
     timeout=30,
 )
 def keep_alive():

@@ -2,7 +2,7 @@
 
 Guidance for Claude Code when working in this repository.
 
-> **Note:** This file and `Dev_Tasks.md` are gitignored — they're working notes shared between Bill and Claude, not committed to the repo. Keep them current because Bill relies on them as the running state of the project across Claude sessions.
+> **Note:** This file and `Dev_Tasks.md` are working notes shared between Bill and Claude — they're git-tracked (committed to the repo), not gitignored. Keep them current because Bill relies on them as the running state of the project across Claude sessions.
 
 ## What this project is
 
@@ -31,7 +31,7 @@ Working end-to-end **on localhost**:
 Not yet done:
 
 - ✗ Realtime subscriptions (Task 5) — `useSvgs` reloads on mutation, no live cross-user sync
-- ✓ Modal `keep_alive()` weekly cron (Task 8) — `modal_functions/keep_alive.py`, runs Sunday 06:00 UTC
+- ✓ Modal `keep_alive()` daily cron (Task 8) — `modal_functions/keep_alive.py`, runs every day 06:00 UTC
 - ✗ Push to GitHub + Vercel auto-deploy (Task 9) — production URL doesn't exist yet
 - ✗ Duncan in `project_members` (Task 4) — happens after he signs up via the deployed app
 - ✗ Zip export of approved SVGs (Task 10)
@@ -63,7 +63,7 @@ See [Dev_Tasks.md](Dev_Tasks.md) for the prioritized backlog and what each remai
 | Hosting     | Vercel                        | Project linked locally as `bill-churchs-projects/physics-sim-icon-dev`. Auto-deploy from GitHub `main` is Task 9 |
 | API proxy   | Vercel serverless (`api/`)    | TypeScript, Node runtime, thin auth proxy only |
 | Compute     | Modal.com (Python)            | Holds all secrets, calls Claude, writes to Supabase. Workspace: `billc2013` |
-| LLM         | Anthropic Claude API          | `claude-sonnet-4-20250514` |
+| LLM         | Anthropic Claude API          | `claude-sonnet-4-6` (Standard) / `claude-opus-4-8` (Advanced) — see Model tiers |
 | Database    | Supabase Postgres (free tier) | Project ref `ohsehevfhfnbrfpnhyxv` (separate org from Bill's Pro account) |
 | Auth        | Supabase Auth (email/password)| JWT-based. Bill uses a Supabase publishable key (`sb_publishable_...`) format, not a classic JWT anon key — works fine |
 | Realtime    | Supabase Realtime             | Tables enabled in schema, no client subscriptions yet |
@@ -77,7 +77,7 @@ Do not violate these without explicit discussion:
 3. **The Vercel proxy injects `requested_by` from the validated JWT** — never trust whatever value the client sends for that field.
 4. **All secrets live in Modal** (`modal.Secret`) — the Anthropic key and the Supabase **service role** key. Vercel only has the Supabase URL and publishable/anon key.
 5. **RLS is enforced.** The browser uses the publishable key and gets RLS-restricted access. Modal uses the service role key and bypasses RLS for system-level writes (generation logs, version archival, seed).
-6. **Schema source of truth is [gist-supabase-schema.sql](gist-supabase-schema.sql)** (note: gitignored locally). Schema changes are made by editing that file *and* running the migration in the Supabase SQL editor. Do not let the file drift from the live DB.
+6. **Schema source of truth is [gist-supabase-schema.sql](gist-supabase-schema.sql)** (git-tracked). Schema changes are made by editing that file *and* running the migration in the Supabase SQL editor. Do not let the file drift from the live DB.
 7. **Realtime, not polling.** Use Supabase Realtime channels for cross-user sync once Task 5 lands.
 8. **Versioning is automatic.** The `archive_svg_version()` trigger snapshots old rows to `svg_versions` on UPDATE. Don't reimplement version tracking client-side.
 9. **The seed script and Modal both need a real `auth.users.id` for `created_by` / `requested_by`.** There's no NULL fallback; bootstrap by signing up first, then seeding.
@@ -91,7 +91,7 @@ Do not violate these without explicit discussion:
 ├── modal_functions/
 │   ├── generate_svg.py           Modal function with both `modal run` entry
 │   │                              and `@modal.fastapi_endpoint` HTTP endpoint
-│   ├── keep_alive.py             Weekly cron: pings heartbeat table to prevent
+│   ├── keep_alive.py             Daily cron: pings heartbeat table to prevent
 │   │                              Supabase free-tier pause. Separate Modal app.
 │   └── requirements.txt          Stale leftover from another Bill project — Modal
 │                                  reads deps from image.pip_install(), not this file
@@ -269,7 +269,7 @@ All four flows let the user pick between two Claude models before firing a gener
 | Tier       | Model ID              | Price (in/out per MTok) | When to use |
 |------------|-----------------------|-------------------------|-------------|
 | Standard   | `claude-sonnet-4-6`   | $3 / $15                | Default for all generations |
-| Advanced   | `claude-opus-4-6`     | $15 / $75               | Escalate when Standard can't nail the SVG |
+| Advanced   | `claude-opus-4-8`     | $5 / $25                | Escalate when Standard can't nail the SVG |
 
 Behavior:
 

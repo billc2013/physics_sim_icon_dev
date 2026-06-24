@@ -45,3 +45,6 @@ scripts/seed-output/
 
 __pycache__/*/
 __pycache__/
+
+# get-up-to-speed skill snapshot — per-machine, keep local (skill files themselves are tracked)
+.claude/skills/get-up-to-speed/state/

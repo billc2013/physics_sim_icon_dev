@@ -18,12 +18,14 @@ export default function ColliderPreview({
   collider,
   viewBoxWidth = VIEWBOX_SIZE,
   viewBoxHeight = VIEWBOX_SIZE,
+  viewBoxMinX = 0,
+  viewBoxMinY = 0,
 }) {
   if (!collider) return null;
 
   return (
     <svg
-      viewBox={`0 0 ${viewBoxWidth} ${viewBoxHeight}`}
+      viewBox={`${viewBoxMinX} ${viewBoxMinY} ${viewBoxWidth} ${viewBoxHeight}`}
       preserveAspectRatio="xMidYMid meet"
       style={{
         position: "absolute",
@@ -31,6 +33,7 @@ export default function ColliderPreview({
         width: "100%",
         height: "100%",
         pointerEvents: "none",
+        overflow: "visible",
       }}
     >
       {renderCollider(collider)}

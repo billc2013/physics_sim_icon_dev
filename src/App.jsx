@@ -27,6 +27,7 @@ import DuplicateSvgModal from "./components/DuplicateSvgModal.jsx";
 import DownloadApprovedModal from "./components/DownloadApprovedModal.jsx";
 import QueuePanel from "./components/QueuePanel.jsx";
 import TrashPanel from "./components/TrashPanel.jsx";
+import ColliderLab from "./components/ColliderLab.jsx";
 import DataTransformPage from "./components/data/DataTransformPage.jsx";
 
 export default function App() {
@@ -677,10 +678,11 @@ function SignedInApp({ user, onSignOut }) {
     margin: "0 auto",
   };
 
-  // The SVG Manager loads its dataset from Supabase, but the Data Transforms
-  // tool doesn't depend on that — only block on `svgs.loading` when the user
-  // is actually on the SVG tab.
-  if (activeTab === "svg" && svgs.loading && !items) {
+  // The SVG Manager and Collider Lab both read the Supabase library; the Data
+  // Transforms tool doesn't. Only block on `svgs.loading` when the user is on a
+  // library-backed tab.
+  const needsLibrary = activeTab === "svg" || activeTab === "collider";
+  if (needsLibrary && svgs.loading && !items) {
     return (
       <div style={shellWrapperStyle}>
         <TabStrip
@@ -693,7 +695,7 @@ function SignedInApp({ user, onSignOut }) {
       </div>
     );
   }
-  if (activeTab === "svg" && svgs.error && !items) {
+  if (needsLibrary && svgs.error && !items) {
     return (
       <div style={shellWrapperStyle}>
         <TabStrip
@@ -720,6 +722,21 @@ function SignedInApp({ user, onSignOut }) {
           onSignOut={onSignOut}
         />
         <DataTransformPage userEmail={user.email} />
+      </div>
+    );
+  }
+
+  if (activeTab === "collider") {
+    return (
+      <div style={shellWrapperStyle}>
+        <Toast message={toast} />
+        <TabStrip
+          activeTab={activeTab}
+          onChange={setActiveTab}
+          userEmail={user.email}
+          onSignOut={onSignOut}
+        />
+        <ColliderLab items={items ?? []} />
       </div>
     );
   }

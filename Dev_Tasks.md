@@ -306,6 +306,201 @@ sent on the `apikey` header, not `Authorization: Bearer`; the modern client hand
 
 ---
 
+### 12. Concave collider generation — outer-boundary outline `[ ]`
+
+New initiative driven by the downstream gist repo's concave-collider refactor.
+Source of truth for the *why*: [../gist/Notes_on_Concave_Colliders_Refactor.md](../gist/Notes_on_Concave_Colliders_Refactor.md)
+(read the Phase 0 + 2026-06-25 "four-option generator" Findings entries).
+
+**Why now.** GIST's physics curriculum needs genuinely concave colliders — open
+containers (cup/bucket "catch the marble") and open-top vehicles (wagon, Newton's
+1st law). gist **Phase 0 is SHIPPED**: it proved a hand-authored concave outline
+decomposes into a dynamic `compound` body that catches and tips, with **zero
+engine changes**. The decomposition path (`poly-decomp`'s `makeCCW` + `quickDecomp`)
+already exists in gist and is **engine-agnostic** (Rapier *and* Planck parity tested).
+So the engine was never the gap — **content + the generator (this repo) are.**
+
+**The decision: decompose DOWNSTREAM; this repo emits the raw concave outline.**
+The generator outputs the true concave silhouette as a `type:"convex"` collider
+(the accepted-concave misnomer), and gist decomposes it at load — identical to the
+Phase 0 hand-authored cup. Chosen over decomposing upstream so `poly-decomp` stays
+single-sourced in gist (no second copy here; stored geometry == authored outline).
+**We do NOT add `poly-decomp` to this repo.**
+
+**Keep-in-sync / cross-repo contract (load-bearing):**
+- gist's `ManifestCollider` is `convex | box | circle` — **no `polygon` type**. A
+  `type:"polygon"` manifest entry resolves to `undefined` downstream and the body
+  builds with **no collider** (reads as a generator bug). So **emit `type:"convex"`**,
+  not `"polygon"`, until gist lands its Phase 4 rename. Our `convex`-named outline IS
+  the polygon path under test downstream.
+- This is a browser-only generator change. It does **not** touch
+  [shared/system_prompt.json](shared/system_prompt.json), so **no `modal deploy`
+  is owed** — the LLM still only picks a type intent; the client computes geometry.
+
+**The structural blocker — outer-boundary extraction.** `extractFilledVertices` in
+[colliderGenerator.js](src/lib/colliderGenerator.js) returns an *unordered point
+cloud* and both entry points `convexHull` it immediately (filling the cup's mouth).
+Decomposition downstream needs an **ordered, simple, closed ring** (a single outline
+traversal). The chosen approach is **vector polygon union, not bitmap tracing**
+(decided 2026-06-25 — see below):
+- **Single dominant filled path** → web-native `SVGGeometryElement.getTotalLength()`
+  + `getPointAtLength()` samples the outline at native precision (also handles
+  arcs/smooth beziers our hand-rolled path parser mangles). **Zero dependency.**
+- **Multiple filled shapes** → boolean **union** of the per-element rings; the
+  union's outer ring is the silhouette, and a union *guarantees* the
+  non-self-intersecting closed ring gist requires. Lowest-cost lib:
+  [`polygon-clipping`](https://www.npmjs.com/package/polygon-clipping) (Martinez–Rueda,
+  pure JS, no runtime deps). Adding it trips the global npm-safety protocol
+  (spell name / publish freshness / install scripts) — do that dance at install time.
+- **Bitmap/OpenCV trace** rejected as high-cost for 64×64 monochrome icons
+  (resolution-bound, AA-fuzzy, OpenCV.js ~8 MB WASM). Reconsider only if we must
+  trace stroke-rendered appearance.
+
+**Concrete change set in this repo:**
+1. [colliderGenerator.js](src/lib/colliderGenerator.js) — add `extractFilledRings()`
+   (per-element **ordered** rings; keep the existing point-cloud fn for the convex-hull
+   path) + an ordered-outline / union route + a concave/`polygon` branch that emits the
+   raw outline with **no hull**.
+2. [colliderSchema.js](src/lib/colliderSchema.js) — `validateConvex`'s
+   `≤ MAX_CONVEX_VERTICES` (8) is a **per-Planck-part-AFTER-decomposition** limit, NOT
+   a per-outline limit. A raw concave outline stored as `convex` will trip it. Relax/bypass
+   the cap for concave-flagged outlines and validate **winding / self-intersection**
+   instead. (Don't pre-guarantee CCW — gist's `makeCCW` normalizes it; the requirement
+   is "ordered simple closed ring," not a specific winding.)
+3. Editor UX ([DetailModal.jsx](src/components/DetailModal.jsx) ~L812 /
+   [ColliderEditor.jsx](src/components/ColliderEditor.jsx)) — flip the amber warning
+   *"Polygon is concave — physics engines require convex shapes … the engine will use
+   the convex hull"* (now **wrong** — gist decomposes, it doesn't hull) to "concave →
+   decomposed downstream (allowed)." Compounds eventually need to be editable
+   (`colliderToEditableVertices` returns null for `compound` today).
+
+**Four-option generator plan (box / circle / pill / polygon) — verdicts from gist:**
+- Emit a **closed polygon, not a "polyline."** An open polyline is a one-sided edge
+  chain with no interior volume — invalid on dynamic bodies (the exact failure this
+  whole refactor avoids).
+- **"Pill" is not a free primitive.** Planck/Box2D has no capsule (only Rapier does),
+  and gist's `ShapeDescriptor` is `circle | rectangle | polygon | compound`. Emit a
+  pill as a **2-circle + rectangle `compound`** — rides the existing compound path,
+  zero adapter change. Collapses four options to three primitives + compound.
+
+**Open questions (UNRESOLVED — UI design is the next conversation):**
+- **Outline-selection rule.** When a sprite has several filled shapes (umbrella =
+  filled canopy + stroke-only ribs), which is "the outline"? Largest filled path?
+  Author-tagged element? Auto-union of all filled shapes? Strokes contribute zero fill
+  area, so a fill-union ignores thin ribs — the **Tier-2 umbrella case gist explicitly
+  deferred** (fix would be stroke-offsetting, not a rewrite).
+- **Type-selection UX.** Does the generator auto-detect polygon-vs-convex, or does the
+  four-option choice become an explicit author control (matching the LLM-type-intent
+  model)? **← the UI thread Bill wants to open next.**
+- **Validation timing.** Add winding/self-intersection rejection here now, or defer to
+  gist's Phase-4 build-time validator?
+
+**Scope gate (gist side).** gist's agent-side dev is **paused** pending Bill's
+canonical "Tier 1" defined-sim list (cup + open-top wagon confirmed; rest TBC). This
+generator work is the "getting ahead" track; the resumed downstream dev is gated on
+*lock Tier 1 → implement this change set → gist Phase 4 landing*.
+
+**Acceptance**
+- Generator emits an ordered, simple, closed concave outline labeled `type:"convex"`
+  for a cup-like SVG (≤8 verts for the first test, matching the Phase 0 recipe)
+- A hand-test cup outline round-trips into gist's `manifest.json` and decomposes to a
+  3-part compound (verify in gist with `?simdebug=1`)
+- Editor no longer tells the user concave is forbidden
+
+---
+
+### 13. Collider Lab — dedicated collider view `[~]`
+
+**Phase 1 of 4 SHIPPED 2026-06-25 (read-only audit/triage surface).** Phases 2–4 ahead.
+
+
+Pull all collider review/editing **out of DetailModal** into a separate top-level
+**Collider Lab** view: a triage + ground-truth surface where you see "like" SVGs
+grouped by collider shape, select one for a large grid-backed view, and confirm/edit
+its collider. Consumes the generator work in **Task 12**. Decisions settled 2026-06-25.
+
+**Architecture (low-risk, no schema change, no new deps):**
+- **Navigation:** in-app Header view toggle `Grid ⇄ Collider Lab` backed by a `view`
+  state in [App.jsx](src/App.jsx). The app has no router — do NOT add one.
+- **Data:** new view over existing `useSvgs` items; writes via the existing
+  `updatePhysicalProperties` (already targets the parent for children). No schema change.
+- **Reuse:** `ColliderPreview` + `ColliderEditor` port in. **Fix the non-square-viewBox
+  bug here:** `ColliderEditor` hardcodes a 64×64 canvas, so a rescaled e.g. 35×64 icon
+  edits misaligned. The Lab's grid forces honoring real viewBox dims — fixes it properly.
+
+**Grouping (settled):**
+- Groups by collider shape: **circle / box / polygon (`convex`) / compound / none**.
+  Concave containers are NOT compound here — they're single `convex` rings (gist
+  decomposes downstream). Add a **"concave" badge** within the polygon group (detect via
+  `isConvexPolygon`) so containers are spottable. The "none" bucket is the triage target.
+- **Make grouping EXTENSIBLE:** Bill will define **physics-perspective facets** later
+  (richer than shape type). Build the grouping as a pluggable facet, not a hardcoded
+  shape switch, so physics facets slot in without a rewrite.
+
+**Ground-truth grid view (the heart):** large render of the unit space (~480px on the
+longer viewBox axis), drawing the **viewBox boundary** (correct when non-square), a
+**coordinate grid** (lines/labels every 8 units), the SVG content beneath, the collider
+overlaid, and a **numerically-editable vertex table** beside the canvas (type `(x,y)`,
+not just drag — that's the "ground-truth the coordinates" ask).
+
+**Decisions settled:**
+- **DetailModal loses its collider section** → shrinks to read-only thumbnail +
+  "Edit in Collider Lab" link. Refine DetailModal further *after* the Lab exists.
+- **Children do NOT appear in the Lab** (they inherit; editing writes to the parent).
+  Show parents + standalones only.
+- **Decomposition = Option A:** edit the raw concave ring, trust gist; do NOT add
+  `poly-decomp` here (avoids version-drift with gist's decomposer). Polygons stay
+  labeled `type:"convex"` in the manifest **for now** — gist is on dev-hold pending
+  Bill's Tier 1 sim list, and Phase 0 tests `convex`-named polygons with zero downstream
+  refactor.
+- **Polygon generation = single-path native route** (`SVGGeometryElement.getTotalLength()`
+  + `getPointAtLength()` on the dominant filled path; zero dependency).
+
+**🔔 Cross-repo reminder (Bill's TODO in gist):** add a **debug switch in gist that
+renders the decomposed collider** (how `poly-decomp` actually splits an outline), so we
+can ground-truth decomposition downstream *without* importing `poly-decomp` here. This is
+the sanctioned substitute for local decomposition preview (Option B, rejected).
+
+**Phasing:**
+1. **✓ SHIPPED 2026-06-25.** Lab shell + grouping (extensible facet) + read-only
+   ground-truth grid. What landed:
+   - [TabStrip.jsx](src/components/TabStrip.jsx) third tab `Collider Lab`;
+     [App.jsx](src/App.jsx) `needsLibrary` guard + render branch.
+   - [ColliderLab.jsx](src/components/ColliderLab.jsx) — `SHAPE_FACET` grouping (extensible
+     `{groups[], bucketOf()}`), triage list, concave badge via `isConvexPolygon`. Excludes
+     children + `idea_only`.
+   - [ColliderGroundTruth.jsx](src/components/ColliderGroundTruth.jsx) — aspect-correct
+     3-layer canvas (icon/grid/collider), reuses `ColliderPreview` + `GeometryInfo`,
+     monospace coord readout. Non-square viewBox aligns by construction (sidesteps the
+     `ColliderEditor` 64×64-hardcode bug).
+   - **Out-of-bounds reveal:** expands the coord space with a gutter when a collider spills
+     past 0–W/0–H — extended grid, drawn viewBox boundary, red off-canvas vertex markers,
+     amber per-edge overflow warning, `⚠` flags in the readout. Added optional
+     `viewBoxMinX/MinY` props to [ColliderPreview.jsx](src/components/ColliderPreview.jsx)
+     (default 0,0 — DetailModal unaffected) + `overflow: visible`.
+   - **Data-quality finding:** several seeded colliders have vertices below the viewBox
+     (confirmed: `dynamics_cart`, `fire_truck`, `flat_asteroid`). Pre-existing defect the
+     Lab now surfaces; the fix path is Phase 2 editing.
+2. **← NEXT.** Editing in the grid — port `ColliderEditor` (carry the non-square-viewBox +
+   gutter awareness from the ground-truth view) + a **numerically-editable vertex table**
+   (type `(x,y)`, not just drag). Writes via `updatePhysicalProperties` (parent for
+   children). **Add a "⚠ N out-of-bounds" filter/sort** so the broken colliders from the
+   Phase 1 finding are one click away.
+3. Polygon generation via single-path native route + flip the concave warning
+   ("forbidden" → "decomposed downstream").
+4. Pill parametric editor (the only "compound" we need near-term — drag two end-circles,
+   set radius).
+
+**Acceptance**
+- Collider Lab reachable from the Header; groups items by collider shape with a triage
+  "none" bucket and a concave badge
+- Selecting an item shows the grid view with correct viewBox (incl. non-square),
+  coordinate grid, SVG + collider overlay, and an editable vertex table
+- Editing writes through `updatePhysicalProperties` (parent for children) — no schema change
+- DetailModal collider section removed in favor of an "Edit in Collider Lab" link
+
+---
+
 ## Completed off-task-list work
 
 ### Trash (soft delete) + rename (2026-06-24) `[x]`

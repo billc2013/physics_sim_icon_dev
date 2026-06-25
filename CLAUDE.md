@@ -41,6 +41,7 @@ Done (off-task-list):
 - ✓ Collider system — schema, programmatic generator, interactive editor, LLM-generated colliders on Flows A/B/C
 - ✓ Parent-child parenting — `parent_id` FK, always-inherit physical_properties, color dots on parent cards, manifest uses effective props
 - ✓ Trash (soft delete) + rename — `deleted_at`/`deleted_by` columns, active-only partial unique index, TrashPanel restore/purge, DetailModal rename of slug + label (schema migration 11d). See [Trash and rename](#trash-soft-delete-and-rename)
+- ◐ Collider Lab (Task 13, **Phase 1 of 4 shipped**) — dedicated `Collider Lab` tab: read-only audit/triage surface grouping SVGs by collider shape with a grid-backed ground-truth inspector that reveals out-of-bounds colliders. Editing/generation/pill-editor are Phases 2–4. See [Collider Lab](#collider-lab)
 
 See [Dev_Tasks.md](Dev_Tasks.md) for the prioritized backlog and what each remaining task involves.
 
@@ -107,7 +108,10 @@ Do not violate these without explicit discussion:
 │   │                              Claude.ai-style CSS variable references
 │   ├── components/
 │   │   ├── ColliderEditor.jsx    Interactive polygon editor overlay (drag/add/remove vertices)
-│   │   ├── ColliderPreview.jsx   Static collider overlay (blue dashed shape)
+│   │   ├── ColliderPreview.jsx   Static collider overlay (blue dashed shape); optional
+│   │   │                          viewBoxMinX/MinY for an expanded coord space
+│   │   ├── ColliderLab.jsx       Collider Lab tab: facet grouping + triage list (Task 13)
+│   │   ├── ColliderGroundTruth.jsx  Grid-backed inspector; reveals out-of-bounds colliders
 │   │   ├── ColorPaletteTag.jsx
 │   │   ├── DetailModal.jsx       Has inline "revision preview" panel for Flow B,
 │   │   │                          collider generate/edit/save section, inheritance display
@@ -299,6 +303,18 @@ All generation flows (except Flow D) now ask Claude to return a `collider` objec
 **Programmatic fallback:** The DetailModal "Generate" button in the Collider section runs a client-side programmatic generator (`colliderGenerator.js`) that extracts vertices from SVG elements, computes a convex hull, and simplifies to ≤8 vertices. No LLM call. Useful for existing SVGs that pre-date the LLM collider feature, or when the LLM's collider needs correction.
 
 **Collider editor:** The DetailModal also has an interactive vertex editor (drag to move, click + to add, click × to remove) for fine-tuning colliders manually. Convexity is checked live with an amber warning if the polygon becomes concave.
+
+> **Direction note (planned, not shipped):** colliders are **convex-only today**, but the downstream gist repo's concave-collider refactor (Phase 0 SHIPPED there) means this repo will gain a **concave outer-boundary outline** path — the generator will emit the true concave silhouette labeled `type:"convex"` (gist decomposes it into a `compound` at load via `poly-decomp`; we do NOT add that dependency here). The amber "concave is forbidden" warning above will flip to "concave → decomposed downstream." See **Dev_Tasks.md → Task 12** and [../gist/Notes_on_Concave_Colliders_Refactor.md](../gist/Notes_on_Concave_Colliders_Refactor.md). The key blocker is ordered outer-boundary extraction (the current generator hulls an unordered point cloud); the chosen approach is vector polygon union, not bitmap tracing.
+
+### Collider Lab
+
+A dedicated **`Collider Lab`** tab (third tab in [TabStrip.jsx](src/components/TabStrip.jsx), alongside SVG Manager + Data Transforms) that pulls collider review out of the cramped DetailModal into a spatial audit/triage surface. **Task 13 — Phase 1 of 4 shipped (read-only).** The remaining phases (editing, polygon generation, pill editor) are in [Dev_Tasks.md](Dev_Tasks.md).
+
+- **A view over existing data — no schema change.** Reads `useSvgs` items, writes (in later phases) via the existing `updatePhysicalProperties`. Gated behind `needsLibrary` in [App.jsx](src/App.jsx) so it loads the library like the SVG tab.
+- **Grouping is an EXTENSIBLE facet.** [ColliderLab.jsx](src/components/ColliderLab.jsx) buckets items via a `facet` object (`{ groups[], bucketOf() }`). Phase 1 ships the **shape facet** (circle / box / polygon=`convex` / compound / none). Bill's planned **physics-perspective facets** slot in as additional facet objects — no rewrite. Children (variants) and `idea_only` concepts are excluded.
+- **Polygon group = stored `type:"convex"`** (the accepted-concave misnomer). A **"concave" badge** (detected via `isConvexPolygon`) flags closed concave outlines (cups/wagons) that gist will decompose downstream.
+- **Ground-truth inspector** ([ColliderGroundTruth.jsx](src/components/ColliderGroundTruth.jsx)): three aligned layers (icon → coordinate grid → collider overlay) in an **aspect-correct box, so non-square rescaled viewBoxes align with no letterboxing** — this sidesteps the `ColliderEditor` 64×64-hardcode bug. Reuses `ColliderPreview` + `GeometryInfo`, plus a monospace coordinate readout.
+- **Reveals out-of-bounds colliders.** When a collider's vertices fall outside 0–W/0–H, the coordinate space **expands with a gutter** (instead of clipping at the edge): extended gridlines + labels, the real viewBox boundary drawn, red markers on off-canvas vertices, an amber warning quantifying the overflow per edge, and `⚠` flags in the readout. This surfaced a real data-quality issue — several seeded colliders (e.g. `dynamics_cart`, `fire_truck`, `flat_asteroid`) have vertices below the viewBox. Fixing them is Phase 2 (editing) motivation.
 
 ### Parent-child relationships (color variants)
 

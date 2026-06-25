@@ -4,6 +4,7 @@
 // Tools share auth, layout, and theme. The tab state lives in App.jsx.
 const TABS = [
   { id: "svg", label: "SVG Manager" },
+  { id: "collider", label: "Collider Lab" },
   { id: "data", label: "Data Transforms" },
 ];
 

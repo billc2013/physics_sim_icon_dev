@@ -361,12 +361,17 @@ traversal). The chosen approach is **vector polygon union, not bitmap tracing**
    (per-element **ordered** rings; keep the existing point-cloud fn for the convex-hull
    path) + an ordered-outline / union route + a concave/`polygon` branch that emits the
    raw outline with **no hull**.
-2. [colliderSchema.js](src/lib/colliderSchema.js) — `validateConvex`'s
-   `≤ MAX_CONVEX_VERTICES` (8) is a **per-Planck-part-AFTER-decomposition** limit, NOT
-   a per-outline limit. A raw concave outline stored as `convex` will trip it. Relax/bypass
-   the cap for concave-flagged outlines and validate **winding / self-intersection**
-   instead. (Don't pre-guarantee CCW — gist's `makeCCW` normalizes it; the requirement
-   is "ordered simple closed ring," not a specific winding.)
+2. **✓ SHIPPED 2026-06-25** (alongside Collider Lab Phase 2).
+   [colliderSchema.js](src/lib/colliderSchema.js) — `validateConvex` now applies the
+   `≤ MAX_CONVEX_VERTICES` (8) cap **only to genuinely-convex polygons** (detected via
+   `isConvexPolygon` — the shapes Planck consumes directly). A concave outline stored as
+   `convex` bypasses the cap and is instead validated as a **simple, non-self-intersecting
+   closed ring** via the new exported `isSimplePolygon()` helper (O(n²) proper-crossing
+   test). We do NOT pre-guarantee CCW — gist's `makeCCW` normalizes winding; the
+   requirement is "ordered simple closed ring." File header comment corrected: the cap
+   exists **solely for Planck** (matter.js removed from gist 2026-05-11; Rapier re-hulls,
+   no limit). Verified: box4→valid, convex-9→reject (cap), cup-8/cup-12 concave→valid,
+   bow-tie→reject (self-intersect).
 3. Editor UX ([DetailModal.jsx](src/components/DetailModal.jsx) ~L812 /
    [ColliderEditor.jsx](src/components/ColliderEditor.jsx)) — flip the amber warning
    *"Polygon is concave — physics engines require convex shapes … the engine will use
@@ -411,7 +416,9 @@ generator work is the "getting ahead" track; the resumed downstream dev is gated
 
 ### 13. Collider Lab — dedicated collider view `[~]`
 
-**Phase 1 of 4 SHIPPED 2026-06-25 (read-only audit/triage surface).** Phases 2–4 ahead.
+**Phases 1–2 SHIPPED 2026-06-25** (audit/triage surface + in-place polygon editing +
+single-item download). Two Phase-2 sub-items deferred (numeric vertex table, OOB filter);
+Phases 3–4 (polygon generation, pill editor) ahead.
 
 
 Pull all collider review/editing **out of DetailModal** into a separate top-level
@@ -481,11 +488,20 @@ the sanctioned substitute for local decomposition preview (Option B, rejected).
    - **Data-quality finding:** several seeded colliders have vertices below the viewBox
      (confirmed: `dynamics_cart`, `fire_truck`, `flat_asteroid`). Pre-existing defect the
      Lab now surfaces; the fix path is Phase 2 editing.
-2. **← NEXT.** Editing in the grid — port `ColliderEditor` (carry the non-square-viewBox +
-   gutter awareness from the ground-truth view) + a **numerically-editable vertex table**
-   (type `(x,y)`, not just drag). Writes via `updatePhysicalProperties` (parent for
-   children). **Add a "⚠ N out-of-bounds" filter/sort** so the broken colliders from the
-   Phase 1 finding are one click away.
+2. **◐ CORE SHIPPED 2026-06-25.** Editing in the grid — built **directly into
+   [ColliderGroundTruth.jsx](src/components/ColliderGroundTruth.jsx)'s expandable
+   coordinate space** rather than porting `ColliderEditor` (a better call — sidesteps its
+   64×64-hardcode bug entirely, and the fixed-on-entry edit canvas is the only way to reach
+   far-off-canvas vertices). What landed: drag/add/remove vertices (`getScreenCTM` in any
+   viewBox), **"Pull in-bounds"** (clamp all verts to 0–W/0–H), Save via
+   `updatePhysicalProperties` (raw, not `wrapMutation`, so failures report accurately),
+   remount-on-`key` reset, convexity-aware validation (convex ≤8 hard gate / concave =
+   simple-ring, see Task 12 #2), OOB warning moved **below** the canvas so it never reflows
+   the handles, and a **single-item zip download** (`{name}.zip` = SVG + manifest entry via
+   shared `buildManifestEntry`; no `markExported`). **Still deferred from this phase:** the
+   **numerically-editable vertex table** (type `(x,y)`, not just drag) and the
+   **"⚠ N out-of-bounds" filter/sort** so the broken seeded colliders are one click away.
+   Editing is **convex-polygon only** so far (circle/box/compound stay read-only).
 3. Polygon generation via single-path native route + flip the concave warning
    ("forbidden" → "decomposed downstream").
 4. Pill parametric editor (the only "compound" we need near-term — drag two end-circles,

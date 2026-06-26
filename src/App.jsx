@@ -30,6 +30,34 @@ import TrashPanel from "./components/TrashPanel.jsx";
 import ColliderLab from "./components/ColliderLab.jsx";
 import DataTransformPage from "./components/data/DataTransformPage.jsx";
 
+// A single item's entry in the export manifest. Shared by the zip "Download
+// approved" flow and the Collider Lab single-item download so the two can't
+// drift — the manifest shape is a contract the gist pipeline reads. Uses
+// effectivePhysicalProperties so children carry their parent's props.
+function buildManifestEntry(item) {
+  return {
+    name: item.id,
+    display_name: item.label,
+    status: item.status,
+    version: item.version,
+    color_tag: item.colorTag,
+    parent: item.parentId ?? null,
+    physical_properties: item.effectivePhysicalProperties,
+  };
+}
+
+// Trigger a browser download of a blob under the given filename.
+function downloadBlob(filename, blob) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 export default function App() {
   const auth = useAuth();
 
@@ -633,15 +661,7 @@ function SignedInApp({ user, onSignOut }) {
         exported_at: new Date().toISOString(),
         exported_by: user.email,
         export_mode: mode,
-        items: selectedItems.map((item) => ({
-          name: item.id,
-          display_name: item.label,
-          status: item.status,
-          version: item.version,
-          color_tag: item.colorTag,
-          parent: item.parentId ?? null,
-          physical_properties: item.effectivePhysicalProperties,
-        })),
+        items: selectedItems.map(buildManifestEntry),
       };
       zip.file("manifest.json", JSON.stringify(manifest, null, 2));
     }
@@ -669,6 +689,22 @@ function SignedInApp({ user, onSignOut }) {
         `Downloaded, but failed to stamp export: ${e.message ?? e}`
       );
     }
+  };
+
+  // Collider Lab single-item download: a zip with the SVG file + a one-item
+  // manifest entry, for a quick gist sim test. Intentionally does NOT call
+  // markExported — this is a dev-test grab, not a real export, so it must not
+  // touch the stale-export tracking that the real "Download approved" flow owns.
+  const handleColliderLabDownload = async (item) => {
+    const zip = new JSZip();
+    zip.file(`${item.id}.svg`, item.svg);
+    zip.file(
+      `${item.id}.manifest.json`,
+      JSON.stringify(buildManifestEntry(item), null, 2)
+    );
+    const blob = await zip.generateAsync({ type: "blob" });
+    downloadBlob(`${item.id}.zip`, blob);
+    showToast(`Downloaded ${item.id}.zip (SVG + manifest entry)`);
   };
 
   const shellWrapperStyle = {
@@ -736,7 +772,14 @@ function SignedInApp({ user, onSignOut }) {
           userEmail={user.email}
           onSignOut={onSignOut}
         />
-        <ColliderLab items={items ?? []} />
+        <ColliderLab
+          items={items ?? []}
+          onSaveCollider={(id, collider) =>
+            svgs.updatePhysicalProperties(id, { collider })
+          }
+          onDownload={handleColliderLabDownload}
+          showToast={showToast}
+        />
       </div>
     );
   }

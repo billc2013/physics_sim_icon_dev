@@ -1,14 +1,23 @@
+import { useCallback, useRef, useState } from "react";
 import { parseViewBox, getColliderBounds } from "../lib/svgGeometry.js";
+import {
+  validateCollider,
+  isConvexPolygon,
+  isSimplePolygon,
+  MAX_CONVEX_VERTICES,
+} from "../lib/colliderSchema.js";
 import ColliderPreview from "./ColliderPreview.jsx";
 import GeometryInfo from "./GeometryInfo.jsx";
 
-// Large, grid-backed "ground truth" view of one SVG + its collider.
+// Large, grid-backed "ground truth" view of one SVG + its collider, with
+// Phase 2 IN-PLACE polygon editing.
 //
 // Three layers share the SAME coordinate space, stacked in a box whose aspect
 // ratio matches that space — so they align pixel-for-pixel with NO letterboxing:
 //   1. the icon (bottom)        — .svg-preview-host forces it to fill its rect
 //   2. the coordinate grid      — faint lines every 8 units, labels every 16
-//   3. the collider overlay     — ColliderPreview, viewBox-aware
+//   3. the collider overlay     — read-only ColliderPreview, OR (when editing)
+//                                 an interactive vertex editor in that space
 //
 // REVEAL out-of-bounds colliders: when a collider's vertices fall outside the
 // SVG's 0–W / 0–H viewBox (a common data defect — vertices below the viewBox),
@@ -17,14 +26,45 @@ import GeometryInfo from "./GeometryInfo.jsx";
 // the 0–W/0–H boundary is drawn, off-bounds vertices are marked red, and a
 // warning quantifies the overflow. This is the whole point of an audit surface.
 //
-// Read-only in Phase 1. Editing + a numerically-editable vertex table: Phase 2.
+// EDITING (Phase 2, polygon/convex only): "Edit collider" drops into a draft
+// where vertices can be dragged (including off-canvas ones, back onto the art),
+// added, removed, or pulled in-bounds en masse. The edit canvas is a FIXED
+// generous space computed on entry so the grid doesn't rescale mid-drag and
+// every vertex stays reachable. Save writes through updatePhysicalProperties
+// (merges, so mass/length/width are preserved) — durable, and in the same
+// viewBox coordinate space GIST scales from. Circle/box/compound stay
+// read-only this phase.
+//
+// Edit state is reset by REMOUNTING (the parent passes key={item.id}), so there
+// is no item-change effect to keep in sync.
 
 const TARGET = 420; // px on the longer display axis
 const STEP = 8; // minor gridline spacing (viewBox units)
 const MAJOR = 16; // labelled / darker gridline spacing
 const GUTTER = 3; // units of breathing room when expanding for out-of-bounds
+const EDIT_MARGIN = 12; // fixed generous canvas margin (units) while editing
 
-export default function ColliderGroundTruth({ item }) {
+const headerBtnStyle = {
+  fontSize: 12,
+  fontWeight: 600,
+  padding: "5px 12px",
+  borderRadius: "var(--border-radius-md)",
+  border: "0.5px solid var(--color-border-secondary)",
+  background: "var(--color-background-primary)",
+  cursor: "pointer",
+};
+
+export default function ColliderGroundTruth({
+  item,
+  onSaveCollider,
+  onDownload,
+  showToast,
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(null); // editable collider clone
+  const [editSpace, setEditSpace] = useState(null); // fixed canvas while editing
+  const [saving, setSaving] = useState(false);
+
   if (!item) {
     return (
       <div
@@ -44,11 +84,16 @@ export default function ColliderGroundTruth({ item }) {
   const W = vb.width;
   const H = vb.height;
 
-  const collider = item.effectivePhysicalProperties?.collider ?? null;
+  const storedCollider = item.effectivePhysicalProperties?.collider ?? null;
   const inherited = item.parentId != null;
+  const collider = editing ? draft : storedCollider;
+
+  // Phase 2 edits polygons only.
+  const editable = storedCollider?.type === "convex";
+
   const colBounds = collider ? getColliderBounds(collider) : null;
 
-  // Does the collider spill past the icon's viewBox on any edge?
+  // Does the (possibly draft) collider spill past the icon's viewBox?
   const overflow = colBounds
     ? {
         left: colBounds.min[0] < 0 ? colBounds.min[0] : null,
@@ -64,17 +109,11 @@ export default function ColliderGroundTruth({ item }) {
       overflow.right != null ||
       overflow.bottom != null);
 
-  // Expanded coordinate space. In-bounds → exactly the viewBox (no change).
-  let minX = 0;
-  let minY = 0;
-  let maxX = W;
-  let maxY = H;
-  if (isOob) {
-    minX = Math.min(0, colBounds.min[0]) - GUTTER;
-    minY = Math.min(0, colBounds.min[1]) - GUTTER;
-    maxX = Math.max(W, colBounds.max[0]) + GUTTER;
-    maxY = Math.max(H, colBounds.max[1]) + GUTTER;
-  }
+  // Active coordinate space. While editing it's the fixed editSpace (stable,
+  // everything reachable); read-only it expands dynamically to reveal overflow.
+  const space =
+    editing && editSpace ? editSpace : dynamicSpace(colBounds, isOob, W, H);
+  const { minX, minY, maxX, maxY } = space;
   const EW = maxX - minX;
   const EH = maxY - minY;
 
@@ -90,32 +129,113 @@ export default function ColliderGroundTruth({ item }) {
     height: `${(H / EH) * 100}%`,
   };
 
+  // ---- edit lifecycle ----
+
+  function enterEdit() {
+    const b = getColliderBounds(storedCollider);
+    setDraft(JSON.parse(JSON.stringify(storedCollider)));
+    setEditSpace({
+      minX: Math.min(0, b?.min[0] ?? 0) - EDIT_MARGIN,
+      minY: Math.min(0, b?.min[1] ?? 0) - EDIT_MARGIN,
+      maxX: Math.max(W, b?.max[0] ?? W) + EDIT_MARGIN,
+      maxY: Math.max(H, b?.max[1] ?? H) + EDIT_MARGIN,
+    });
+    setEditing(true);
+  }
+
+  function cancelEdit() {
+    setEditing(false);
+    setDraft(null);
+    setEditSpace(null);
+  }
+
+  const setVertices = (verts) => setDraft((d) => ({ ...d, vertices: verts }));
+
+  function pullInBounds() {
+    setVertices(
+      draft.vertices.map(([x, y]) => [
+        round2(Math.max(0, Math.min(W, x))),
+        round2(Math.max(0, Math.min(H, y))),
+      ])
+    );
+  }
+
+  async function save() {
+    const check = validateCollider(draft);
+    if (!check.valid) {
+      showToast?.(check.error);
+      return;
+    }
+    setSaving(true);
+    try {
+      await onSaveCollider(item.id, draft);
+      showToast?.("Collider saved");
+      cancelEdit();
+    } catch (e) {
+      showToast?.(`Save failed: ${e?.message ?? e}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const dirty =
+    editing && JSON.stringify(draft) !== JSON.stringify(storedCollider);
+
+  // Convexity decides which validity rule binds. A genuinely-convex polygon is
+  // consumed by Planck directly, so the 8-vertex cap is a hard gate. A concave
+  // outline is decomposed downstream by gist into ≤8-vertex parts, so the cap
+  // is NOT ours to enforce — it only has to be a simple (non-self-intersecting)
+  // closed ring. (Mirrors validateConvex; keep the two in sync.)
+  const polyVerts =
+    collider?.type === "convex" ? collider.vertices ?? [] : null;
+  const convexPoly = polyVerts != null && isConvexPolygon(polyVerts);
+  const concave = polyVerts != null && !convexPoly;
+  const planckCapViolated =
+    convexPoly && polyVerts.length > MAX_CONVEX_VERTICES;
+  const selfIntersects = concave && !isSimplePolygon(polyVerts);
+
   return (
     <div>
-      <div style={{ marginBottom: 8 }}>
-        <div style={{ fontSize: 15, fontWeight: 600 }}>{item.label}</div>
-        <div style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>
-          {item.id} · collider: {collider ? colliderSummary(collider) : "none"}
-          {inherited && collider ? ` · inherited from ${item.parentId}` : ""}
+      <div
+        style={{
+          marginBottom: 8,
+          display: "flex",
+          alignItems: "flex-start",
+          justifyContent: "space-between",
+          gap: 8,
+        }}
+      >
+        <div>
+          <div style={{ fontSize: 15, fontWeight: 600 }}>{item.label}</div>
+          <div style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>
+            {item.id} · collider: {collider ? colliderSummary(collider) : "none"}
+            {inherited && collider ? ` · inherited from ${item.parentId}` : ""}
+          </div>
         </div>
+        {!editing && (
+          <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+            {editable && (
+              <button onClick={enterEdit} style={headerBtnStyle}>
+                Edit collider
+              </button>
+            )}
+            {onDownload && (
+              <button
+                onClick={() => onDownload(item)}
+                title="Download this SVG + a single manifest entry to drop into gist for a quick sim test"
+                style={headerBtnStyle}
+              >
+                ↓ Download
+              </button>
+            )}
+          </div>
+        )}
       </div>
 
-      {isOob && (
-        <div
-          style={{
-            padding: "6px 10px",
-            borderRadius: "var(--border-radius-md)",
-            background: "#FEF3C7",
-            color: "#92400E",
-            fontSize: 11,
-            marginBottom: 8,
-            lineHeight: 1.4,
-          }}
-        >
-          <strong>Collider extends beyond the {W}×{H} viewBox:</strong>{" "}
-          {overflowMessage(overflow, W, H)}. Vertices in red are off-canvas —
-          GIST scales the collider to the object bbox, so these misalign with the
-          art. Likely a bad collider to fix.
+      {!editing && storedCollider && !editable && (
+        <div style={{ fontSize: 11, color: "var(--color-text-tertiary)", marginBottom: 8 }}>
+          Editing {storedCollider.type} colliders isn’t supported yet — this
+          phase edits polygons only.
         </div>
       )}
 
@@ -146,36 +266,433 @@ export default function ColliderGroundTruth({ item }) {
           vbHeight={H}
         />
 
-        {/* Layer 3 — the collider overlay + out-of-bounds vertex markers */}
-        {collider && (
-          <>
-            <ColliderPreview
-              collider={collider}
-              viewBoxMinX={minX}
-              viewBoxMinY={minY}
-              viewBoxWidth={EW}
-              viewBoxHeight={EH}
-            />
-            {isOob && (
-              <OutOfBoundsMarkers
+        {/* Layer 3 — collider overlay: interactive editor when editing, else
+            the static preview + out-of-bounds vertex markers */}
+        {editing && draft?.type === "convex" ? (
+          <PolygonEditLayer
+            vertices={draft.vertices}
+            onChange={setVertices}
+            space={space}
+            vbWidth={W}
+            vbHeight={H}
+          />
+        ) : (
+          collider && (
+            <>
+              <ColliderPreview
                 collider={collider}
-                vbWidth={W}
-                vbHeight={H}
-                minX={minX}
-                minY={minY}
-                EW={EW}
-                EH={EH}
+                viewBoxMinX={minX}
+                viewBoxMinY={minY}
+                viewBoxWidth={EW}
+                viewBoxHeight={EH}
               />
-            )}
-          </>
+              {isOob && (
+                <OutOfBoundsMarkers
+                  collider={collider}
+                  vbWidth={W}
+                  vbHeight={H}
+                  minX={minX}
+                  minY={minY}
+                  EW={EW}
+                  EH={EH}
+                />
+              )}
+            </>
+          )
         )}
       </div>
+
+      {/* Out-of-bounds warning lives BELOW the canvas so toggling it (e.g. as a
+          vertex is dragged past the edge) never reflows the icon/grid/handles —
+          the canvas stays anchored; only the toolbar/readout below shift. */}
+      {isOob && (
+        <div
+          style={{
+            padding: "6px 10px",
+            borderRadius: "var(--border-radius-md)",
+            background: "#FEF3C7",
+            color: "#92400E",
+            fontSize: 11,
+            marginTop: 8,
+            lineHeight: 1.4,
+          }}
+        >
+          <strong>Collider extends beyond the {W}×{H} viewBox:</strong>{" "}
+          {overflowMessage(overflow, W, H)}. Vertices in red are off-canvas —
+          GIST scales the collider to the object bbox, so these misalign with the
+          art.{" "}
+          {editing
+            ? "Drag them onto the art or use “Pull in-bounds”."
+            : "Likely a bad collider to fix — click “Edit collider”."}
+        </div>
+      )}
+
+      {editing && (
+        <EditToolbar
+          dirty={dirty}
+          saving={saving}
+          isOob={isOob}
+          concave={concave}
+          planckCapViolated={planckCapViolated}
+          selfIntersects={selfIntersects}
+          vertCount={draft?.vertices?.length ?? 0}
+          onPullInBounds={pullInBounds}
+          onSave={save}
+          onCancel={cancelEdit}
+        />
+      )}
 
       <div style={{ marginTop: 8 }}>
         <GeometryInfo svg={item.svg} collider={collider} />
       </div>
 
       <ColliderReadout collider={collider} vbWidth={W} vbHeight={H} />
+    </div>
+  );
+}
+
+// Read-only coordinate space: exactly the viewBox when in-bounds, expanded
+// with a gutter when the collider overflows so off-canvas vertices show.
+function dynamicSpace(colBounds, isOob, W, H) {
+  if (!isOob || !colBounds) return { minX: 0, minY: 0, maxX: W, maxY: H };
+  return {
+    minX: Math.min(0, colBounds.min[0]) - GUTTER,
+    minY: Math.min(0, colBounds.min[1]) - GUTTER,
+    maxX: Math.max(W, colBounds.max[0]) + GUTTER,
+    maxY: Math.max(H, colBounds.max[1]) + GUTTER,
+  };
+}
+
+// Interactive polygon editor laid over the icon/grid, in the SAME coordinate
+// space (so it aligns pixel-for-pixel). Unlike the legacy ColliderEditor this
+// takes its viewBox from `space` rather than hardcoding 64×64 — which is what
+// lets it reach and reposition vertices that sit far outside the icon bounds.
+//
+// Mouse → viewBox-unit conversion uses getScreenCTM().inverse(), which accounts
+// for the box's actual rendered size and the viewBox transform automatically.
+// The root <svg> is pointer-transparent; only the handles capture events, so
+// the polygon interior never swallows clicks.
+function PolygonEditLayer({ vertices, onChange, space, vbWidth, vbHeight }) {
+  const svgRef = useRef(null);
+  const [dragIdx, setDragIdx] = useState(null);
+
+  const { minX, minY, maxX, maxY } = space;
+  const EW = maxX - minX;
+  const EH = maxY - minY;
+  const maxDim = Math.max(EW, EH);
+
+  // The 8-vertex cap only binds while the polygon is genuinely convex (Planck
+  // eats it directly). Once it's a concave outline, gist decomposes it
+  // downstream, so adding vertices past 8 is allowed.
+  const convex = isConvexPolygon(vertices);
+  const atMax = convex && vertices.length >= MAX_CONVEX_VERTICES;
+  const atMin = vertices.length <= 3;
+
+  // Handle sizes scale with zoom so they stay a consistent on-screen size.
+  const vertR = maxDim / 38;
+  const hitR = maxDim / 20;
+  const midR = maxDim / 52;
+  const labelFont = maxDim / 34;
+
+  const clientToSvg = useCallback((clientX, clientY) => {
+    const svg = svgRef.current;
+    if (!svg) return [0, 0];
+    const pt = svg.createSVGPoint();
+    pt.x = clientX;
+    pt.y = clientY;
+    const ctm = svg.getScreenCTM();
+    if (!ctm) return [0, 0];
+    const p = pt.matrixTransform(ctm.inverse());
+    return [p.x, p.y];
+  }, []);
+
+  // Keep handles on the canvas, but allow the full edit space (incl. gutter)
+  // so off-canvas vertices remain draggable.
+  const clampToSpace = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+  const handlePointerMove = useCallback(
+    (e) => {
+      if (dragIdx === null) return;
+      const [x, y] = clientToSvg(e.clientX, e.clientY);
+      const next = vertices.map((v, i) =>
+        i === dragIdx
+          ? [
+              round2(clampToSpace(x, minX, maxX)),
+              round2(clampToSpace(y, minY, maxY)),
+            ]
+          : v
+      );
+      onChange(next);
+    },
+    [dragIdx, vertices, onChange, clientToSvg, minX, minY, maxX, maxY]
+  );
+
+  const handlePointerUp = useCallback(() => setDragIdx(null), []);
+
+  const handlePointerDown = useCallback((e, idx) => {
+    e.preventDefault();
+    e.stopPropagation();
+    e.target.setPointerCapture(e.pointerId);
+    setDragIdx(idx);
+  }, []);
+
+  const addVertex = useCallback(
+    (edgeIdx) => {
+      if (atMax) return;
+      const a = vertices[edgeIdx];
+      const b = vertices[(edgeIdx + 1) % vertices.length];
+      const mid = [round2((a[0] + b[0]) / 2), round2((a[1] + b[1]) / 2)];
+      const next = [...vertices];
+      next.splice(edgeIdx + 1, 0, mid);
+      onChange(next);
+    },
+    [vertices, onChange, atMax]
+  );
+
+  const removeVertex = useCallback(
+    (idx) => {
+      if (atMin) return;
+      onChange(vertices.filter((_, i) => i !== idx));
+    },
+    [vertices, onChange, atMin]
+  );
+
+  const midpoints = atMax
+    ? []
+    : vertices.map((a, i) => {
+        const b = vertices[(i + 1) % vertices.length];
+        return { x: (a[0] + b[0]) / 2, y: (a[1] + b[1]) / 2, edgeIdx: i };
+      });
+
+  const points = vertices.map((v) => v.join(",")).join(" ");
+
+  return (
+    <svg
+      ref={svgRef}
+      viewBox={`${minX} ${minY} ${EW} ${EH}`}
+      preserveAspectRatio="xMidYMid meet"
+      style={{
+        position: "absolute",
+        inset: 0,
+        width: "100%",
+        height: "100%",
+        pointerEvents: "none", // only handles below opt back in
+        overflow: "visible",
+        touchAction: "none",
+      }}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      onPointerLeave={handlePointerUp}
+    >
+      <polygon
+        points={points}
+        fill="rgba(59, 130, 246, 0.12)"
+        stroke={convex ? "#3B82F6" : "#F59E0B"}
+        strokeWidth={maxDim / 150}
+        strokeDasharray={`${maxDim / 40} ${maxDim / 80}`}
+      />
+
+      {/* Edge "+" midpoints */}
+      {midpoints.map((mp) => (
+        <g
+          key={`mid-${mp.edgeIdx}`}
+          style={{ cursor: "pointer", pointerEvents: "auto" }}
+          onClick={() => addVertex(mp.edgeIdx)}
+        >
+          <circle cx={mp.x} cy={mp.y} r={hitR * 0.6} fill="transparent" />
+          <circle
+            cx={mp.x}
+            cy={mp.y}
+            r={midR}
+            fill="white"
+            stroke="#10B981"
+            strokeWidth={maxDim / 250}
+          />
+          <text
+            x={mp.x}
+            y={mp.y}
+            textAnchor="middle"
+            dominantBaseline="central"
+            fill="#10B981"
+            fontSize={labelFont}
+            fontWeight="bold"
+            style={{ pointerEvents: "none" }}
+          >
+            +
+          </text>
+        </g>
+      ))}
+
+      {/* Vertex handles */}
+      {vertices.map(([vx, vy], idx) => {
+        const dragging = dragIdx === idx;
+        const oobVert = vx < 0 || vy < 0 || vx > vbWidth || vy > vbHeight;
+        const fill = dragging
+          ? "#1D4ED8"
+          : oobVert
+          ? "#EF4444"
+          : "#3B82F6";
+        return (
+          <g key={`v-${idx}`}>
+            <circle
+              cx={vx}
+              cy={vy}
+              r={hitR}
+              fill="transparent"
+              style={{
+                cursor: dragging ? "grabbing" : "grab",
+                pointerEvents: "auto",
+              }}
+              onPointerDown={(e) => handlePointerDown(e, idx)}
+            />
+            <circle
+              cx={vx}
+              cy={vy}
+              r={vertR}
+              fill={fill}
+              stroke="white"
+              strokeWidth={maxDim / 250}
+              style={{ pointerEvents: "none" }}
+            />
+            <text
+              x={vx}
+              y={vy}
+              textAnchor="middle"
+              dominantBaseline="central"
+              fill="white"
+              fontSize={labelFont * 0.8}
+              fontWeight="bold"
+              style={{ pointerEvents: "none" }}
+            >
+              {idx}
+            </text>
+            {!atMin && (
+              <g
+                style={{ cursor: "pointer", pointerEvents: "auto" }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  removeVertex(idx);
+                }}
+              >
+                <circle
+                  cx={vx + vertR * 1.4}
+                  cy={vy - vertR * 1.4}
+                  r={midR * 1.2}
+                  fill="#EF4444"
+                  stroke="white"
+                  strokeWidth={maxDim / 300}
+                />
+                <text
+                  x={vx + vertR * 1.4}
+                  y={vy - vertR * 1.4}
+                  textAnchor="middle"
+                  dominantBaseline="central"
+                  fill="white"
+                  fontSize={labelFont * 0.75}
+                  fontWeight="bold"
+                  style={{ pointerEvents: "none" }}
+                >
+                  &times;
+                </text>
+              </g>
+            )}
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+// Buttons + live validation while editing a polygon collider.
+function EditToolbar({
+  dirty,
+  saving,
+  isOob,
+  concave,
+  planckCapViolated,
+  selfIntersects,
+  vertCount,
+  onPullInBounds,
+  onSave,
+  onCancel,
+}) {
+  const blocked = planckCapViolated || selfIntersects;
+  const saveDisabled = !dirty || saving || blocked;
+  return (
+    <div style={{ marginTop: 10 }}>
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+        <button
+          onClick={onSave}
+          disabled={saveDisabled}
+          style={{
+            fontSize: 12,
+            fontWeight: 600,
+            padding: "6px 14px",
+            borderRadius: "var(--border-radius-md)",
+            border: "none",
+            background: saveDisabled
+              ? "var(--color-border-secondary)"
+              : "var(--color-text-info, #2563EB)",
+            color: "white",
+            cursor: saveDisabled ? "default" : "pointer",
+          }}
+        >
+          {saving ? "Saving…" : "Save collider"}
+        </button>
+        <button
+          onClick={onCancel}
+          disabled={saving}
+          style={{
+            fontSize: 12,
+            padding: "6px 12px",
+            borderRadius: "var(--border-radius-md)",
+            border: "0.5px solid var(--color-border-secondary)",
+            background: "var(--color-background-primary)",
+            cursor: saving ? "default" : "pointer",
+          }}
+        >
+          Cancel
+        </button>
+        <button
+          onClick={onPullInBounds}
+          disabled={!isOob || saving}
+          title="Clamp every vertex into the 0–W / 0–H viewBox"
+          style={{
+            fontSize: 12,
+            padding: "6px 12px",
+            borderRadius: "var(--border-radius-md)",
+            border: "0.5px solid var(--color-border-secondary)",
+            background: "var(--color-background-primary)",
+            color: isOob ? undefined : "var(--color-text-tertiary)",
+            cursor: !isOob || saving ? "default" : "pointer",
+          }}
+        >
+          Pull in-bounds
+        </button>
+        <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>
+          {vertCount} vertices · drag to move · “+” adds · red × removes
+        </span>
+      </div>
+
+      {planckCapViolated && (
+        <div style={{ marginTop: 6, fontSize: 11, color: "#B45309" }}>
+          {vertCount} vertices exceeds the {MAX_CONVEX_VERTICES}-vertex Planck.js
+          limit for a <em>convex</em> polygon. Remove vertices, or reshape into a
+          concave outline — those are decomposed downstream and aren’t capped.
+        </div>
+      )}
+      {selfIntersects && (
+        <div style={{ marginTop: 6, fontSize: 11, color: "#B45309" }}>
+          Outline self-intersects — it must be a simple closed ring before saving
+          (gist can only decompose a non-self-intersecting polygon).
+        </div>
+      )}
+      {concave && !planckCapViolated && !selfIntersects && (
+        <div style={{ marginTop: 6, fontSize: 11, color: "#92400E" }}>
+          Concave outline — allowed; GIST decomposes it into ≤{MAX_CONVEX_VERTICES}
+          -vertex parts at load (no convex vertex cap here).
+        </div>
+      )}
     </div>
   );
 }
@@ -301,7 +818,7 @@ function ColliderReadout({ collider, vbWidth, vbHeight }) {
   if (!collider) {
     return (
       <div style={{ marginTop: 8, fontSize: 11, color: "var(--color-text-tertiary)" }}>
-        No collider on this item yet. Generation + editing arrive in a later phase.
+        No collider on this item yet. Generation arrives in a later phase.
       </div>
     );
   }
@@ -335,7 +852,7 @@ function ColliderReadout({ collider, vbWidth, vbHeight }) {
       >
         {rows.map((r, i) => (
           <div key={i} style={{ color: r.oob ? "#B45309" : undefined }}>
-            {r.oob ? "⚠ " : "  "}
+            {r.oob ? "⚠ " : "  "}
             {r.text}
           </div>
         ))}

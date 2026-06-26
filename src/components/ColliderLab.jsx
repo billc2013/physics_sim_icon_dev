@@ -44,7 +44,12 @@ function isConcaveOutline(item) {
   );
 }
 
-export default function ColliderLab({ items }) {
+export default function ColliderLab({
+  items,
+  onSaveCollider,
+  onDownload,
+  showToast,
+}) {
   const [selectedId, setSelectedId] = useState(null);
 
   // Parents + standalones only; skip idea_only concepts (no real renderable).
@@ -134,7 +139,13 @@ export default function ColliderLab({ items }) {
               top: 12,
             }}
           >
-            <ColliderGroundTruth item={selected} />
+            <ColliderGroundTruth
+              key={selected?.id ?? "none"}
+              item={selected}
+              onSaveCollider={onSaveCollider}
+              onDownload={onDownload}
+              showToast={showToast}
+            />
           </div>
         </div>
       )}

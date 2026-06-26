@@ -3,8 +3,20 @@
 // All coordinates are in SVG viewBox space (0–64). The downstream physics
 // engine scales to meters at load time.
 //
-// Three engines are targeted: matter.js, Planck.js, and Rapier 2D.
-// Planck.js is the binding constraint: max 8 vertices per convex polygon.
+// Two engines are targeted downstream: Planck.js and Rapier 2D. (matter.js was
+// removed from gist on 2026-05-11; legacy configs coerce to Rapier.) The
+// 8-vertex cap exists SOLELY for Planck, which consumes each convex polygon
+// directly with a hard b2_maxPolygonVertices = 8 limit; Rapier re-hulls each
+// part and has no such limit.
+//
+// CRUCIAL LAYERING: the 8-vertex limit is a per-convex-polygon, *post-
+// decomposition* property. It applies to convex/box/circle shapes Planck eats
+// directly — NOT to concave outlines, which gist decomposes into ≤8-vertex
+// parts at load (via poly-decomp, a dependency we deliberately do NOT add
+// here). So this repo enforces ≤8 only for genuinely-convex polygons; concave
+// outlines (stored as type:"convex" — the accepted misnomer) are validated as
+// simple closed rings, and the per-part limit is owned by gist where the
+// decomposition actually runs. See Dev_Tasks.md → Task 12.
 //
 // Collider data is stored in physics_svgs.physical_properties.collider.
 
@@ -79,17 +91,31 @@ function validateConvex(c) {
   if (!Array.isArray(c.vertices) || c.vertices.length < 3) {
     return { valid: false, error: "Convex needs at least 3 vertices." };
   }
-  if (c.vertices.length > MAX_CONVEX_VERTICES) {
-    return {
-      valid: false,
-      error: `Convex polygon has ${c.vertices.length} vertices; max is ${MAX_CONVEX_VERTICES} (Planck.js limit).`,
-    };
-  }
   for (let i = 0; i < c.vertices.length; i++) {
     if (!isPoint(c.vertices[i])) {
       return { valid: false, error: `Vertex ${i} is not a valid [x, y] pair.` };
     }
   }
+
+  // The 8-vertex cap is the wrong layer for concave outlines (gist decomposes
+  // those downstream into ≤8-vertex parts), so apply it only to genuinely-
+  // convex polygons — the shapes Planck consumes directly. Concave outlines
+  // just have to be a simple (non-self-intersecting) closed ring; the per-part
+  // limit is gist's to enforce after decomposition. See the file header.
+  if (isConvexPolygon(c.vertices)) {
+    if (c.vertices.length > MAX_CONVEX_VERTICES) {
+      return {
+        valid: false,
+        error: `Convex polygon has ${c.vertices.length} vertices; max is ${MAX_CONVEX_VERTICES} (Planck.js limit). Reshape into a concave outline to decompose downstream, or remove vertices.`,
+      };
+    }
+  } else if (!isSimplePolygon(c.vertices)) {
+    return {
+      valid: false,
+      error: "Concave outline self-intersects; it must be a simple closed ring for gist to decompose it.",
+    };
+  }
+
   return { valid: true };
 }
 
@@ -193,6 +219,46 @@ export function isConvexPolygon(vertices) {
     }
   }
   return true;
+}
+
+/**
+ * Check whether a polygon (vertex array) is "simple" — a closed ring whose
+ * non-adjacent edges don't cross. This is the validity condition that matters
+ * for concave outlines: poly-decomp (downstream in gist) can only decompose a
+ * simple polygon. Convex polygons are always simple; this is the meaningful
+ * gate for the concave outlines that bypass the 8-vertex cap.
+ *
+ * O(n²) proper-crossing test — fine for our ≤ ~30-vertex outlines. Shared
+ * vertices between adjacent edges are not crossings, so adjacency is skipped.
+ */
+export function isSimplePolygon(vertices) {
+  const n = vertices.length;
+  if (n < 3) return false;
+  for (let i = 0; i < n; i++) {
+    const a1 = vertices[i];
+    const a2 = vertices[(i + 1) % n];
+    for (let j = i + 1; j < n; j++) {
+      // Skip edges that share a vertex with edge i (adjacent, incl. wrap).
+      if (j === i) continue;
+      if ((i + 1) % n === j || (j + 1) % n === i) continue;
+      const b1 = vertices[j];
+      const b2 = vertices[(j + 1) % n];
+      if (segmentsProperlyIntersect(a1, a2, b1, b2)) return false;
+    }
+  }
+  return true;
+}
+
+function segmentsProperlyIntersect(p1, p2, p3, p4) {
+  const d1 = Math.sign(orient(p3, p4, p1));
+  const d2 = Math.sign(orient(p3, p4, p2));
+  const d3 = Math.sign(orient(p1, p2, p3));
+  const d4 = Math.sign(orient(p1, p2, p4));
+  return d1 !== d2 && d3 !== d4;
+}
+
+function orient(p, q, r) {
+  return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]);
 }
 
 function round(n) {

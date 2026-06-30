@@ -4,8 +4,13 @@ import {
   validateCollider,
   isConvexPolygon,
   isSimplePolygon,
+  planckReadiness,
   MAX_CONVEX_VERTICES,
 } from "../lib/colliderSchema.js";
+import {
+  computeConcaveOutline,
+  computeSilhouetteOutline,
+} from "../lib/colliderGenerator.js";
 import ColliderPreview from "./ColliderPreview.jsx";
 import GeometryInfo from "./GeometryInfo.jsx";
 
@@ -131,16 +136,68 @@ export default function ColliderGroundTruth({
 
   // ---- edit lifecycle ----
 
+  // Fixed generous canvas that contains the icon AND a (possibly off-canvas)
+  // collider, with margin, so the grid doesn't rescale mid-edit.
+  function editSpaceFor(bounds) {
+    return {
+      minX: Math.min(0, bounds?.min[0] ?? 0) - EDIT_MARGIN,
+      minY: Math.min(0, bounds?.min[1] ?? 0) - EDIT_MARGIN,
+      maxX: Math.max(W, bounds?.max[0] ?? W) + EDIT_MARGIN,
+      maxY: Math.max(H, bounds?.max[1] ?? H) + EDIT_MARGIN,
+    };
+  }
+
   function enterEdit() {
-    const b = getColliderBounds(storedCollider);
     setDraft(JSON.parse(JSON.stringify(storedCollider)));
-    setEditSpace({
-      minX: Math.min(0, b?.min[0] ?? 0) - EDIT_MARGIN,
-      minY: Math.min(0, b?.min[1] ?? 0) - EDIT_MARGIN,
-      maxX: Math.max(W, b?.max[0] ?? W) + EDIT_MARGIN,
-      maxY: Math.max(H, b?.max[1] ?? H) + EDIT_MARGIN,
-    });
+    setEditSpace(editSpaceFor(getColliderBounds(storedCollider)));
     setEditing(true);
+  }
+
+  // Task 12 spike: trace an ordered concave outline from the SVG and drop it
+  // straight into the edit UI for review. Save (if it validates as a simple
+  // ring) writes it through onSaveCollider like any hand edit.
+  function traceOutline() {
+    const { collider: traced, debug } = computeConcaveOutline(item.svg);
+    if (!traced) {
+      showToast?.(`Couldn't trace an outline (${debug?.error ?? "no geometry"}).`);
+      return;
+    }
+    setDraft(traced);
+    setEditSpace(editSpaceFor(getColliderBounds(traced)));
+    setEditing(true);
+    const sub = debug.subpaths > 1 ? `, ${debug.subpaths} subpaths ⚠` : "";
+    const rd = planckReadiness(traced);
+    showToast?.(
+      rd.level === "fail"
+        ? `${rd.message} (path trace is the wrong tool for a convex shape — try circle or hull)`
+        : `Traced ${traced.vertices.length} verts from <${debug.chosenTag}> (${debug.sampledPoints} samples${sub}) — review & Save`
+    );
+  }
+
+  // Task 12: raster silhouette trace — captures the whole concave outer
+  // boundary of a multi-shape sprite (arms and all) by tracing the rendered
+  // alpha blob, then drops it into the edit UI like a hand edit. Async (the
+  // SVG renders to canvas via an Image load).
+  async function traceSilhouette() {
+    try {
+      const { collider: traced, debug } = await computeSilhouetteOutline(item.svg);
+      if (!traced) {
+        showToast?.(`Couldn't trace silhouette (${debug?.error ?? "no geometry"}).`);
+        return;
+      }
+      setDraft(traced);
+      setEditSpace(editSpaceFor(getColliderBounds(traced)));
+      setEditing(true);
+      const parts = debug.components > 1 ? `${debug.components} parts → 1 blob, ` : "";
+      const rd = planckReadiness(traced);
+      showToast?.(
+        rd.level === "fail"
+          ? `${rd.message} (silhouette is the wrong tool for a convex blob — try circle or ≤${MAX_CONVEX_VERTICES} hull)`
+          : `Silhouette: ${traced.vertices.length} verts (${parts}${debug.contourPixels} contour px) — review & Save`
+      );
+    } catch (e) {
+      showToast?.(`Silhouette trace failed: ${e?.message ?? e}`);
+    }
   }
 
   function cancelEdit() {
@@ -214,6 +271,20 @@ export default function ColliderGroundTruth({
         </div>
         {!editing && (
           <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+            <button
+              onClick={traceOutline}
+              title="Auto-fit: trace one dominant filled path (native path sampling). Best for single-path concave shapes like a cup."
+              style={headerBtnStyle}
+            >
+              ⬡ Trace path
+            </button>
+            <button
+              onClick={traceSilhouette}
+              title="Auto-fit: trace the whole rendered silhouette (raster blob). Best for multi-shape sprites like a cactus — arms and all."
+              style={headerBtnStyle}
+            >
+              ▦ Trace silhouette
+            </button>
             {editable && (
               <button onClick={enterEdit} style={headerBtnStyle}>
                 Edit collider
@@ -231,6 +302,8 @@ export default function ColliderGroundTruth({
           </div>
         )}
       </div>
+
+      {collider && <PlanckVerdict collider={collider} />}
 
       {!editing && storedCollider && !editable && (
         <div style={{ fontSize: 11, color: "var(--color-text-tertiary)", marginBottom: 8 }}>
@@ -693,6 +766,40 @@ function EditToolbar({
           -vertex parts at load (no convex vertex cap here).
         </div>
       )}
+    </div>
+  );
+}
+
+// Authoring-time Planck-readiness verdict (see planckReadiness in
+// colliderSchema). Dev-side guidance so we don't ship Planck-hostile colliders;
+// the AUTHORITATIVE post-decomposition check lives in gist's dev build (this
+// repo can't run poly-decomp). See Dev_Tasks.md → Task 12.
+function PlanckVerdict({ collider }) {
+  const { level, message } = planckReadiness(collider);
+  const palette =
+    {
+      ok: { bg: "#DCFCE7", fg: "#166534", icon: "✓" },
+      warn: { bg: "#FEF3C7", fg: "#92400E", icon: "⚠" },
+      fail: { bg: "#FEE2E2", fg: "#991B1B", icon: "✖" },
+    }[level] ?? { bg: "#F1F5F9", fg: "#475569", icon: "·" };
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "baseline",
+        gap: 6,
+        padding: "5px 10px",
+        borderRadius: "var(--border-radius-md)",
+        background: palette.bg,
+        color: palette.fg,
+        fontSize: 11,
+        marginBottom: 8,
+        lineHeight: 1.4,
+      }}
+    >
+      <span style={{ fontWeight: 700, flexShrink: 0 }}>{palette.icon} Planck</span>
+      <span>{message}</span>
     </div>
   );
 }

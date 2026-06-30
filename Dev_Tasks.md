@@ -517,6 +517,141 @@ the sanctioned substitute for local decomposition preview (Option B, rejected).
 
 ---
 
+### 14. Manifest declares its collider coordinate space (Option B) — cross-repo `[ ]`
+
+Cross-repo note from a 2026-06-25 gist session. Source of truth for the *why*:
+[../gist/Notes_on_Concave_Colliders_Refactor.md](../gist/Notes_on_Concave_Colliders_Refactor.md)
+→ Findings **2026-06-25 "manifest collider viewBox mis-scaling FIXED"**, plus
+[../gist/parking_lot.md](../gist/parking_lot.md) (the manifest-readiness race).
+
+**What just landed in gist (context — Option A, SHIPPED + visually verified).**
+gist had a **library-wide** collider bug: its loader
+(`scaleManifestColliderToShape`) assumed every collider lived in a **64×64**
+viewBox. But our rescaled sprites are **non-square** — **172 of 208** (e.g.
+`dynamics_cart` 64×27.43, `frisbee` 64×18.29, `sled` 64×12). For those, gist
+squished the collider onto the off-64 axis and mis-centered it, so the object
+**sank into surfaces it landed on** (wheels/rim ended up *below* the collider).
+
+This was the **downstream half of the SAME non-square-viewBox problem we fixed
+upstream** in `ColliderGroundTruth` (the aspect-correct view that sidesteps the
+`ColliderEditor` 64×64-hardcode). Our re-authored colliders looked right **here**
+but sank **there**. gist's Option A fix maps **per-axis** from each sprite's true
+viewBox (square sprites unchanged; all 172 non-square corrected; cart + frisbee
+spot-checked). **Net: colliders authored in this repo's true-viewBox space now map
+correctly downstream — the Collider Lab is validated as the spot-check / rebuild
+surface (Task 13).**
+
+**What's still open — Option B (the durable contract).** Option A has gist
+*infer* the coordinate space by **fetching + parsing every SVG at load** (a
+startup fetch pass, plus a latent manifest-readiness race in gist). Option B makes
+the manifest **self-describing**: this repo emits each collider's authoring viewBox
+in the export, and gist reads it instead of inferring.
+
+- **This repo's half:** add the authoring viewBox to each manifest entry on export
+  (e.g. `"viewBox": [w, h]` or a `collider_space` field). We already know each
+  sprite's true viewBox — `ColliderGroundTruth` renders aspect-correct from it.
+  Touch the manifest builder in [App.jsx](src/App.jsx) (`handleConfirmDownload`)
+  and bump `manifest_version`.
+- **gist's half:** read the field, drop the per-SVG viewBox fetch, close the race.
+  ~10 lines (gist owns this).
+- **Joint decision (both sides must agree):** the manifest field **name + shape**
+  for the authoring viewBox. Decide once; both honor it. Same "manifest is the
+  cross-repo contract" theme as the pending `convex → polygon` rename (Task 12).
+
+**Division of labor (agreed 2026-06-25).** The Collider Lab authors/corrects
+colliders and owns the **export half** + the **overshoot cleanup** (below); gist
+owns the **loader half** + its own race. Only the field name/shape is joint.
+
+**Adjacent cleanup (this repo, low priority).** The gist audit found **54
+colliders that overshoot their sprite viewBox by 1–5 units** (benign silhouette
+imprecision — e.g. `drum` +3.7, `hamburger` +5). These are exactly what the
+Collider Lab's **out-of-bounds reveal already flags** (Task 13 Phase 1 finding).
+Triage in the Lab during Phase 2 editing; not a gist concern.
+
+**Priority: NOT urgent.** Option A already makes gist correct. Option B's payoff is
+robustness (if collider-space ever diverges from the SVG viewBox) + dropping gist's
+startup fetch + dissolving its race. **Fold into Task 12/13 work** when next
+touching export/authoring rather than doing it standalone.
+
+**Acceptance**
+- Manifest export carries each collider's authoring viewBox under an agreed field;
+  `manifest_version` bumped (and the gist consumer documented).
+- gist reads it, drops the per-SVG viewBox fetch, and the parking-lot race closes.
+- A non-square asset (cup / cart) round-trips Lab → manifest → gist and sits
+  correctly with **no gist-side SVG parsing**.
+
+---
+
+### 15. Planck-readiness warnings (authoring + gist dev build) — cross-repo `[~]`
+
+**Strategy (Bill, 2026-06-29):** GIST keeps a **two-engine adapter** (Planck +
+Rapier) with **no default** — deliberately, for the learning and to keep the
+adapter seam clean for later 3D / better-2D / cross-domain numerical engines
+(chem, bio, earth-space). So **we develop to Planck because it's the strictest
+constraint** — anything looser comes for free. This repo's job stays: (a) great
+SVGs, (b) manifests with the info GIST needs. New: surface **Planck warnings**
+so we can make good adapter decisions — **dev-build only, never production**.
+
+**Confirmed gist behavior (agent code-read 2026-06-29, cited):**
+`decomposePolygonShape` (gist `src/physics/shapeHelpers.ts:13-22`) runs
+`makeCCW` + `quickDecomp` on **every** `type:"convex"` collider (convex→1 part;
+concave→compound). **There is NO per-part ≤8 vertex cap anywhere in gist** — a
+documented-but-unimplemented gap. Live example: `dynamics_cart` decomposes to
+parts `[3,4,4,5,3,9]` — the **9-vertex part already trips it today**. Adapters:
+**Rapier** (`RapierAdapter.ts:119`) `ColliderDesc.convexHull` re-hulls every
+part → safe at any count; **Planck** (`PlanckAdapter.ts:77`)
+`new planck.Polygon(verts)` directly — **silently accepts >8 (no throw),
+undefined Box2D behavior** (a quiet correctness bug, not a crash).
+
+**The poly-decomp boundary decides where each warning can live.** This repo
+never runs poly-decomp (single-sourced in gist by design), so it only sees the
+raw outline. But `quickDecomp` (Bayazit) adds **no Steiner points** — every
+decomposed part's vertices are a subset of the outline's — which makes most of
+the verdict exactly knowable at authoring time:
+
+| Collider | Verdict (knowable here) |
+|---|---|
+| circle / box | ok |
+| convex ≤8 | ok |
+| convex >8 | **fail** — decomposition can't reduce it |
+| concave ≤8 | ok — every part is a subset ⇒ all ≤8 |
+| concave >8 | **warn** — a part *might* exceed 8; only gist dev build can confirm |
+
+**This repo's half — SHIPPED 2026-06-29:**
+- `planckReadiness(collider)` in [colliderSchema.js](src/lib/colliderSchema.js)
+  — the ruleset above, `{ level: "ok"|"warn"|"fail", message }`.
+- Collider Lab ground-truth: a colored **Planck verdict line**
+  ([ColliderGroundTruth.jsx](src/components/ColliderGroundTruth.jsx),
+  `PlanckVerdict`), live during edit (reads the draft).
+- Lab triage list: **`⚠P` / `✖P` badges** on cards
+  ([ColliderLab.jsx](src/components/ColliderLab.jsx), `planckLevel`).
+- **Wrong-tool nudge:** both auto-fit trace buttons toast a redirect when their
+  output is convex >8 ("silhouette/path is the wrong tool for a convex blob —
+  try circle or ≤8 hull").
+
+**gist's half — TODO (gist owns; resumes when gist dev does):** the
+AUTHORITATIVE post-decomposition check — only gist can compute it. In
+`decomposePolygonShape`, after `quickDecomp`, for each part with
+`length > 8`, `console.warn` **gated to dev builds** (`import.meta.env.DEV` or
+gist's equivalent) with `{ renderableName, partIndex, vertexCount }`. Resolves
+exactly the **concave >8** case this repo can only flag as `warn`. Belongs to
+gist's already-deferred "post-decomp part-vertex check" (its Notes ≈315-320).
+Do NOT add it to production builds — it's adapter-decision tooling.
+
+**Manifest: no new field (decided, against stamping).** gist already has the
+vertices, so its dev build computes the authoritative check itself — stamping a
+heuristic `planck_ready` into the manifest would only duplicate it and risk
+staleness. Keep the manifest lean. (Unrelated pending manifest change is Task
+14's authoring-viewBox.)
+
+**Acceptance**
+- ✓ Lab shows a Planck verdict per collider and badges risky ones in the list.
+- ✓ Tracing a convex >8 shape (asteroid) nudges toward circle/hull.
+- ☐ gist dev build warns on any decomposed part >8 (e.g. `dynamics_cart`'s
+  9-vert part) and is silent in production. (gist-side, pending.)
+
+---
+
 ## Completed off-task-list work
 
 ### Trash (soft delete) + rename (2026-06-24) `[x]`

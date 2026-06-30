@@ -186,6 +186,437 @@ export function computeColliderForType(svgMarkup, type) {
   }
 }
 
+// ---- Concave outer-boundary extraction (native path metrics) ----
+//
+// Task 12 SPIKE — the convex-hull path above fills the mouth of a cup/wagon
+// because extractFilledVertices returns an UNORDERED point cloud. This route
+// instead samples the dominant filled element's boundary IN ORDER, so the
+// result preserves concavity. It emits a `type:"convex"` collider (the
+// accepted-concave misnomer; gist decomposes it downstream) with the raw
+// ordered ring and NO convex hull.
+//
+// Native getTotalLength()/getPointAtLength() need a RENDERED element, so we
+// mount the SVG offscreen in the live document, sample, then remove it. This is
+// browser-only (no-op without `document`). getCTM() maps each sampled point
+// from the element's local space into viewBox units, so element transforms
+// (rotate(), nested groups) are handled for free.
+//
+// LIMITATION (single-path spike): a filled <path> with multiple subpaths (e.g.
+// a cup drawn as outer-rect + inner-rect hole under even-odd fill) traces as
+// one chain that jumps between subpaths, producing a self-intersecting ring.
+// We detect and report subpath count in debug; the multi-shape boolean-union
+// route (polygon-clipping) is the planned follow-up. The editor's validation
+// (isSimplePolygon) blocks saving a self-intersecting trace, so a bad case
+// fails loud, not silent.
+
+/**
+ * Extract an ORDERED outline ring of the dominant filled element by sampling
+ * its boundary via native SVG path metrics. Returns
+ * { ring: [[x,y], ...], debug }. `ring` is [] if nothing usable was found or
+ * if called without a DOM.
+ *
+ * @param {string} svgMarkup
+ * @param {{ sampleStep?: number }} [opts] sampleStep = viewBox units between
+ *   boundary samples (default 1.5).
+ */
+export function extractOrderedOutline(svgMarkup, opts = {}) {
+  const { sampleStep = 1.5 } = opts;
+
+  if (typeof document === "undefined") {
+    return { ring: [], debug: { strategy: "ordered-outline", error: "no-dom" } };
+  }
+
+  // Mount offscreen so getTotalLength/getPointAtLength/getCTM are live. Using
+  // innerHTML (not DOMParser) lets the HTML parser render inline SVG directly,
+  // sidestepping cross-document namespace pitfalls.
+  const host = document.createElement("div");
+  host.setAttribute("aria-hidden", "true");
+  host.style.cssText =
+    "position:absolute;left:-99999px;top:-99999px;width:0;height:0;overflow:hidden;";
+  host.innerHTML = svgMarkup;
+  document.body.appendChild(host);
+
+  try {
+    const svg = host.querySelector("svg");
+    if (!svg) {
+      return { ring: [], debug: { strategy: "ordered-outline", error: "no-svg" } };
+    }
+
+    const candidates = [...svg.querySelectorAll("path, polygon, rect, circle, ellipse")].filter(
+      (el) =>
+        el.getAttribute("fill") !== "none" &&
+        typeof el.getTotalLength === "function"
+    );
+
+    // Pick the filled element whose sampled ring encloses the most area — the
+    // silhouette for this single-path spike.
+    let best = null;
+    for (const el of candidates) {
+      const ring = sampleElementOutline(el, sampleStep);
+      if (ring.length < 3) continue;
+      const area = Math.abs(signedArea(ring));
+      if (!best || area > best.area) best = { el, ring, area };
+    }
+
+    if (!best) {
+      return {
+        ring: [],
+        debug: {
+          strategy: "ordered-outline",
+          error: "no-filled-geometry",
+          candidates: candidates.length,
+        },
+      };
+    }
+
+    return {
+      ring: best.ring,
+      debug: {
+        strategy: "ordered-outline",
+        candidates: candidates.length,
+        chosenTag: best.el.tagName.toLowerCase(),
+        subpaths: countSubpaths(best.el),
+        sampledPoints: best.ring.length,
+        area: round2(best.area),
+      },
+    };
+  } finally {
+    document.body.removeChild(host);
+  }
+}
+
+/**
+ * Compute a concave outer-boundary collider from SVG markup via the ordered
+ * sampling route, RDP-simplified to a clean ring. Emits `type:"convex"` with
+ * NO convex hull (gist decomposes the concave outline downstream).
+ *
+ * Returns { collider, debug } like the other generators; `collider` is null if
+ * extraction failed.
+ *
+ * @param {string} svgMarkup
+ * @param {{ sampleStep?: number, epsilon?: number }} [opts] epsilon = RDP
+ *   tolerance in viewBox units (default 0.6).
+ */
+export function computeConcaveOutline(svgMarkup, opts = {}) {
+  const { sampleStep = 1.5, epsilon = 0.6 } = opts;
+  const { ring, debug } = extractOrderedOutline(svgMarkup, { sampleStep });
+
+  if (ring.length < 3) {
+    return { collider: null, debug: { ...debug, strategy: "concave-outline-failed" } };
+  }
+
+  // RDP preserves order AND concavity (it never adds the cross-cuts a hull
+  // would). First/last samples are distinct ring vertices, so no dup endpoint.
+  const simplified = rdpSimplify(ring, epsilon);
+
+  return {
+    collider: {
+      type: "convex",
+      vertices: simplified.map(([x, y]) => [round2(x), round2(y)]),
+    },
+    debug: {
+      ...debug,
+      strategy: "concave-outline",
+      sampledPoints: ring.length,
+      simplifiedTo: simplified.length,
+    },
+  };
+}
+
+/** Sample an SVGGeometryElement's boundary into ordered viewBox-space points. */
+function sampleElementOutline(el, step) {
+  const total = el.getTotalLength();
+  if (!total || !isFinite(total)) return [];
+
+  const ctm = el.getCTM(); // element local units → viewBox units (excludes viewBox→px)
+  const n = Math.max(8, Math.ceil(total / step));
+  const pts = [];
+  for (let i = 0; i < n; i++) {
+    let p = el.getPointAtLength((i / n) * total);
+    if (ctm) p = p.matrixTransform(ctm);
+    pts.push([round2(p.x), round2(p.y)]);
+  }
+  return pts;
+}
+
+/** Signed area (shoelace) — sign encodes winding; magnitude is the area. */
+function signedArea(vertices) {
+  let area = 0;
+  for (let i = 0; i < vertices.length; i++) {
+    const j = (i + 1) % vertices.length;
+    area += vertices[i][0] * vertices[j][1] - vertices[j][0] * vertices[i][1];
+  }
+  return area / 2;
+}
+
+/** Count subpaths in a <path> (each M/m starts one). 1 for non-path elements. */
+function countSubpaths(el) {
+  if (el.tagName.toLowerCase() !== "path") return 1;
+  const d = el.getAttribute("d") || "";
+  const m = d.match(/[Mm]/g);
+  return m ? m.length : 1;
+}
+
+// ---- Raster silhouette trace (multi-shape concave outer boundary) ----
+//
+// Task 12 — the structure-agnostic capture tool. Where the ordered-outline
+// route above traces ONE filled element, this renders the WHOLE SVG to an
+// offscreen canvas and boundary-traces the rendered alpha silhouette. It does
+// not care how the art is built — N filled shapes, group transforms, rounded
+// corners, overlapping tones — so it captures the entire outer boundary
+// "arms and all" for connected multi-shape sprites (e.g. a cactus = trunk +
+// arms). Emits a `type:"convex"` collider with the raw ordered ring, NO hull.
+//
+// Tradeoff: the raw contour is pixel-stepped, so we supersample (default 4×)
+// and RDP-simplify. For axis-aligned art the steps land on the real edges;
+// rounded corners become a couple of chamfer segments after RDP. Browser-only
+// (canvas + Image); no-op without a DOM. The render path is the same one the
+// browser uses to paint the icon, so it's the true silhouette, not an
+// approximation of the source geometry.
+
+/**
+ * Trace the rendered alpha silhouette of an SVG into an ordered ring of the
+ * largest connected blob. Returns a Promise<{ ring: [[x,y],...], debug }>.
+ *
+ * @param {string} svgMarkup
+ * @param {{ supersample?: number, alphaThreshold?: number }} [opts]
+ */
+export async function traceSilhouetteRaster(svgMarkup, opts = {}) {
+  const { supersample = 4, alphaThreshold = 32 } = opts;
+
+  if (typeof document === "undefined" || typeof Image === "undefined") {
+    return { ring: [], debug: { strategy: "raster-silhouette", error: "no-dom" } };
+  }
+
+  const vb = readViewBox(svgMarkup);
+  const W = Math.max(1, Math.round(vb.width * supersample));
+  const H = Math.max(1, Math.round(vb.height * supersample));
+
+  const canvas = document.createElement("canvas");
+  canvas.width = W;
+  canvas.height = H;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+  // The Image needs an intrinsic size or some browsers paint nothing from a
+  // viewBox-only SVG — give the root explicit width/height.
+  const sized = withExplicitSize(svgMarkup, vb.width, vb.height);
+  const blob = new Blob([sized], { type: "image/svg+xml" });
+  const url = URL.createObjectURL(blob);
+
+  try {
+    const img = new Image();
+    await new Promise((resolve, reject) => {
+      img.onload = resolve;
+      img.onerror = () => reject(new Error("SVG image failed to load"));
+      img.src = url;
+    });
+    ctx.drawImage(img, 0, 0, W, H);
+
+    let data;
+    try {
+      data = ctx.getImageData(0, 0, W, H).data;
+    } catch {
+      return { ring: [], debug: { strategy: "raster-silhouette", error: "canvas-tainted" } };
+    }
+
+    const grid = new Uint8Array(W * H);
+    let filled = 0;
+    for (let i = 0; i < W * H; i++) {
+      if (data[i * 4 + 3] > alphaThreshold) {
+        grid[i] = 1;
+        filled++;
+      }
+    }
+    if (filled < 9) {
+      return { ring: [], debug: { strategy: "raster-silhouette", error: "empty-render", filled } };
+    }
+
+    // Trace only the largest blob so stray AA speckle / detached marks don't
+    // hijack the start pixel.
+    const { keep, components, largest } = largestComponent(grid, W, H);
+    const contourPx = mooreTrace(keep, W, H);
+    if (contourPx.length < 3) {
+      return { ring: [], debug: { strategy: "raster-silhouette", error: "no-contour" } };
+    }
+
+    // Pixel centers → viewBox units.
+    const ring = contourPx.map(([x, y]) => [(x + 0.5) / supersample, (y + 0.5) / supersample]);
+
+    return {
+      ring,
+      debug: {
+        strategy: "raster-silhouette",
+        supersample,
+        components,
+        largestPixels: largest,
+        contourPixels: contourPx.length,
+      },
+    };
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+/**
+ * Compute a concave outer-boundary collider via the raster silhouette route,
+ * RDP-simplified. Emits `type:"convex"` with NO hull. Returns a
+ * Promise<{ collider, debug }>; collider is null on failure.
+ *
+ * @param {string} svgMarkup
+ * @param {{ supersample?: number, alphaThreshold?: number, epsilon?: number }} [opts]
+ *   epsilon = RDP tolerance in viewBox units (default 0.8).
+ */
+export async function computeSilhouetteOutline(svgMarkup, opts = {}) {
+  const { epsilon = 0.8 } = opts;
+  const { ring, debug } = await traceSilhouetteRaster(svgMarkup, opts);
+
+  if (ring.length < 3) {
+    return { collider: null, debug: { ...debug, strategy: "silhouette-failed" } };
+  }
+
+  const simplified = rdpSimplify(ring, epsilon);
+
+  return {
+    collider: {
+      type: "convex",
+      vertices: simplified.map(([x, y]) => [round2(x), round2(y)]),
+    },
+    debug: {
+      ...debug,
+      strategy: "raster-silhouette",
+      contourPixels: ring.length,
+      simplifiedTo: simplified.length,
+    },
+  };
+}
+
+/** Read viewBox (or width/height) without importing svgGeometry (avoids a
+ *  circular import — svgGeometry imports extractFilledVertices from here). */
+function readViewBox(markup) {
+  const vb = markup.match(
+    /viewBox\s*=\s*["']\s*[-\d.eE]+\s+[-\d.eE]+\s+([-\d.eE]+)\s+([-\d.eE]+)/
+  );
+  if (vb) return { width: parseFloat(vb[1]), height: parseFloat(vb[2]) };
+  const wm = markup.match(/\bwidth\s*=\s*["']?([\d.]+)/);
+  const hm = markup.match(/\bheight\s*=\s*["']?([\d.]+)/);
+  return { width: wm ? parseFloat(wm[1]) : 64, height: hm ? parseFloat(hm[1]) : 64 };
+}
+
+/** Add explicit width/height to the root <svg> so an Image has intrinsic size. */
+function withExplicitSize(markup, w, h) {
+  try {
+    const doc = new DOMParser().parseFromString(markup, "image/svg+xml");
+    const svg = doc.querySelector("svg");
+    if (!svg) return markup;
+    svg.setAttribute("width", String(w));
+    svg.setAttribute("height", String(h));
+    return new XMLSerializer().serializeToString(svg);
+  } catch {
+    return markup;
+  }
+}
+
+/** Keep only the largest 8-connected component; return its mask + stats. */
+function largestComponent(grid, w, h) {
+  const labels = new Int32Array(w * h);
+  let cur = 0;
+  let best = 0;
+  let bestSize = 0;
+  const stack = [];
+
+  for (let i = 0; i < w * h; i++) {
+    if (!grid[i] || labels[i] !== 0) continue;
+    cur++;
+    let size = 0;
+    stack.length = 0;
+    stack.push(i);
+    labels[i] = cur;
+    while (stack.length) {
+      const idx = stack.pop();
+      size++;
+      const x = idx % w;
+      const y = (idx / w) | 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (dx === 0 && dy === 0) continue;
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+          const nidx = ny * w + nx;
+          if (grid[nidx] && labels[nidx] === 0) {
+            labels[nidx] = cur;
+            stack.push(nidx);
+          }
+        }
+      }
+    }
+    if (size > bestSize) {
+      bestSize = size;
+      best = cur;
+    }
+  }
+
+  const keep = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) if (labels[i] === best) keep[i] = 1;
+  return { keep, components: cur, largest: bestSize };
+}
+
+/**
+ * Moore-neighbor boundary tracing of the outer contour of a binary blob.
+ * Returns an ordered list of boundary pixels [[x,y], ...]. Simple
+ * return-to-start stop — fine for thick (supersampled) blobs with no 1px
+ * pinch points.
+ */
+function mooreTrace(grid, w, h) {
+  const at = (x, y) => x >= 0 && y >= 0 && x < w && y < h && grid[y * w + x] === 1;
+
+  // First filled pixel in raster scan — a convex corner of the outer contour.
+  let sx = -1;
+  let sy = -1;
+  for (let y = 0; y < h && sy < 0; y++) {
+    for (let x = 0; x < w; x++) {
+      if (grid[y * w + x]) {
+        sx = x;
+        sy = y;
+        break;
+      }
+    }
+  }
+  if (sx < 0) return [];
+
+  // 8 neighbors clockwise from East.
+  const dirs = [
+    [1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1],
+  ];
+
+  const contour = [[sx, sy]];
+  let cx = sx;
+  let cy = sy;
+  let backDir = 4; // came from the West (raster scan order)
+  const maxSteps = 8 * w * h;
+
+  for (let step = 0; step < maxSteps; step++) {
+    // Sweep clockwise starting just past the backtrack; first filled neighbor
+    // is the next boundary pixel.
+    let nd = -1;
+    for (let i = 1; i <= 8; i++) {
+      const d = (backDir + i) % 8;
+      if (at(cx + dirs[d][0], cy + dirs[d][1])) {
+        nd = d;
+        break;
+      }
+    }
+    if (nd < 0) break; // isolated pixel
+    cx += dirs[nd][0];
+    cy += dirs[nd][1];
+    backDir = (nd + 4) % 8; // direction from the new pixel back to the old
+    if (cx === sx && cy === sy) break;
+    contour.push([cx, cy]);
+  }
+
+  return contour;
+}
+
 // ---- SVG Parsing ----
 
 /**

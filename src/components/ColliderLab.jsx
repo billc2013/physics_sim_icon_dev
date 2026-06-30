@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { isConvexPolygon } from "../lib/colliderSchema.js";
+import { isConvexPolygon, planckReadiness } from "../lib/colliderSchema.js";
 import ColliderGroundTruth from "./ColliderGroundTruth.jsx";
 
 // Collider Lab — a dedicated audit/triage surface for colliders, decoupled
@@ -42,6 +42,15 @@ function isConcaveOutline(item) {
     Array.isArray(c.vertices) &&
     !isConvexPolygon(c.vertices)
   );
+}
+
+// Planck-readiness level for an item's collider, or null if it has none (a
+// "No collider" item isn't a Planck problem, just untriaged). "warn"/"fail"
+// drive a triage badge so Planck-risky colliders are spottable in the list.
+function planckLevel(item) {
+  const c = item.effectivePhysicalProperties?.collider;
+  if (!c) return null;
+  return planckReadiness(c).level;
 }
 
 export default function ColliderLab({
@@ -122,6 +131,7 @@ export default function ColliderLab({
                       item={it}
                       selected={it.id === selectedId}
                       concave={isConcaveOutline(it)}
+                      planck={planckLevel(it)}
                       onClick={() => setSelectedId(it.id)}
                     />
                   ))}
@@ -153,7 +163,13 @@ export default function ColliderLab({
   );
 }
 
-function LabCard({ item, selected, concave, onClick }) {
+function LabCard({ item, selected, concave, planck, onClick }) {
+  const planckBadge =
+    planck === "fail"
+      ? { bg: "#FEE2E2", fg: "#991B1B", text: "✖P", title: "Exceeds Planck's 8-vertex cap — won't decompose away" }
+      : planck === "warn"
+      ? { bg: "#FEF3C7", fg: "#92400E", text: "⚠P", title: "Concave >8 — a part may exceed Planck's 8 after decomposition; verify in gist dev build" }
+      : null;
   return (
     <div
       onClick={onClick}
@@ -185,6 +201,24 @@ function LabCard({ item, selected, concave, onClick }) {
       >
         {item.label}
       </div>
+      {planckBadge && (
+        <span
+          title={planckBadge.title}
+          style={{
+            position: "absolute",
+            top: 3,
+            left: 3,
+            fontSize: 8,
+            fontWeight: 700,
+            padding: "1px 4px",
+            borderRadius: 4,
+            background: planckBadge.bg,
+            color: planckBadge.fg,
+          }}
+        >
+          {planckBadge.text}
+        </span>
+      )}
       {concave && (
         <span
           title="Concave outline — gist decomposes this into a compound at load"

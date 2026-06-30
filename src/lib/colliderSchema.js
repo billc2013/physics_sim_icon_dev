@@ -266,6 +266,86 @@ function round(n) {
 }
 
 /**
+ * Planck-readiness verdict for a collider, computed at AUTHORING time (here),
+ * where only the raw outline is visible — gist runs poly-decomp, this repo
+ * deliberately does not. Returns { level: "ok" | "warn" | "fail", message }.
+ *
+ * The ruleset is exact except for one deferred case, because quickDecomp
+ * (Bayazit) only connects EXISTING vertices with diagonals — it never adds
+ * Steiner points — so every decomposed part's vertices are a subset of the
+ * outline's:
+ *   - circle / box                 → ok   (Planck-native)
+ *   - convex, ≤8 verts             → ok
+ *   - convex, >8 verts             → fail (decomposition can't reduce a convex
+ *                                    polygon; it stays one >8-gon)
+ *   - concave outline, ≤8 verts    → ok   (every part is a subset ⇒ all ≤8)
+ *   - concave outline, >8 verts    → warn (a part MIGHT exceed 8; only gist's
+ *                                    dev build can confirm post-decomposition)
+ *   - compound                     → worst part wins
+ *
+ * Planck silently accepts >8-vertex polygons (no throw) with undefined Box2D
+ * behavior, so "fail" is a quiet correctness bug, not a crash — hence the
+ * authoring-time warning. See Dev_Tasks.md → Task 12.
+ */
+export function planckReadiness(collider) {
+  if (!collider || typeof collider !== "object") {
+    return { level: "warn", message: "No collider." };
+  }
+
+  switch (collider.type) {
+    case "circle":
+    case "box":
+      return { level: "ok", message: `Planck-safe (${collider.type}).` };
+
+    case "convex": {
+      const verts = Array.isArray(collider.vertices) ? collider.vertices : [];
+      const n = verts.length;
+      if (isConvexPolygon(verts)) {
+        if (n > MAX_CONVEX_VERTICES) {
+          return {
+            level: "fail",
+            message: `Planck: convex ${n}-gon exceeds the ${MAX_CONVEX_VERTICES}-vertex cap — decomposition won't help. Use a circle or a ≤${MAX_CONVEX_VERTICES}-vertex hull.`,
+          };
+        }
+        return { level: "ok", message: `Planck-safe (convex, ${n} verts).` };
+      }
+      // Concave outline — gist decomposes it downstream.
+      if (n <= MAX_CONVEX_VERTICES) {
+        return {
+          level: "ok",
+          message: `Planck-safe (concave, ${n} verts — every decomposed part is ≤${MAX_CONVEX_VERTICES}).`,
+        };
+      }
+      return {
+        level: "warn",
+        message: `Planck: concave outline with ${n} verts — a part may exceed ${MAX_CONVEX_VERTICES} after decomposition. Verify in gist's dev build.`,
+      };
+    }
+
+    case "compound": {
+      const parts = Array.isArray(collider.parts) ? collider.parts : [];
+      const verdicts = parts.map(planckReadiness);
+      if (verdicts.some((v) => v.level === "fail")) {
+        return {
+          level: "fail",
+          message: `Planck: a compound part exceeds the ${MAX_CONVEX_VERTICES}-vertex cap.`,
+        };
+      }
+      if (verdicts.some((v) => v.level === "warn")) {
+        return {
+          level: "warn",
+          message: `Planck: a compound part may exceed ${MAX_CONVEX_VERTICES} verts — verify in gist's dev build.`,
+        };
+      }
+      return { level: "ok", message: `Planck-safe (compound, ${parts.length} parts).` };
+    }
+
+    default:
+      return { level: "warn", message: `Unknown collider type "${collider.type}".` };
+  }
+}
+
+/**
  * Apply a uniform scale + translate to every coordinate in a collider.
  * Used by the SVG rescale-to-fit flow to keep an aligned collider aligned
  * after the SVG's content has been moved/scaled within its viewBox.

@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { parseViewBox, getColliderBounds } from "../lib/svgGeometry.js";
 import {
   validateCollider,
@@ -303,8 +303,6 @@ export default function ColliderGroundTruth({
         )}
       </div>
 
-      {collider && <PlanckVerdict collider={collider} />}
-
       {!editing && storedCollider && !editable && (
         <div style={{ fontSize: 11, color: "var(--color-text-tertiary)", marginBottom: 8 }}>
           Editing {storedCollider.type} colliders isn’t supported yet — this
@@ -400,6 +398,10 @@ export default function ColliderGroundTruth({
         </div>
       )}
 
+      {/* Planck verdict sits BELOW the grid (with the outline/validity notes)
+          so it never shifts the icon/grid when it appears or its text changes. */}
+      {collider && <PlanckVerdict collider={collider} />}
+
       {editing && (
         <EditToolbar
           dirty={dirty}
@@ -441,13 +443,26 @@ function dynamicSpace(colBounds, isOob, W, H) {
 // takes its viewBox from `space` rather than hardcoding 64×64 — which is what
 // lets it reach and reposition vertices that sit far outside the icon bounds.
 //
-// Mouse → viewBox-unit conversion uses getScreenCTM().inverse(), which accounts
-// for the box's actual rendered size and the viewBox transform automatically.
-// The root <svg> is pointer-transparent; only the handles capture events, so
-// the polygon interior never swallows clicks.
+// Designed to stay legible with MANY vertices: no per-vertex numbers, ×'s, or
+// edge "+" ghosts. State is conveyed purely by DOT COLOR:
+//   • idle             — blue
+//   • hovered          — white (so you always know which one is under the cursor)
+//   • clicked/dragging — red (drag is 1:1: the dot is exactly where it lands)
+//   • out-of-bounds    — red ring, in any state
+// Interactions:
+//   • drag a dot to move it
+//   • click an edge to insert a vertex there (then keep dragging the new one)
+//   • Delete/Backspace removes the vertex under the cursor (or the selected one)
+//
+// Mouse → viewBox-unit conversion uses getScreenCTM().inverse(). The whole <svg>
+// is pointer-active during edit and hit-testing is geometric (nearest vertex /
+// nearest edge point), not DOM-based, so the fill never gets in the way.
 function PolygonEditLayer({ vertices, onChange, space, vbWidth, vbHeight }) {
   const svgRef = useRef(null);
   const [dragIdx, setDragIdx] = useState(null);
+  const [selectedIdx, setSelectedIdx] = useState(null);
+  const [hoverIdx, setHoverIdx] = useState(null);
+  const [onEdge, setOnEdge] = useState(false); // hovering an edge → "add" cursor
 
   const { minX, minY, maxX, maxY } = space;
   const EW = maxX - minX;
@@ -461,11 +476,11 @@ function PolygonEditLayer({ vertices, onChange, space, vbWidth, vbHeight }) {
   const atMax = convex && vertices.length >= MAX_CONVEX_VERTICES;
   const atMin = vertices.length <= 3;
 
-  // Handle sizes scale with zoom so they stay a consistent on-screen size.
-  const vertR = maxDim / 38;
-  const hitR = maxDim / 20;
-  const midR = maxDim / 52;
-  const labelFont = maxDim / 34;
+  // Sizes scale with zoom so they read consistently on screen. No size change
+  // on hover/drag — state is shown by color, not size.
+  const dotR = maxDim / 44;
+  const vertexHit = maxDim / 20; // grab/hover threshold (units)
+  const edgeHit = maxDim / 45; // edge-insert threshold (units)
 
   const clientToSvg = useCallback((clientX, clientY) => {
     const svg = svgRef.current;
@@ -479,64 +494,143 @@ function PolygonEditLayer({ vertices, onChange, space, vbWidth, vbHeight }) {
     return [p.x, p.y];
   }, []);
 
-  // Keep handles on the canvas, but allow the full edit space (incl. gutter)
-  // so off-canvas vertices remain draggable.
-  const clampToSpace = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+  const nearestVertex = useCallback(
+    (x, y) => {
+      let best = { idx: -1, dist: Infinity };
+      vertices.forEach(([vx, vy], i) => {
+        const d = Math.hypot(x - vx, y - vy);
+        if (d < best.dist) best = { idx: i, dist: d };
+      });
+      return best;
+    },
+    [vertices]
+  );
+
+  const nearestEdge = useCallback(
+    (x, y) => {
+      let best = { edgeIdx: -1, point: [0, 0], dist: Infinity };
+      const n = vertices.length;
+      for (let i = 0; i < n; i++) {
+        const proj = projectToSegment([x, y], vertices[i], vertices[(i + 1) % n]);
+        if (proj.dist < best.dist) {
+          best = { edgeIdx: i, point: proj.point, dist: proj.dist };
+        }
+      }
+      return best;
+    },
+    [vertices]
+  );
 
   const handlePointerMove = useCallback(
     (e) => {
-      if (dragIdx === null) return;
       const [x, y] = clientToSvg(e.clientX, e.clientY);
-      const next = vertices.map((v, i) =>
-        i === dragIdx
-          ? [
-              round2(clampToSpace(x, minX, maxX)),
-              round2(clampToSpace(y, minY, maxY)),
-            ]
-          : v
-      );
-      onChange(next);
+      if (dragIdx !== null) {
+        const next = vertices.map((v, i) =>
+          i === dragIdx
+            ? [round2(clamp(x, minX, maxX)), round2(clamp(y, minY, maxY))]
+            : v
+        );
+        onChange(next);
+        return;
+      }
+      const nv = nearestVertex(x, y);
+      if (nv.idx >= 0 && nv.dist <= vertexHit) {
+        setHoverIdx(nv.idx);
+        setOnEdge(false);
+        return;
+      }
+      setHoverIdx(null);
+      // Near an edge (and room to add) → signal an insert via the cursor.
+      const ne = atMax ? null : nearestEdge(x, y);
+      setOnEdge(!!ne && ne.edgeIdx >= 0 && ne.dist <= edgeHit);
     },
-    [dragIdx, vertices, onChange, clientToSvg, minX, minY, maxX, maxY]
+    [dragIdx, vertices, onChange, clientToSvg, nearestVertex, nearestEdge, atMax, vertexHit, edgeHit, minX, minY, maxX, maxY]
+  );
+
+  const handlePointerDown = useCallback(
+    (e) => {
+      e.preventDefault();
+      const [x, y] = clientToSvg(e.clientX, e.clientY);
+      const nv = nearestVertex(x, y);
+      if (nv.idx >= 0 && nv.dist <= vertexHit) {
+        setSelectedIdx(nv.idx);
+        setDragIdx(nv.idx);
+        svgRef.current?.setPointerCapture(e.pointerId);
+        return;
+      }
+      if (!atMax) {
+        const ne = nearestEdge(x, y);
+        if (ne.edgeIdx >= 0 && ne.dist <= edgeHit) {
+          const insertAt = ne.edgeIdx + 1;
+          const next = [...vertices];
+          next.splice(insertAt, 0, [round2(ne.point[0]), round2(ne.point[1])]);
+          onChange(next);
+          setSelectedIdx(insertAt);
+          setDragIdx(insertAt);
+          svgRef.current?.setPointerCapture(e.pointerId);
+          return;
+        }
+      }
+      setSelectedIdx(null); // clicked empty space — deselect
+    },
+    [clientToSvg, nearestVertex, nearestEdge, atMax, vertices, onChange, vertexHit, edgeHit]
   );
 
   const handlePointerUp = useCallback(() => setDragIdx(null), []);
-
-  const handlePointerDown = useCallback((e, idx) => {
-    e.preventDefault();
-    e.stopPropagation();
-    e.target.setPointerCapture(e.pointerId);
-    setDragIdx(idx);
+  const handlePointerLeave = useCallback(() => {
+    setDragIdx(null);
+    setHoverIdx(null);
+    setOnEdge(false);
   }, []);
-
-  const addVertex = useCallback(
-    (edgeIdx) => {
-      if (atMax) return;
-      const a = vertices[edgeIdx];
-      const b = vertices[(edgeIdx + 1) % vertices.length];
-      const mid = [round2((a[0] + b[0]) / 2), round2((a[1] + b[1]) / 2)];
-      const next = [...vertices];
-      next.splice(edgeIdx + 1, 0, mid);
-      onChange(next);
-    },
-    [vertices, onChange, atMax]
-  );
 
   const removeVertex = useCallback(
     (idx) => {
-      if (atMin) return;
+      if (atMin || idx == null) return;
       onChange(vertices.filter((_, i) => i !== idx));
+      setSelectedIdx(null);
+      setHoverIdx(null);
     },
     [vertices, onChange, atMin]
   );
 
-  const midpoints = atMax
-    ? []
-    : vertices.map((a, i) => {
-        const b = vertices[(i + 1) % vertices.length];
-        return { x: (a[0] + b[0]) / 2, y: (a[1] + b[1]) / 2, edgeIdx: i };
-      });
+  // Delete/Backspace removes the vertex under the cursor, else the dragged one,
+  // else the last-selected (red) one. A ref carries live values so the listener
+  // binds once. Ignore the keys while a text field is focused.
+  const deleteTarget = hoverIdx ?? dragIdx ?? selectedIdx;
+  const kbRef = useRef({});
+  useEffect(() => {
+    kbRef.current = { deleteTarget, atMin, removeVertex };
+  });
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key !== "Delete" && e.key !== "Backspace") return;
+      const t = e.target;
+      if (
+        t &&
+        (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)
+      )
+        return;
+      const { deleteTarget, atMin, removeVertex } = kbRef.current;
+      if (deleteTarget != null && !atMin) {
+        e.preventDefault();
+        removeVertex(deleteTarget);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
+  const cursor =
+    dragIdx !== null
+      ? "grabbing"
+      : hoverIdx !== null
+      ? "grab"
+      : onEdge
+      ? "copy" // arrow with a "+" — a click here inserts a vertex
+      : "default";
+  const clickedIdx = dragIdx ?? selectedIdx; // drawn red
   const points = vertices.map((v) => v.join(",")).join(" ");
 
   return (
@@ -549,13 +643,15 @@ function PolygonEditLayer({ vertices, onChange, space, vbWidth, vbHeight }) {
         inset: 0,
         width: "100%",
         height: "100%",
-        pointerEvents: "none", // only handles below opt back in
+        pointerEvents: "auto",
         overflow: "visible",
         touchAction: "none",
+        cursor,
       }}
       onPointerMove={handlePointerMove}
+      onPointerDown={handlePointerDown}
       onPointerUp={handlePointerUp}
-      onPointerLeave={handlePointerUp}
+      onPointerLeave={handlePointerLeave}
     >
       <polygon
         points={points}
@@ -565,111 +661,25 @@ function PolygonEditLayer({ vertices, onChange, space, vbWidth, vbHeight }) {
         strokeDasharray={`${maxDim / 40} ${maxDim / 80}`}
       />
 
-      {/* Edge "+" midpoints */}
-      {midpoints.map((mp) => (
-        <g
-          key={`mid-${mp.edgeIdx}`}
-          style={{ cursor: "pointer", pointerEvents: "auto" }}
-          onClick={() => addVertex(mp.edgeIdx)}
-        >
-          <circle cx={mp.x} cy={mp.y} r={hitR * 0.6} fill="transparent" />
-          <circle
-            cx={mp.x}
-            cy={mp.y}
-            r={midR}
-            fill="white"
-            stroke="#10B981"
-            strokeWidth={maxDim / 250}
-          />
-          <text
-            x={mp.x}
-            y={mp.y}
-            textAnchor="middle"
-            dominantBaseline="central"
-            fill="#10B981"
-            fontSize={labelFont}
-            fontWeight="bold"
-            style={{ pointerEvents: "none" }}
-          >
-            +
-          </text>
-        </g>
-      ))}
-
-      {/* Vertex handles */}
+      {/* Vertex dots — state by color: red = clicked/dragging, white = hovered,
+          blue = idle; a red ring flags out-of-bounds in any state. */}
       {vertices.map(([vx, vy], idx) => {
-        const dragging = dragIdx === idx;
         const oobVert = vx < 0 || vy < 0 || vx > vbWidth || vy > vbHeight;
-        const fill = dragging
-          ? "#1D4ED8"
-          : oobVert
-          ? "#EF4444"
-          : "#3B82F6";
+        const clicked = idx === clickedIdx;
+        const hovered = !clicked && idx === hoverIdx;
+        const fill = clicked ? "#EF4444" : hovered ? "#FFFFFF" : "#3B82F6";
+        const stroke = oobVert ? "#EF4444" : hovered ? "#1D4ED8" : "white";
         return (
-          <g key={`v-${idx}`}>
-            <circle
-              cx={vx}
-              cy={vy}
-              r={hitR}
-              fill="transparent"
-              style={{
-                cursor: dragging ? "grabbing" : "grab",
-                pointerEvents: "auto",
-              }}
-              onPointerDown={(e) => handlePointerDown(e, idx)}
-            />
-            <circle
-              cx={vx}
-              cy={vy}
-              r={vertR}
-              fill={fill}
-              stroke="white"
-              strokeWidth={maxDim / 250}
-              style={{ pointerEvents: "none" }}
-            />
-            <text
-              x={vx}
-              y={vy}
-              textAnchor="middle"
-              dominantBaseline="central"
-              fill="white"
-              fontSize={labelFont * 0.8}
-              fontWeight="bold"
-              style={{ pointerEvents: "none" }}
-            >
-              {idx}
-            </text>
-            {!atMin && (
-              <g
-                style={{ cursor: "pointer", pointerEvents: "auto" }}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  removeVertex(idx);
-                }}
-              >
-                <circle
-                  cx={vx + vertR * 1.4}
-                  cy={vy - vertR * 1.4}
-                  r={midR * 1.2}
-                  fill="#EF4444"
-                  stroke="white"
-                  strokeWidth={maxDim / 300}
-                />
-                <text
-                  x={vx + vertR * 1.4}
-                  y={vy - vertR * 1.4}
-                  textAnchor="middle"
-                  dominantBaseline="central"
-                  fill="white"
-                  fontSize={labelFont * 0.75}
-                  fontWeight="bold"
-                  style={{ pointerEvents: "none" }}
-                >
-                  &times;
-                </text>
-              </g>
-            )}
-          </g>
+          <circle
+            key={`v-${idx}`}
+            cx={vx}
+            cy={vy}
+            r={dotR}
+            fill={fill}
+            stroke={stroke}
+            strokeWidth={oobVert || hovered ? maxDim / 170 : maxDim / 300}
+            style={{ pointerEvents: "none" }}
+          />
         );
       })}
     </svg>
@@ -743,7 +753,8 @@ function EditToolbar({
           Pull in-bounds
         </button>
         <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>
-          {vertCount} vertices · drag to move · “+” adds · red × removes
+          {vertCount} vertices · drag a dot to move · click an edge to add ·
+          press <kbd>Delete</kbd> to remove the vertex you're hovering or dragging
         </span>
       </div>
 
@@ -794,7 +805,7 @@ function PlanckVerdict({ collider }) {
         background: palette.bg,
         color: palette.fg,
         fontSize: 11,
-        marginBottom: 8,
+        marginTop: 8,
         lineHeight: 1.4,
       }}
     >
@@ -1046,4 +1057,16 @@ function colliderRows(c, W, H) {
 
 function round2(n) {
   return Math.round(n * 100) / 100;
+}
+
+// Nearest point on segment a→b to point p (clamped to the segment), plus the
+// distance. Used for edge hover/insert so a new vertex lands where you click.
+function projectToSegment(p, a, b) {
+  const dx = b[0] - a[0];
+  const dy = b[1] - a[1];
+  const len2 = dx * dx + dy * dy;
+  let t = len2 === 0 ? 0 : ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len2;
+  t = Math.max(0, Math.min(1, t));
+  const point = [a[0] + t * dx, a[1] + t * dy];
+  return { point, dist: Math.hypot(p[0] - point[0], p[1] - point[1]) };
 }

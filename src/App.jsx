@@ -87,6 +87,10 @@ function SignedInApp({ user, onSignOut }) {
 
   // UI state.
   const [modalItemId, setModalItemId] = useState(null);
+  // When the user clicks "Edit in Collider Lab" from DetailModal, we switch
+  // to the Collider Lab tab and preselect this id (the parent, for children).
+  // Read by ColliderLab as its initial selection on mount.
+  const [colliderLabFocusId, setColliderLabFocusId] = useState(null);
   const [filters, setFilters] = useState(new Set(STATUSES));
   const [search, setSearch] = useState("");
   const [feedbackText, setFeedbackText] = useState("");
@@ -145,6 +149,18 @@ function SignedInApp({ user, onSignOut }) {
     setReviseModelTier("standard");
     setPendingUpload(null);
   }, []);
+
+  // Jump from DetailModal to the Collider Lab, preselecting the item. For a
+  // child (color variant) the collider lives on the parent and the Lab only
+  // shows parents/standalones, so target the parent's id.
+  const handleEditInColliderLab = useCallback(
+    (item) => {
+      setColliderLabFocusId(item.parentId ?? item.id);
+      closeModal();
+      setActiveTab("collider");
+    },
+    [closeModal]
+  );
 
   // Filter + search applied to items, in render order. Memoised against
   // the items array reference so we don't re-filter on unrelated renders.
@@ -205,7 +221,6 @@ function SignedInApp({ user, onSignOut }) {
   const updateStatus = wrapMutation(svgs.updateStatus);
   const updateNotes = wrapMutation(svgs.updateNotes);
   const updateColor = wrapMutation(svgs.updateColor);
-  const updatePhysicalProperties = wrapMutation(svgs.updatePhysicalProperties);
 
   const addFeedback = async (id) => {
     if (!feedbackText.trim()) return;
@@ -344,8 +359,8 @@ function SignedInApp({ user, onSignOut }) {
 
   // Import: bring in an SVG from disk and insert as a new draft. Auto-runs
   // the programmatic collider generator so the new item lands with a
-  // starter collider — Bill can refine via the DetailModal collider editor
-  // or replace it later via Flow B.
+  // starter collider — Bill can refine it in the Collider Lab or replace it
+  // later via Flow B.
   const handleOpenImportSvg = () => setShowImportSvg(true);
   const handleCloseImportSvg = () => setShowImportSvg(false);
   const handleImportAccept = async ({ name, displayName, svgContent, colorTag }) => {
@@ -356,7 +371,7 @@ function SignedInApp({ user, onSignOut }) {
       if (check.valid) physicalProperties = { collider };
     } catch {
       // Generator failed (e.g. unparseable SVG). Insert without a collider;
-      // the user can generate one later from the DetailModal.
+      // the user can add one later in the Collider Lab.
     }
     try {
       await svgs.insertSvg({
@@ -774,6 +789,7 @@ function SignedInApp({ user, onSignOut }) {
         />
         <ColliderLab
           items={items ?? []}
+          initialSelectedId={colliderLabFocusId}
           onSaveCollider={(id, collider) =>
             svgs.updatePhysicalProperties(id, { collider })
           }
@@ -877,7 +893,7 @@ function SignedInApp({ user, onSignOut }) {
           onPendingUploadChange={setPendingUpload}
           onAcceptUpload={handleAcceptUpload}
           onDiscardUpload={handleDiscardUpload}
-          onUpdatePhysicalProperties={updatePhysicalProperties}
+          onEditInColliderLab={handleEditInColliderLab}
           onDuplicate={handleOpenDuplicate}
           onRename={handleRename}
           onTrash={handleTrash}

@@ -55,11 +55,15 @@ function planckLevel(item) {
 
 export default function ColliderLab({
   items,
+  initialSelectedId,
   onSaveCollider,
   onDownload,
   showToast,
 }) {
-  const [selectedId, setSelectedId] = useState(null);
+  // Seed selection from the id App hands us when arriving via DetailModal's
+  // "Edit in Collider Lab" link. Read once on mount — the Lab remounts on
+  // each tab switch, so this captures the latest focus id each time.
+  const [selectedId, setSelectedId] = useState(initialSelectedId ?? null);
 
   // Parents + standalones only; skip idea_only concepts (no real renderable).
   const labItems = (items ?? []).filter(

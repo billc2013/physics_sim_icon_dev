@@ -2,7 +2,7 @@
 
 Prioritized backlog for migrating the GIST Physics SVG Asset Manager from a single Claude.ai artifact into a deployed full-stack app.
 
-> **Note:** This file (and CLAUDE.md) is gitignored — working notes for Bill and Claude only, not committed to the repo.
+> **Note:** This file (and CLAUDE.md) is git-tracked — working notes shared between Bill and Claude, committed to the repo as the running project state across sessions.
 
 See [CLAUDE.md](CLAUDE.md) for working conventions, repo state, and the schema-vs-item-shape mapping. See [overview_April_7.md](overview_April_7.md) for full architectural context.
 
@@ -23,7 +23,7 @@ Done locally:
 - ✓ Parent-child parenting: `parent_id` column, always-inherit physical_properties, color dots on parent cards, ↑parent on variant cards, manifest uses effectivePhysicalProperties
 
 Remaining:
-- Tasks 4, 5, 9, 11, and the production-walkthrough piece of 10
+- Tasks 4, 5, 9b, 11, and the production-walkthrough piece of 10 (9a — GitHub push — is done)
 - Task 11 (Supabase `sb_secret_` key migration) has a real external deadline: legacy keys deleted late 2026
 
 The app works end-to-end on `vercel dev` (login → grid → review → four generate flows with queue + collider generation → audit log → manual download/upload → zip export with manifest + colliders). What's missing is multi-user (Realtime), production deploy, Duncan's bootstrap, and the prod walkthrough of the zip export.
@@ -33,7 +33,7 @@ The app works end-to-end on `vercel dev` (login → grid → review → four gen
 - `vercel env add MODAL_BATCH_ENDPOINT_URL development` (the URL printed by `modal deploy` for the batch endpoint)
 
 **Suggested next-task order from here:**
-1. **Task 9** (deploy) — unlocks Duncan signing up via the production URL AND unblocks the remaining production-walkthrough piece of Task 10
+1. **Task 9b** (Vercel auto-deploy) — unlocks Duncan signing up via the production URL AND unblocks the remaining production-walkthrough piece of Task 10. *Deferred by Bill for now — still testing on localhost.*
 2. **Task 4** (insert Duncan into project_members) — 10-second SQL after he signs up
 3. **Task 5** (Realtime) — multi-user live sync, biggest UX win once Duncan is in
 4. Finish **Task 10** prod walkthrough
@@ -193,21 +193,23 @@ The schema (section 8) also has a `pg_cron` job that does the same update, but `
 
 ## Phase 4 — Deploy & polish
 
-### 9. Push to GitHub and set up Vercel auto-deploy `[ ]`
+### 9. Push to GitHub (9a) and set up Vercel auto-deploy (9b)
 
-This unblocks Duncan signing up (Task 4). Probably the most "yak shaving for the value" task in the backlog.
+Splits into two: 9a (GitHub) is **done**; 9b (Vercel auto-deploy) is **deliberately deferred** while Bill keeps testing on localhost.
+
+#### 9a. Push to GitHub `[x]`
+
+Done. The repo is public on GitHub (public since 2026-06-23). Decision on what to commit was resolved: `CLAUDE.md`, `Dev_Tasks.md`, and `gist-supabase-schema.sql` are all now **git-tracked** (previously local-only). `.env*` stays gitignored. `.env.local.example` remains untracked (Bill's call).
+
+#### 9b. Set up Vercel auto-deploy from `main` `[ ]`
+
+**Deferred deliberately** — Bill is still testing on his local machine and isn't ready for a production URL / auto-deploy yet. This still unblocks Duncan signing up (Task 4) once it lands.
 
 **Prerequisites**
-- Bill has a GitHub account and can create a new repo
 - The Vercel project is already linked locally (`.vercel/project.json` shows `bill-churchs-projects/physics-sim-icon-dev`)
+- Add `__pycache__/` to gitignore if not already (Modal creates these locally)
 
 **Scope**
-- Create GitHub repo (Bill creates it via UI; Claude provides the `git remote add` + push commands)
-- Decide what to commit vs. what stays local-only:
-  - Currently gitignored: `CLAUDE.md`, `Dev_Tasks.md`, `.env*`, `gist-supabase-schema.sql`. Confirm Bill wants this state for the public repo, or pull the schema back in.
-  - Add `__pycache__/` to gitignore if not already (Modal creates these locally)
-  - Decide whether `.env.local.example` should be committed (it's a useful onboarding doc with no secrets — recommend unignoring it for the deploy)
-- Push `main` to GitHub
 - Connect the GitHub repo to Vercel (already linked locally so this should be a few clicks in the dashboard)
 - **Configure Vercel env vars at `production` scope** (NOT just `development`):
   - `VITE_SUPABASE_URL`
@@ -341,26 +343,36 @@ single-sourced in gist (no second copy here; stored geometry == authored outline
 [colliderGenerator.js](src/lib/colliderGenerator.js) returns an *unordered point
 cloud* and both entry points `convexHull` it immediately (filling the cup's mouth).
 Decomposition downstream needs an **ordered, simple, closed ring** (a single outline
-traversal). The chosen approach is **vector polygon union, not bitmap tracing**
-(decided 2026-06-25 — see below):
-- **Single dominant filled path** → web-native `SVGGeometryElement.getTotalLength()`
-  + `getPointAtLength()` samples the outline at native precision (also handles
-  arcs/smooth beziers our hand-rolled path parser mangles). **Zero dependency.**
-- **Multiple filled shapes** → boolean **union** of the per-element rings; the
-  union's outer ring is the silhouette, and a union *guarantees* the
-  non-self-intersecting closed ring gist requires. Lowest-cost lib:
-  [`polygon-clipping`](https://www.npmjs.com/package/polygon-clipping) (Martinez–Rueda,
-  pure JS, no runtime deps). Adding it trips the global npm-safety protocol
-  (spell name / publish freshness / install scripts) — do that dance at install time.
-- **Bitmap/OpenCV trace** rejected as high-cost for 64×64 monochrome icons
-  (resolution-bound, AA-fuzzy, OpenCV.js ~8 MB WASM). Reconsider only if we must
-  trace stroke-rendered appearance.
+traversal).
+
+**APPROACH — SHIPPED 2026-06-29 (supersedes the 2026-06-25 "vector union" plan).**
+Built as a **two-tool auto-fit series** (Bill's framing: try a tool per shape class),
+both client-side in [colliderGenerator.js](src/lib/colliderGenerator.js), zero new deps:
+- **Single dominant filled path** → `computeConcaveOutline` — native
+  `SVGGeometryElement.getTotalLength()` + `getPointAtLength()`, SVG mounted offscreen in
+  the live DOM, `getCTM()` → viewBox units. Best for single-path concave shapes (cup).
+  Bill tested: no-go for multi-shape (picks only the largest element = the cactus trunk).
+- **Multiple filled shapes** → `computeSilhouetteOutline` — render to offscreen canvas
+  (4× supersample) → alpha threshold → largest connected component → **Moore-neighbor
+  boundary trace** → RDP. Zero dep, structure-agnostic. Bill tested on the cactus:
+  "works VERY well."
+
+> **SUPERSEDED:** the original plan was single-path native **+ `polygon-clipping`
+> boolean union** for multi-shape, with "bitmap/OpenCV trace rejected (8 MB WASM,
+> AA-fuzzy)." *Why we changed our minds:* the raster route is a **~120-line hand-rolled
+> Moore-neighbor trace** (NOT OpenCV) — it's dependency-free, captures arms-and-all
+> regardless of how the art is built (N shapes, group transforms, rounded corners,
+> stroke-only elements), and for axis-aligned art the steps land on real edges. So
+> raster won for multi-shape and `polygon-clipping` was never added. (Vector union
+> remains a viable alt if we ever need crisper vector edges and accept the dep.)
 
 **Concrete change set in this repo:**
-1. [colliderGenerator.js](src/lib/colliderGenerator.js) — add `extractFilledRings()`
-   (per-element **ordered** rings; keep the existing point-cloud fn for the convex-hull
-   path) + an ordered-outline / union route + a concave/`polygon` branch that emits the
-   raw outline with **no hull**.
+1. **✓ SHIPPED 2026-06-29 (different route than originally specced).**
+   [colliderGenerator.js](src/lib/colliderGenerator.js) — instead of
+   `extractFilledRings()`+union, added `extractOrderedOutline`/`computeConcaveOutline`
+   (single-path native) and `traceSilhouetteRaster`/`computeSilhouetteOutline` (raster).
+   Both emit `type:"convex"` with the raw ordered ring, **no hull**; the existing
+   point-cloud convex-hull path is untouched (still used for convex blobs).
 2. **✓ SHIPPED 2026-06-25** (alongside Collider Lab Phase 2).
    [colliderSchema.js](src/lib/colliderSchema.js) — `validateConvex` now applies the
    `≤ MAX_CONVEX_VERTICES` (8) cap **only to genuinely-convex polygons** (detected via
@@ -372,12 +384,15 @@ traversal). The chosen approach is **vector polygon union, not bitmap tracing**
    exists **solely for Planck** (matter.js removed from gist 2026-05-11; Rapier re-hulls,
    no limit). Verified: box4→valid, convex-9→reject (cap), cup-8/cup-12 concave→valid,
    bow-tie→reject (self-intersect).
-3. Editor UX ([DetailModal.jsx](src/components/DetailModal.jsx) ~L812 /
-   [ColliderEditor.jsx](src/components/ColliderEditor.jsx)) — flip the amber warning
-   *"Polygon is concave — physics engines require convex shapes … the engine will use
-   the convex hull"* (now **wrong** — gist decomposes, it doesn't hull) to "concave →
-   decomposed downstream (allowed)." Compounds eventually need to be editable
-   (`colliderToEditableVertices` returns null for `compound` today).
+3. Editor UX — **✓ RESOLVED BY REMOVAL 2026-07-02.** The plan was to flip DetailModal's
+   stale amber warning (*"…the engine will use the convex hull"*) to "concave → decomposed
+   downstream (allowed)." Instead the entire DetailModal collider section (incl.
+   `ColliderEditor`) was removed (Task 13 decision) — so there's no warning left to flip.
+   The Collider Lab's own editor already shows the correct "concave → decomposed
+   downstream (allowed)" message. [ColliderEditor.jsx](src/components/ColliderEditor.jsx)
+   is now orphaned (deletion noted in CLAUDE.md → Known minor issues). Compounds still
+   need to become editable in the Lab (`colliderToEditableVertices` returns null for
+   `compound` today).
 
 **Four-option generator plan (box / circle / pill / polygon) — verdicts from gist:**
 - Emit a **closed polygon, not a "polyline."** An open polyline is a one-sided edge
@@ -452,7 +467,12 @@ not just drag — that's the "ground-truth the coordinates" ask).
 
 **Decisions settled:**
 - **DetailModal loses its collider section** → shrinks to read-only thumbnail +
-  "Edit in Collider Lab" link. Refine DetailModal further *after* the Lab exists.
+  "Edit in Collider Lab" link. **✓ SHIPPED 2026-07-02.** Generate/edit/save + the
+  `ColliderEditor` overlay removed from [DetailModal.jsx](src/components/DetailModal.jsx);
+  now a read-only collider overlay + summary + "Edit in Collider Lab ↗" button that
+  jumps via `onEditInColliderLab` → App `handleEditInColliderLab` (targets the parent
+  for children) → `ColliderLab initialSelectedId`. Rescale-to-fit (which transforms the
+  collider) stays in DetailModal. This also retired Task 12 #3's stale concave warning.
 - **Children do NOT appear in the Lab** (they inherit; editing writes to the parent).
   Show parents + standalones only.
 - **Decomposition = Option A:** edit the raw concave ring, trust gist; do NOT add
@@ -502,8 +522,21 @@ the sanctioned substitute for local decomposition preview (Option B, rejected).
    **numerically-editable vertex table** (type `(x,y)`, not just drag) and the
    **"⚠ N out-of-bounds" filter/sort** so the broken seeded colliders are one click away.
    Editing is **convex-polygon only** so far (circle/box/compound stay read-only).
-3. Polygon generation via single-path native route + flip the concave warning
-   ("forbidden" → "decomposed downstream").
+   **Editor UX redesign 2026-07-02** (prompted by the 33-vert `runner` silhouette being
+   unreadable): `PolygonEditLayer` now shows state by **dot color only** (blue idle / white
+   hover / red clicked-dragging / red ring = OOB), **no** per-vertex numbers, ×'s, or
+   per-edge + ghosts. Hit-testing is geometric (nearest vertex / nearest edge). **Add** =
+   click an edge (cursor → `copy` "+" arrow when an edge can accept one); **delete** =
+   `Delete`/`Backspace` on the hovered/selected vertex (window listener, ignores text
+   fields). The Planck verdict moved **below** the grid so it never shifts the icon/grid
+   mid-edit. Still tunable (edge-hit distance) but called good for now.
+3. **◐ CORE SHIPPED 2026-06-29.** Polygon generation — TWO auto-fit tools
+   (single-path native `computeConcaveOutline` + raster silhouette
+   `computeSilhouetteOutline`; see Task 12) wired as ground-truth buttons that drop into
+   the Phase-2 edit draft, **plus Planck-readiness warnings** (verdict line + triage
+   badges + wrong-tool nudge; see Task 15). **Still ahead:** flip the **DetailModal
+   `ColliderEditor`** concave warning ("forbidden" → "decomposed downstream") — Task 12
+   #3, still unflipped (the Lab's own editor messaging is already correct).
 4. Pill parametric editor (the only "compound" we need near-term — drag two end-circles,
    set radius).
 
@@ -513,7 +546,7 @@ the sanctioned substitute for local decomposition preview (Option B, rejected).
 - Selecting an item shows the grid view with correct viewBox (incl. non-square),
   coordinate grid, SVG + collider overlay, and an editable vertex table
 - Editing writes through `updatePhysicalProperties` (parent for children) — no schema change
-- DetailModal collider section removed in favor of an "Edit in Collider Lab" link
+- ✓ DetailModal collider section removed in favor of an "Edit in Collider Lab" link (2026-07-02)
 
 ---
 

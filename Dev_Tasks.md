@@ -327,14 +327,30 @@ The generator outputs the true concave silhouette as a `type:"convex"` collider
 (the accepted-concave misnomer), and gist decomposes it at load — identical to the
 Phase 0 hand-authored cup. Chosen over decomposing upstream so `poly-decomp` stays
 single-sourced in gist (no second copy here; stored geometry == authored outline).
-**We do NOT add `poly-decomp` to this repo.**
+**We do NOT add `poly-decomp` to this repo.** → **REVISED 2026-07-17 (bird
+finding, Task 15):** `poly-decomp@0.3.0` is now a dependency, exact-pinned to
+gist's version (frozen upstream since 2018, no install scripts), **verdict-only**
+— `planckReadiness` decomposes concave outlines for an exact per-part Planck
+check; parts are discarded, never stored/exported. Decomposition *for physics*
+stays single-sourced in gist. The original rule's intent (no version drift, no
+second physics path) is preserved; only the "never run it here at all" letter
+changed, because the runner/bird specimens proved outline-level heuristics
+cannot separate safe from harmful concave outlines.
 
 **Keep-in-sync / cross-repo contract (load-bearing):**
-- gist's `ManifestCollider` is `convex | box | circle` — **no `polygon` type**. A
-  `type:"polygon"` manifest entry resolves to `undefined` downstream and the body
-  builds with **no collider** (reads as a generator bug). So **emit `type:"convex"`**,
-  not `"polygon"`, until gist lands its Phase 4 rename. Our `convex`-named outline IS
-  the polygon path under test downstream.
+- **UPDATE 2026-07-16 — rename greenlit + shipped at the manifest boundary.** gist
+  confirmed its loader now reads `type:"polygon"`, so **manifest v2 emits
+  `"polygon"`** via `toManifestCollider()` in [App.jsx](src/App.jsx) (incl. inside
+  `compound` parts). **Boundary-only by decision (Bill, 2026-07-16):** DB rows,
+  `colliderSchema`/`colliderGenerator`, UI, and the LLM contract all still say
+  `"convex"` internally — only the export translates. A full internal rename was
+  considered and deferred (6+ files + stored-jsonb migration; not worth it while
+  only gist consumes the name). The paragraph below records the pre-rename state.
+- *(Historical, superseded above)* gist's `ManifestCollider` was `convex | box |
+  circle` — no `polygon` type; a `type:"polygon"` entry resolved to `undefined`
+  downstream and the body built with **no collider**. That's why this repo emitted
+  `type:"convex"` until gist landed its Phase 4 rename. Our `convex`-named outline
+  IS the polygon path downstream.
 - This is a browser-only generator change. It does **not** touch
   [shared/system_prompt.json](shared/system_prompt.json), so **no `modal deploy`
   is owed** — the LLM still only picks a type intent; the client computes geometry.
@@ -550,12 +566,13 @@ the sanctioned substitute for local decomposition preview (Option B, rejected).
 
 ---
 
-### 14. Manifest declares its collider coordinate space (Option B) — cross-repo `[ ]`
+### 14. Manifest declares its collider coordinate space (Option B) — cross-repo `[✓]` DONE 2026-07-16 (both halves; dynamics_cart round-trip verified)
 
 Cross-repo note from a 2026-06-25 gist session. Source of truth for the *why*:
 [../gist/Notes_on_Concave_Colliders_Refactor.md](../gist/Notes_on_Concave_Colliders_Refactor.md)
-→ Findings **2026-06-25 "manifest collider viewBox mis-scaling FIXED"**, plus
-[../gist/parking_lot.md](../gist/parking_lot.md) (the manifest-readiness race).
+→ Findings **2026-06-25 "manifest collider viewBox mis-scaling FIXED"** and
+**2026-07-16 "manifest-readiness race CLOSED"** (the race entry moved there
+from gist's parking lot when it was fixed).
 
 **What just landed in gist (context — Option A, SHIPPED + visually verified).**
 gist had a **library-wide** collider bug: its loader
@@ -574,22 +591,42 @@ spot-checked). **Net: colliders authored in this repo's true-viewBox space now m
 correctly downstream — the Collider Lab is validated as the spot-check / rebuild
 surface (Task 13).**
 
+**Status update (gist session 2026-07-16): the race is CLOSED — independently
+of Option B.** gist now gates its sim mount (`adapterReady` in `BaseSimulation`)
+on `Promise.all([adapter, loadManifest()])`, so bodies can no longer build
+against an unpopulated manifest. Drive-verified by Bill on throttled Slow 4G.
+**Consequence for this task:** "dissolves gist's race" is no longer part of
+Option B's payoff. What the throttle drive *did* show is that the per-sprite
+viewBox fetch pass is the **mount-latency long pole on slow networks** — one
+round-trip per approved manifest entry (~0.7 kB each, pure latency, capped by
+the browser's per-host connection limit), and gist's sim mount now *waits* for
+all of them. Time-to-first-sim on slow connections scales with library size.
+So Option B's remaining payoff is: (a) eliminate that N-fetch startup pass,
+(b) the self-describing-contract robustness. Still fold into Task 12/13 work;
+urgency rises if the library grows much past ~200 sprites.
+
 **What's still open — Option B (the durable contract).** Option A has gist
 *infer* the coordinate space by **fetching + parsing every SVG at load** (a
-startup fetch pass, plus a latent manifest-readiness race in gist). Option B makes
+startup fetch pass that gist's mount gate now waits on). Option B makes
 the manifest **self-describing**: this repo emits each collider's authoring viewBox
 in the export, and gist reads it instead of inferring.
 
-- **This repo's half:** add the authoring viewBox to each manifest entry on export
-  (e.g. `"viewBox": [w, h]` or a `collider_space` field). We already know each
-  sprite's true viewBox — `ColliderGroundTruth` renders aspect-correct from it.
-  Touch the manifest builder in [App.jsx](src/App.jsx) (`handleConfirmDownload`)
-  and bump `manifest_version`.
-- **gist's half:** read the field, drop the per-SVG viewBox fetch, close the race.
-  ~10 lines (gist owns this).
-- **Joint decision (both sides must agree):** the manifest field **name + shape**
-  for the authoring viewBox. Decide once; both honor it. Same "manifest is the
-  cross-repo contract" theme as the pending `convex → polygon` rename (Task 12).
+- **This repo's half — ✓ SHIPPED 2026-07-16:** `buildManifestEntry` in
+  [App.jsx](src/App.jsx) now emits `view_box: [x, y, w, h]` (parsed from the
+  item's own SVG via `parseViewBox`; `null` if unparseable → gist falls back to
+  fetch-and-infer for that sprite), and `manifest_version` bumped **1 → 2**.
+  Shipped together with the `convex → polygon` boundary rename (Task 12) so v2
+  gates both shape changes at once. Covers both consumers automatically (zip
+  export + Collider Lab single-item download share the builder).
+- **gist's half — ✓ DONE 2026-07-16 (gist-side session, confirmed by Bill):**
+  reads `view_box` from the v2 manifest. Verified same day with the export half
+  (see acceptance below).
+- **Joint decision — ✓ DECIDED 2026-07-16 (gist session):** field is
+  **`view_box: [x, y, width, height]`**, a **sibling of `name`/`status`** on the
+  entry (NOT inside `physical_properties`). Full 4-tuple matches SVG semantics
+  even though our convention pins origin at (0,0). Same "manifest is the
+  cross-repo contract" theme as the `convex → polygon` rename (Task 12, also
+  greenlit + shipped at the boundary the same day).
 
 **Division of labor (agreed 2026-06-25).** The Collider Lab authors/corrects
 colliders and owns the **export half** + the **overshoot cleanup** (below); gist
@@ -607,11 +644,16 @@ startup fetch + dissolving its race. **Fold into Task 12/13 work** when next
 touching export/authoring rather than doing it standalone.
 
 **Acceptance**
-- Manifest export carries each collider's authoring viewBox under an agreed field;
-  `manifest_version` bumped (and the gist consumer documented).
-- gist reads it, drops the per-SVG viewBox fetch, and the parking-lot race closes.
-- A non-square asset (cup / cart) round-trips Lab → manifest → gist and sits
-  correctly with **no gist-side SVG parsing**.
+- ✓ Manifest export carries each collider's authoring viewBox under the agreed
+  field (`view_box: [x,y,w,h]`, entry-level sibling); `manifest_version` bumped
+  to 2 (documented in CLAUDE.md → Download approved).
+- ✓ gist reads it (loader half landed gist-side 2026-07-16; the race was already
+  closed — this bought mount latency, not correctness). Confirm on the gist side
+  that the per-SVG viewBox fetch pass is actually removed, not just bypassed —
+  that's where the latency win lives.
+- ✓ A non-square asset round-trips Lab → manifest → gist: **dynamics_cart**
+  (`view_box: [0, 0, 64, 27.4286]`, concave/`polygon` collider) rendered and
+  collided correctly — Bill + gist-side session, 2026-07-16.
 
 ---
 
@@ -677,11 +719,144 @@ heuristic `planck_ready` into the manifest would only duplicate it and risk
 staleness. Keep the manifest lean. (Unrelated pending manifest change is Task
 14's authoring-viewBox.)
 
+**⚠ Cross-repo correction (gist session 2026-07-02) — the cap is 12, not 8.**
+Code-read of gist's pinned Planck: `Settings.maxPolygonVertices = 12` (not the
+Box2D-classic 8 this task assumed), and `PolygonShape._set` **silently truncates** to
+the first 12 verts then convex-hulls them (no throw) — so the real silent-break is a
+decomposed part **>12**, not >8. The `planckReadiness` ruleset here (`convex >8 = fail`,
+`concave >8 = warn`) is therefore *conservative*, not exact. **Bill's decision: leave
+the heuristic as-is for now and DON'T re-tune the threshold yet** — gist is adding a
+**collider observation overlay** (renders the actual decomposed geometry + per-part vert
+counts, flags parts >12) as an *observation instrument*; the 8-vs-12 portability target
+gets decided once we have data on real objects, here and upstream. Concrete data point:
+the updated **`runner`** (34-vert concave outline) decomposes to **12 parts, max 7 verts
+— safe** — yet this repo's heuristic flags it `warn` (concave >8). That false-alarm gap
+is exactly why the authoritative call lives downstream. Source of truth:
+[../gist/Notes_on_Concave_Colliders_Refactor.md](../gist/Notes_on_Concave_Colliders_Refactor.md)
+→ Findings 2026-07-02 + "Collider debug / observation mode".
+
+**⚠ Cross-repo data (gist session 2026-07-16) — first confirmed HARMFUL
+specimen: `bird`. The 2026-07-02 "decide once we have data" gate is answered.**
+
+`bird` (39-vert concave outline, `view_box` 64×53.2573, approved in the v2
+library) decomposes (gist `quickDecomp`) to **10 parts, vert counts
+`[3,3,10,4,5,4,4,4,4,16]`** — the torso oval is a **16-vertex part, over the
+real Planck cap of 12**. Engine-truth diff (a real `planck.Polygon` built from
+that part and compared to the authored geometry): Planck keeps the first 12
+verts and re-hulls, dropping the four **underbelly** vertices (viewBox
+x 15–38, y 34–41) — the belly arc becomes a flat chord, max deviation
+**≈6.5% of sprite height**. **Drive-confirmed by Bill same day** (Planck,
+`?colliders=1`): the dynamics cart wedged visibly *inside* the drawn
+underbelly outline; correct contact on Rapier. Crucially, gist's observation
+overlay draws the *authored* decomposition (engine-actual fixture readback is
+deferred), so the wrong fixture is **invisible in every tool both repos
+currently have** — only behavior reveals it. Exhibit (screenshot + sim JSON):
+`../gist/user_exhibits_for_dev_and_debugging/`. Full analysis:
+[../gist/Notes_on_Concave_Colliders_Refactor.md](../gist/Notes_on_Concave_Colliders_Refactor.md)
+→ Findings 2026-07-16 (asset finding under the manifest-v2 entry).
+
+**What the two specimens decide.** `runner` (34-vert concave → 12 parts,
+max 7 — SAFE) and `bird` (39-vert concave → 16-vert part — HARMFUL) both land
+in the heuristic's identical `concave >8 ⇒ warn` bucket. No outline-level
+threshold re-tune (8 vs 12) can separate them — the verdict is a property of
+the *decomposition*, not the outline. So:
+
+- **Recommendation (this repo): make the concave verdict EXACT at authoring
+  time.** Run the same decomposition (`poly-decomp`'s `makeCCW` +
+  `quickDecomp`, pinned to gist's version) inside `planckReadiness` /
+  the Lab, verdict-only — decomposed parts are NOT exported and the manifest
+  contract is unchanged (gist still single-sources decomposition for
+  physics; this is the same check, run early, on the same deterministic
+  algorithm). Result: `bird` → `✖P` with facts ("part 9: 16 verts > 12"),
+  `runner` → `ok` (kills its false alarm). The `convex >8` branch can also
+  correct to the true cap (≤12 ok).
+- **Asset fix:** re-trace / coarsen `bird`'s torso arc so no decomposed part
+  exceeds 12 — first entry in the over-cap triage queue (the Lab's exact
+  verdict then becomes the regression check at approval).
+- **gist's half (unchanged, still pending there):** the dev-build
+  post-decompose warn — now with cap **12** (not this task's original 8) and
+  a motivating exhibit. Tracked gist-side as roadmap item CC2.
+
 **Acceptance**
 - ✓ Lab shows a Planck verdict per collider and badges risky ones in the list.
 - ✓ Tracing a convex >8 shape (asteroid) nudges toward circle/hull.
-- ☐ gist dev build warns on any decomposed part >8 (e.g. `dynamics_cart`'s
-  9-vert part) and is silent in production. (gist-side, pending.)
+- ✓ Concave verdicts are exact (authoring-time decomposition) — SHIPPED
+  2026-07-17: `planckReadiness` runs pinned `poly-decomp@0.3.0`
+  (`makeCCW`+`quickDecomp`, mirroring gist's `decomposePolygonShape`) and
+  fails with part facts. Convex cap corrected to 12 (`MAX_CONVEX_VERTICES`),
+  which also moves the save-gate, editor add-vertex cap, and hull-tool target
+  (Bill's call: 12 everywhere). Lab spot-check CONFIRMED by Bill 2026-07-17:
+  over-cap SVGs show `✖P`.
+- ☐ `bird` re-traced so all decomposed parts ≤12; verified in the Lab.
+- ☐ gist dev build warns on any decomposed part >12 (authoritative check;
+  e.g. `bird`'s 16-vert torso part) and is silent in production.
+  (gist-side CC2, pending.)
+
+---
+
+### 16. Over-cap triage: fix options + a "Fix" status for Planck-failing SVGs — `[ ]` **NEXT SESSION**
+
+Planned by Bill 2026-07-17, immediately after the exact Planck verdict (Task 15)
+shipped and his Lab check confirmed over-cap SVGs badge `✖P`. Two parts:
+
+**(1) Think through fix options for colliders that fail the >12 test.** The
+verdict now *identifies* failures exactly; this decides how to *repair* them.
+Candidate approaches to evaluate (per shape, extending the "auto-fit tool
+series" framing — likely no single universal answer):
+- **Re-trace coarser** — silhouette trace with a larger RDP epsilon so smooth
+  arcs land fewer vertices per convex run.
+- **Manual vertex deletion** in the Lab editor on the offending arc — the
+  verdict recomputes live during edit, so "delete until green" already works.
+- **Wrong-tool cases** — near-convex blobs should be circle / ≤12-hull, not
+  silhouette (the existing nudge).
+- **Compound/pill authoring** for shapes that inherently decompose badly.
+- **Possible new tool:** "auto-coarsen until Planck-safe" — iterate RDP epsilon
+  until all decomposed parts ≤12. Evaluate whether it earns its complexity vs.
+  manual deletion.
+
+`bird` (16-vert torso part) is the pilot specimen — its re-trace is Task 15's
+remaining ☐ and should exercise whichever option wins.
+
+**(2) New status `fix` + bulk move of failing approved items.** Intent: an
+approved SVG whose collider fails Planck must not sit in the export set
+looking shippable. Status is a **multi-runtime contract** — the full
+keep-in-sync map:
+
+- **DB (migration owed):** `svg_status` is a Postgres enum
+  ([gist-supabase-schema.sql](gist-supabase-schema.sql) line 24, used by BOTH
+  `physics_svgs.status` and `svg_versions.status` — one ALTER covers both).
+  Migration: `alter type svg_status add value 'fix';` run in the Supabase SQL
+  editor (note: `ADD VALUE` must run outside a transaction block) AND recorded
+  in the schema file (migration 11e) so the file doesn't drift from the live DB.
+- **Browser:** `STATUSES` + `STATUS_CONFIG` in
+  [constants.js](src/lib/constants.js) (new chip color), which FilterBar/
+  SvgCard/DetailModal render from. Check the filter "solo" behavior and the
+  status dropdown pick it up automatically from `STATUSES`.
+- **Export scope:** "Download approved" filters `status === "approved"`, so
+  `fix` items drop out of exports automatically — that's the point. No
+  manifest shape change (`manifest_version` stays 2; entries already carry
+  `status` and `fix` never appears in an export since exports are
+  approved-only).
+- **NOT in the LLM contract:** statuses aren't in
+  [shared/system_prompt.json](shared/system_prompt.json) → no `modal deploy`
+  owed.
+- **Archive trigger:** each approved→fix move archives the old row + bumps
+  `version` (status changes always do). Expected, harmless.
+- **Workflow design Qs for the session:** who moves `fix` → `approved`
+  (manual, once the Lab verdict is green?); auto-promote logic only touches
+  `draft`, so it needs no change — confirm.
+- **Bulk-move mechanics:** the failing set is computed **client-side**
+  (`planckReadiness` needs the decomposition), so plain SQL can't find it.
+  Either a Lab triage action ("mark all ✖P as Fix" driving the existing
+  `updateStatus` mutation) or hand-list the names from the Lab and move them.
+  The Lab action is probably worth it — it makes the triage repeatable.
+
+**Acceptance (sketch)**
+- Fix options written up here with a chosen default per shape class; `bird`
+  repaired as the pilot (closes Task 15's ☐).
+- `fix` exists end-to-end: enum migrated + schema file updated + UI chip/filter.
+- Every approved item badging `✖P` moved to `fix`; export scope verifiably
+  excludes them.
 
 ---
 

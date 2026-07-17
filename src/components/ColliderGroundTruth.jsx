@@ -773,8 +773,8 @@ function EditToolbar({
       )}
       {concave && !planckCapViolated && !selfIntersects && (
         <div style={{ marginTop: 6, fontSize: 11, color: "#92400E" }}>
-          Concave outline — allowed; GIST decomposes it into ≤{MAX_CONVEX_VERTICES}
-          -vertex parts at load (no convex vertex cap here).
+          Concave outline — allowed; GIST decomposes it into convex parts at
+          load. The Planck verdict below shows the actual part sizes.
         </div>
       )}
     </div>
@@ -782,9 +782,10 @@ function EditToolbar({
 }
 
 // Authoring-time Planck-readiness verdict (see planckReadiness in
-// colliderSchema). Dev-side guidance so we don't ship Planck-hostile colliders;
-// the AUTHORITATIVE post-decomposition check lives in gist's dev build (this
-// repo can't run poly-decomp). See Dev_Tasks.md → Task 12.
+// colliderSchema). EXACT since 2026-07-17: it runs the same pinned poly-decomp
+// decomposition gist runs at load, so concave verdicts report real per-part
+// vertex counts. gist's dev-build post-decompose warn (CC2) stays as the
+// engine-side backstop. See Dev_Tasks.md → Task 15.
 function PlanckVerdict({ collider }) {
   const { level, message } = planckReadiness(collider);
   const palette =

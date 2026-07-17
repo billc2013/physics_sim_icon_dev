@@ -5,20 +5,26 @@
 //
 // Two engines are targeted downstream: Planck.js and Rapier 2D. (matter.js was
 // removed from gist on 2026-05-11; legacy configs coerce to Rapier.) The
-// 8-vertex cap exists SOLELY for Planck, which consumes each convex polygon
-// directly with a hard b2_maxPolygonVertices = 8 limit; Rapier re-hulls each
+// vertex cap exists SOLELY for Planck: gist's pinned Planck has
+// Settings.maxPolygonVertices = 12, and PolygonShape silently truncates to the
+// first 12 vertices then convex-hulls them — no throw, just a distorted
+// fixture (the `bird` underbelly exhibit, 2026-07-16). Rapier re-hulls each
 // part and has no such limit.
 //
-// CRUCIAL LAYERING: the 8-vertex limit is a per-convex-polygon, *post-
+// CRUCIAL LAYERING: the 12-vertex limit is a per-convex-polygon, *post-
 // decomposition* property. It applies to convex/box/circle shapes Planck eats
-// directly — NOT to concave outlines, which gist decomposes into ≤8-vertex
-// parts at load (via poly-decomp, a dependency we deliberately do NOT add
-// here). So this repo enforces ≤8 only for genuinely-convex polygons; concave
-// outlines (stored as type:"convex" — the accepted misnomer) are validated as
-// simple closed rings, and the per-part limit is owned by gist where the
-// decomposition actually runs. See Dev_Tasks.md → Task 12.
+// directly — NOT to concave outlines, which gist decomposes into convex parts
+// at load. Concave outlines (stored as type:"convex" — the accepted misnomer)
+// are validated as simple closed rings; whether their DECOMPOSED parts fit the
+// cap is answered exactly by planckReadiness below, which runs the same
+// poly-decomp (makeCCW + quickDecomp) gist runs — pinned to gist's exact
+// version (0.3.0), VERDICT-ONLY: decomposed parts are never stored or
+// exported, and gist remains the single source of decomposition for physics.
+// See Dev_Tasks.md → Task 12 / 15.
 //
 // Collider data is stored in physics_svgs.physical_properties.collider.
+
+import polyDecomp from "poly-decomp";
 
 // --- Collider types ---
 //
@@ -29,8 +35,11 @@
 
 export const COLLIDER_TYPES = ["circle", "box", "convex", "compound"];
 
-// Planck.js (Box2D) hard limit per convex polygon.
-export const MAX_CONVEX_VERTICES = 8;
+// Planck.js hard limit per convex polygon (gist's pinned Planck:
+// Settings.maxPolygonVertices = 12; over-cap shapes are silently
+// truncated-then-hulled, not rejected). Was 8 (Box2D-classic assumption)
+// until 2026-07-17 — the bird/runner specimens settled the true cap.
+export const MAX_CONVEX_VERTICES = 12;
 
 // Default SVG viewBox size for this project.
 export const VIEWBOX_SIZE = 64;
@@ -266,26 +275,33 @@ function round(n) {
 }
 
 /**
- * Planck-readiness verdict for a collider, computed at AUTHORING time (here),
- * where only the raw outline is visible — gist runs poly-decomp, this repo
- * deliberately does not. Returns { level: "ok" | "warn" | "fail", message }.
+ * Planck-readiness verdict for a collider, computed at AUTHORING time.
+ * Returns { level: "ok" | "warn" | "fail", message }.
  *
- * The ruleset is exact except for one deferred case, because quickDecomp
- * (Bayazit) only connects EXISTING vertices with diagonals — it never adds
- * Steiner points — so every decomposed part's vertices are a subset of the
- * outline's:
- *   - circle / box                 → ok   (Planck-native)
- *   - convex, ≤8 verts             → ok
- *   - convex, >8 verts             → fail (decomposition can't reduce a convex
- *                                    polygon; it stays one >8-gon)
- *   - concave outline, ≤8 verts    → ok   (every part is a subset ⇒ all ≤8)
- *   - concave outline, >8 verts    → warn (a part MIGHT exceed 8; only gist's
- *                                    dev build can confirm post-decomposition)
- *   - compound                     → worst part wins
+ * EXACT since 2026-07-17: concave outlines are decomposed right here with the
+ * same pinned poly-decomp calls gist runs at load (makeCCW + quickDecomp —
+ * mirror of gist's decomposePolygonShape in shapeHelpers.ts), so the verdict
+ * reports actual per-part vertex counts instead of guessing from the outline.
+ * The runner/bird specimens proved outline-level heuristics can't work: both
+ * are "concave >8" yet runner decomposes safe (12 parts, max 7) and bird
+ * harmful (a 16-vert torso part). Verdict-only: the decomposed parts are
+ * discarded — never stored, never exported; gist stays the single source of
+ * decomposition for physics.
  *
- * Planck silently accepts >8-vertex polygons (no throw) with undefined Box2D
- * behavior, so "fail" is a quiet correctness bug, not a crash — hence the
- * authoring-time warning. See Dev_Tasks.md → Task 12.
+ *   - circle / box               → ok   (Planck-native)
+ *   - convex, ≤12 verts          → ok
+ *   - convex, >12 verts          → fail (decomposition can't reduce a convex
+ *                                  polygon; it stays one over-cap part)
+ *   - concave, all parts ≤12     → ok   (with part facts)
+ *   - concave, any part >12      → fail (with the offending part counts)
+ *   - concave, self-intersecting → warn (can't decompose; validateCollider
+ *                                  blocks save anyway — mid-edit transient)
+ *   - compound                   → worst part wins
+ *
+ * Planck doesn't reject an over-cap polygon — it silently keeps the first 12
+ * verts and re-hulls, distorting the fixture (bird's flattened underbelly,
+ * gist exhibit 2026-07-16) invisibly to every overlay. Hence "fail" here at
+ * authoring time. See Dev_Tasks.md → Task 15.
  */
 export function planckReadiness(collider) {
   if (!collider || typeof collider !== "object") {
@@ -309,33 +325,56 @@ export function planckReadiness(collider) {
         }
         return { level: "ok", message: `Planck-safe (convex, ${n} verts).` };
       }
-      // Concave outline — gist decomposes it downstream.
-      if (n <= MAX_CONVEX_VERTICES) {
+      // Concave outline — run gist's exact decomposition here, verdict-only.
+      if (!isSimplePolygon(verts)) {
         return {
-          level: "ok",
-          message: `Planck-safe (concave, ${n} verts — every decomposed part is ≤${MAX_CONVEX_VERTICES}).`,
+          level: "warn",
+          message: "Planck: outline self-intersects — no verdict until the ring is simple (save is blocked anyway).",
         };
       }
-      return {
-        level: "warn",
-        message: `Planck: concave outline with ${n} verts — a part may exceed ${MAX_CONVEX_VERTICES} after decomposition. Verify in gist's dev build.`,
-      };
+      try {
+        const ring = verts.map(([x, y]) => [x, y]); // copy — makeCCW mutates
+        polyDecomp.makeCCW(ring);
+        const parts = polyDecomp.quickDecomp(ring);
+        if (!parts.length) {
+          return {
+            level: "warn",
+            message: "Planck: decomposition produced no parts — verify in gist's dev build.",
+          };
+        }
+        const counts = parts.map((p) => p.length);
+        const over = counts
+          .map((c, i) => ({ i, c }))
+          .filter(({ c }) => c > MAX_CONVEX_VERTICES);
+        if (over.length) {
+          const facts = over.map(({ i, c }) => `part ${i + 1}: ${c} verts`).join(", ");
+          return {
+            level: "fail",
+            message: `Planck: decomposes to ${parts.length} parts; over the ${MAX_CONVEX_VERTICES}-vertex cap — ${facts}. Planck silently truncates + re-hulls that part. Re-trace or coarsen the outline there.`,
+          };
+        }
+        return {
+          level: "ok",
+          message: `Planck-safe (concave, ${n} verts → ${parts.length} parts, max ${Math.max(...counts)} — all ≤${MAX_CONVEX_VERTICES}).`,
+        };
+      } catch {
+        return {
+          level: "warn",
+          message: "Planck: decomposition failed on this outline — verify in gist's dev build.",
+        };
+      }
     }
 
     case "compound": {
       const parts = Array.isArray(collider.parts) ? collider.parts : [];
       const verdicts = parts.map(planckReadiness);
-      if (verdicts.some((v) => v.level === "fail")) {
-        return {
-          level: "fail",
-          message: `Planck: a compound part exceeds the ${MAX_CONVEX_VERTICES}-vertex cap.`,
-        };
+      const worstFail = verdicts.find((v) => v.level === "fail");
+      if (worstFail) {
+        return { level: "fail", message: `Compound part — ${worstFail.message}` };
       }
-      if (verdicts.some((v) => v.level === "warn")) {
-        return {
-          level: "warn",
-          message: `Planck: a compound part may exceed ${MAX_CONVEX_VERTICES} verts — verify in gist's dev build.`,
-        };
+      const worstWarn = verdicts.find((v) => v.level === "warn");
+      if (worstWarn) {
+        return { level: "warn", message: `Compound part — ${worstWarn.message}` };
       }
       return { level: "ok", message: `Planck-safe (compound, ${parts.length} parts).` };
     }

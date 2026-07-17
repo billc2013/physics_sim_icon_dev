@@ -11,6 +11,7 @@ import {
   applyTransformToSvg,
   normalizeForInsert,
   normalizeSvgOnly,
+  parseViewBox,
 } from "./lib/svgGeometry.js";
 import LoginPage from "./components/LoginPage.jsx";
 import Header from "./components/Header.jsx";
@@ -30,11 +31,27 @@ import TrashPanel from "./components/TrashPanel.jsx";
 import ColliderLab from "./components/ColliderLab.jsx";
 import DataTransformPage from "./components/data/DataTransformPage.jsx";
 
+// Manifest v2 emits the stored collider type "convex" (this repo's accepted
+// misnomer — the ring may be concave) as "polygon", the name gist's loader
+// reads (joint rename agreed 2026-07-16). Boundary-only: DB rows, validation,
+// and the LLM contract all still say "convex". Returns a copy, never mutates
+// the in-state collider.
+function toManifestCollider(collider) {
+  if (!collider) return collider;
+  if (collider.type === "convex") return { ...collider, type: "polygon" };
+  if (collider.type === "compound") {
+    return { ...collider, parts: (collider.parts || []).map(toManifestCollider) };
+  }
+  return collider;
+}
+
 // A single item's entry in the export manifest. Shared by the zip "Download
 // approved" flow and the Collider Lab single-item download so the two can't
 // drift — the manifest shape is a contract the gist pipeline reads. Uses
 // effectivePhysicalProperties so children carry their parent's props.
 function buildManifestEntry(item) {
+  const vb = parseViewBox(item.svg);
+  const props = item.effectivePhysicalProperties;
   return {
     name: item.id,
     display_name: item.label,
@@ -42,7 +59,13 @@ function buildManifestEntry(item) {
     version: item.version,
     color_tag: item.colorTag,
     parent: item.parentId ?? null,
-    physical_properties: item.effectivePhysicalProperties,
+    // The collider's authoring coordinate space, so gist can skip its
+    // per-sprite fetch-and-parse pass at sim mount. null → gist falls back
+    // to inferring from the SVG, as it did for manifest_version 1.
+    view_box: vb ? [vb.x, vb.y, vb.width, vb.height] : null,
+    physical_properties: props
+      ? { ...props, collider: toManifestCollider(props.collider) }
+      : props,
   };
 }
 
@@ -672,7 +695,8 @@ function SignedInApp({ user, onSignOut }) {
 
     if (includeManifest) {
       const manifest = {
-        manifest_version: 1,
+        // v2: entries carry view_box + the collider type rename convex→polygon.
+        manifest_version: 2,
         exported_at: new Date().toISOString(),
         exported_by: user.email,
         export_mode: mode,

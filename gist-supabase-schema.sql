@@ -21,10 +21,17 @@ create extension if not exists pg_trgm schema extensions;          -- trigram op
 -- 1. CUSTOM TYPES
 -- ============================================================================
 
+-- Migration 11e (2026-07-18): added 'fix' — a collider-quality quarantine
+-- status for SVGs whose collider fails Planck's 12-vertex verdict. Because
+-- exports filter status = 'approved', a 'fix' item automatically drops out of
+-- the download set. 'ADD VALUE' must run OUTSIDE a transaction block:
+--   alter type svg_status add value 'fix';
+-- Run in the Supabase SQL editor; this file records the resulting shape.
 create type svg_status as enum (
   'draft',
   'revised',
   'approved',
+  'fix',
   'idea_only'
 );
 

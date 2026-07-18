@@ -794,7 +794,7 @@ the *decomposition*, not the outline. So:
 
 ---
 
-### 16. Over-cap triage: fix options + a "Fix" status for Planck-failing SVGs — `[ ]` **NEXT SESSION**
+### 16. Over-cap triage: fix options + a "Fix" status for Planck-failing SVGs — `[◐]` part 2 shipped 2026-07-18 (16b); part 1 (fix options) open
 
 Planned by Bill 2026-07-17, immediately after the exact Planck verdict (Task 15)
 shipped and his Lab check confirmed over-cap SVGs badge `✖P`. Two parts:
@@ -808,7 +808,12 @@ series" framing — likely no single universal answer):
 - **Manual vertex deletion** in the Lab editor on the offending arc — the
   verdict recomputes live during edit, so "delete until green" already works.
 - **Wrong-tool cases** — near-convex blobs should be circle / ≤12-hull, not
-  silhouette (the existing nudge).
+  silhouette (the existing nudge). **SHIPPED 2026-07-18:** `◯ Fit circle` /
+  `▭ Fit box` buttons in the ground-truth view (`fitPrimitive` →
+  `computeColliderForType`) — fit a Planck-safe primitive to the content,
+  staged as a draft for review then Save. The direct fix for round/rectangular
+  ✖P items (a primitive is always under the cap → verdict goes green). See
+  [CLAUDE.md → Collider Lab Phase 3](CLAUDE.md#collider-lab).
 - **Compound/pill authoring** for shapes that inherently decompose badly.
 - **Possible new tool:** "auto-coarsen until Planck-safe" — iterate RDP epsilon
   until all decomposed parts ≤12. Evaluate whether it earns its complexity vs.
@@ -817,10 +822,17 @@ series" framing — likely no single universal answer):
 `bird` (16-vert torso part) is the pilot specimen — its re-trace is Task 15's
 remaining ☐ and should exercise whichever option wins.
 
-**(2) New status `fix` + bulk move of failing approved items.** Intent: an
-approved SVG whose collider fails Planck must not sit in the export set
-looking shippable. Status is a **multi-runtime contract** — the full
-keep-in-sync map:
+**(2) New status `fix` + bulk move of failing items — SHIPPED 2026-07-18 (Task 16b), pending Bill's enum migration.** Intent: an
+SVG whose collider fails Planck must not sit in the export set
+looking shippable. **Scope decision (2026-07-18): the bulk-move sweeps ALL ✖P
+items regardless of stage (draft/revised/approved), not just approved.** `fix`
+is thus a "broken-collider repair queue" label, not only an approved-quarantine
+— the `Fix` filter becomes the complete repair worklist. Consequence: because
+`fix` overwrites the prior status, the return path is **manual** (set status
+back via DetailModal once the Lab verdict is green — a repaired draft returns to
+draft, NOT silently to approved), and the bulk confirm shows a **status
+breakdown** so sweeping in-progress items is never a surprise. Status is a
+**multi-runtime contract** — the full keep-in-sync map:
 
 - **DB (migration owed):** `svg_status` is a Postgres enum
   ([gist-supabase-schema.sql](gist-supabase-schema.sql) line 24, used by BOTH
@@ -842,21 +854,30 @@ keep-in-sync map:
   owed.
 - **Archive trigger:** each approved→fix move archives the old row + bumps
   `version` (status changes always do). Expected, harmless.
-- **Workflow design Qs for the session:** who moves `fix` → `approved`
-  (manual, once the Lab verdict is green?); auto-promote logic only touches
-  `draft`, so it needs no change — confirm.
-- **Bulk-move mechanics:** the failing set is computed **client-side**
-  (`planckReadiness` needs the decomposition), so plain SQL can't find it.
-  Either a Lab triage action ("mark all ✖P as Fix" driving the existing
-  `updateStatus` mutation) or hand-list the names from the Lab and move them.
-  The Lab action is probably worth it — it makes the triage repeatable.
+- **Workflow design Qs — RESOLVED:** `fix` → prior status is **manual** via the
+  DetailModal status control (renders from `STATUSES`, so `fix` appears
+  automatically). Auto-promote logic only touches `draft`; a `fix` item won't
+  auto-promote — no change needed. Confirmed.
+- **Bulk-move mechanics — SHIPPED:** a Lab triage action, since the failing set
+  is computed **client-side** (`planckReadiness` needs the decomposition) so
+  plain SQL can't find it. [ColliderLab.jsx](src/components/ColliderLab.jsx)
+  `handleBulkMoveToFix` — **"Move all ✖P → Fix (N)"** button that targets
+  `planckLevel === "fail"` AND `status !== "fix"` (so re-running is a no-op),
+  computed from the FULL lab set (not the filtered view, so nothing hidden is
+  missed), with a status-breakdown `window.confirm`, looping `updateStatus`
+  (passed as `onSetStatus`). Also added: **status filter buttons** in the Lab
+  (mirror FilterBar's solo behavior; idea_only excluded).
 
-**Acceptance (sketch)**
-- Fix options written up here with a chosen default per shape class; `bird`
-  repaired as the pilot (closes Task 15's ☐).
-- `fix` exists end-to-end: enum migrated + schema file updated + UI chip/filter.
-- Every approved item badging `✖P` moved to `fix`; export scope verifiably
-  excludes them.
+**Acceptance**
+- ☐ Fix options (part 1) written up here with a chosen default per shape class;
+  `bird` repaired as the pilot (closes Task 15's ☐). **Still open — part 1.**
+- ☑ `fix` exists end-to-end: schema file updated (migration 11e) + `STATUSES`/
+  `STATUS_CONFIG` chip (red/rose) + FilterBar button (auto) + Lab status filters.
+  **Bill still owes the live enum migration** (`alter type svg_status add value
+  'fix';` outside a txn) — code is deployed but the DB write of a `fix` row will
+  error until then.
+- ☑ Bulk-move sweeps all `✖P` items to `fix`; export scope (`status ===
+  "approved"`) verifiably excludes them. **Verify after the migration.**
 
 ---
 

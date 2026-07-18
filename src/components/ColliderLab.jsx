@@ -1,6 +1,11 @@
 import { useState } from "react";
 import { isConvexPolygon, planckReadiness } from "../lib/colliderSchema.js";
+import { STATUSES, STATUS_CONFIG } from "../lib/constants.js";
 import ColliderGroundTruth from "./ColliderGroundTruth.jsx";
+
+// Statuses the Lab can filter by. idea_only is excluded everywhere in the Lab
+// (no renderable), so it's not offered as a filter either.
+const LAB_STATUSES = STATUSES.filter((s) => s !== "idea_only");
 
 // Collider Lab — a dedicated audit/triage surface for colliders, decoupled
 // from DetailModal. Phase 1 is READ-ONLY: see "like" SVGs grouped by collider
@@ -57,6 +62,7 @@ export default function ColliderLab({
   items,
   initialSelectedId,
   onSaveCollider,
+  onSetStatus,
   onDownload,
   showToast,
 }) {
@@ -65,10 +71,72 @@ export default function ColliderLab({
   // each tab switch, so this captures the latest focus id each time.
   const [selectedId, setSelectedId] = useState(initialSelectedId ?? null);
 
+  // Status filter — same solo behavior as the SVG Manager's FilterBar
+  // (click one when all shown → solo it; click the soloed one → restore all).
+  const [statusFilter, setStatusFilter] = useState(new Set(LAB_STATUSES));
+  const [moving, setMoving] = useState(false);
+
   // Parents + standalones only; skip idea_only concepts (no real renderable).
-  const labItems = (items ?? []).filter(
+  const allLabItems = (items ?? []).filter(
     (it) => !it.parentId && it.status !== "idea_only"
   );
+
+  // The ✖P bulk-move target is computed from the FULL set, not the filtered
+  // view — "move all ✖P" must not silently miss items hidden by the filter.
+  // Already-fix items are excluded so re-running the button is a no-op.
+  const failSet = allLabItems.filter(
+    (it) => it.status !== "fix" && planckLevel(it) === "fail"
+  );
+
+  const labItems = allLabItems.filter((it) => statusFilter.has(it.status));
+
+  const toggleStatus = (status) =>
+    setStatusFilter((prev) => {
+      if (prev.size === LAB_STATUSES.length) return new Set([status]);
+      if (prev.size === 1 && prev.has(status)) return new Set(LAB_STATUSES);
+      const next = new Set(prev);
+      if (next.has(status)) next.delete(status);
+      else next.add(status);
+      return next.size === 0 ? new Set(LAB_STATUSES) : next;
+    });
+
+  const handleBulkMoveToFix = async () => {
+    if (!onSetStatus || failSet.length === 0 || moving) return;
+    // Breakdown by current status so sweeping in-progress items is never a
+    // surprise (a repaired draft should go back to draft, not silently ship).
+    const byStatus = failSet.reduce((acc, it) => {
+      acc[it.status] = (acc[it.status] || 0) + 1;
+      return acc;
+    }, {});
+    const breakdown = LAB_STATUSES.filter((s) => byStatus[s])
+      .map((s) => `${byStatus[s]} ${STATUS_CONFIG[s].label.toLowerCase()}`)
+      .join(", ");
+    const ok = window.confirm(
+      `Move ${failSet.length} item${failSet.length === 1 ? "" : "s"} to Fix ` +
+        `(${breakdown})?\n\n` +
+        `These colliders exceed Planck's 12-vertex cap. Fix items drop out of ` +
+        `the approved/export set until repaired. Return them via each item's ` +
+        `status control once the Lab verdict is green.`
+    );
+    if (!ok) return;
+    setMoving(true);
+    let moved = 0;
+    try {
+      for (const it of failSet) {
+        await onSetStatus(it.id, "fix");
+        moved += 1;
+      }
+      showToast?.(`Moved ${moved} to Fix`);
+    } catch {
+      showToast?.(
+        moved > 0
+          ? `Moved ${moved} of ${failSet.length} to Fix — the rest failed`
+          : "Move to Fix failed"
+      );
+    } finally {
+      setMoving(false);
+    }
+  };
 
   const facet = SHAPE_FACET;
   const groups = facet.groups
@@ -87,9 +155,80 @@ export default function ColliderLab({
           Collider Lab
         </h2>
         <div style={{ fontSize: 12, color: "var(--color-text-tertiary)" }}>
-          {labItems.length} items · grouped by {facet.label.toLowerCase()} ·
-          color variants inherit from their parent and are hidden here
+          {labItems.length} of {allLabItems.length} items · grouped by{" "}
+          {facet.label.toLowerCase()} · color variants inherit from their parent
+          and are hidden here
         </div>
+      </div>
+
+      {/* Status filter row + ✖P bulk-move-to-fix */}
+      <div
+        style={{
+          display: "flex",
+          gap: 6,
+          alignItems: "center",
+          marginBottom: 16,
+          flexWrap: "wrap",
+        }}
+      >
+        <span
+          style={{ fontSize: 12, color: "var(--color-text-tertiary)", marginRight: 2 }}
+        >
+          Status:
+        </span>
+        {LAB_STATUSES.map((status) => {
+          const config = STATUS_CONFIG[status];
+          const isOn = statusFilter.has(status);
+          const isSolo = statusFilter.size === 1 && isOn;
+          const count = allLabItems.filter((it) => it.status === status).length;
+          return (
+            <button
+              key={status}
+              onClick={() => toggleStatus(status)}
+              style={{
+                fontSize: 12,
+                padding: "4px 10px",
+                borderRadius: "var(--border-radius-md)",
+                cursor: "pointer",
+                background: isOn ? config.bg : "transparent",
+                color: isOn ? config.dk : "var(--color-text-tertiary)",
+                border: isSolo
+                  ? `2px solid ${config.c}`
+                  : isOn
+                  ? `0.5px solid ${config.c}40`
+                  : "0.5px solid var(--color-border-tertiary)",
+                fontWeight: isOn ? 500 : 400,
+              }}
+            >
+              {config.label} ({count})
+            </button>
+          );
+        })}
+        <span style={{ flex: 1 }} />
+        <button
+          onClick={handleBulkMoveToFix}
+          disabled={failSet.length === 0 || moving}
+          title="Move every collider that exceeds Planck's 12-vertex cap (✖P) into the Fix status, pulling it out of the export set"
+          style={{
+            fontSize: 12,
+            padding: "4px 10px",
+            borderRadius: "var(--border-radius-md)",
+            cursor: failSet.length === 0 || moving ? "default" : "pointer",
+            background: failSet.length === 0 ? "transparent" : STATUS_CONFIG.fix.bg,
+            color:
+              failSet.length === 0
+                ? "var(--color-text-tertiary)"
+                : STATUS_CONFIG.fix.dk,
+            border:
+              failSet.length === 0
+                ? "0.5px solid var(--color-border-tertiary)"
+                : `0.5px solid ${STATUS_CONFIG.fix.c}`,
+            fontWeight: 500,
+            opacity: moving ? 0.6 : 1,
+          }}
+        >
+          {moving ? "Moving…" : `Move all ✖P → Fix (${failSet.length})`}
+        </button>
       </div>
 
       {labItems.length === 0 ? (
@@ -101,7 +240,9 @@ export default function ColliderLab({
             fontSize: 14,
           }}
         >
-          No items to inspect.
+          {allLabItems.length === 0
+            ? "No items to inspect."
+            : "No items match the status filter."}
         </div>
       ) : (
         <div style={{ display: "flex", gap: 20, alignItems: "flex-start", flexWrap: "wrap" }}>
@@ -170,9 +311,9 @@ export default function ColliderLab({
 function LabCard({ item, selected, concave, planck, onClick }) {
   const planckBadge =
     planck === "fail"
-      ? { bg: "#FEE2E2", fg: "#991B1B", text: "✖P", title: "Exceeds Planck's 8-vertex cap — won't decompose away" }
+      ? { bg: "#FEE2E2", fg: "#991B1B", text: "✖P", title: "Exceeds Planck's 12-vertex cap — decomposition won't reduce it below 12" }
       : planck === "warn"
-      ? { bg: "#FEF3C7", fg: "#92400E", text: "⚠P", title: "Concave >8 — a part may exceed Planck's 8 after decomposition; verify in gist dev build" }
+      ? { bg: "#FEF3C7", fg: "#92400E", text: "⚠P", title: "No clean Planck verdict — self-intersecting or undecomposable outline; verify in gist's dev build" }
       : null;
   return (
     <div

@@ -10,6 +10,7 @@ import {
 import {
   computeConcaveOutline,
   computeSilhouetteOutline,
+  computeColliderForType,
 } from "../lib/colliderGenerator.js";
 import ColliderPreview from "./ColliderPreview.jsx";
 import GeometryInfo from "./GeometryInfo.jsx";
@@ -93,8 +94,9 @@ export default function ColliderGroundTruth({
   const inherited = item.parentId != null;
   const collider = editing ? draft : storedCollider;
 
-  // Phase 2 edits polygons only.
-  const editable = storedCollider?.type === "convex";
+  // Interactive editing: polygons (vertex editor) + circle/box (resize
+  // handles). Compound stays read-only for now.
+  const editable = ["convex", "circle", "box"].includes(storedCollider?.type);
 
   const colBounds = collider ? getColliderBounds(collider) : null;
 
@@ -200,6 +202,28 @@ export default function ColliderGroundTruth({
     }
   }
 
+  // Fit a Planck-safe PRIMITIVE (circle or box) to the content and stage it
+  // as a draft for review — the fix for round/rectangular shapes stuck with an
+  // over-cap polygon collider. computeColliderForType is deterministic and
+  // content-fitted (circle = centroid + max-distance bounding circle of the
+  // hull; box = axis-aligned bbox). Primitives are always Planck-safe, so this
+  // turns a ✖P item green. Save writes through onSaveCollider like any edit.
+  function fitPrimitive(type) {
+    const { collider: fitted, debug } = computeColliderForType(item.svg, type);
+    if (!fitted) {
+      showToast?.(`Couldn't fit a ${type} (no geometry).`);
+      return;
+    }
+    setDraft(fitted);
+    setEditSpace(editSpaceFor(getColliderBounds(fitted)));
+    setEditing(true);
+    const src =
+      debug?.strategy === "fallback-full-box"
+        ? "no geometry found — full-viewBox fallback"
+        : `fit to ${debug?.hullPoints ?? "?"} hull points`;
+    showToast?.(`Fitted ${type} (${src}) — review the overlay & Save`);
+  }
+
   function cancelEdit() {
     setEditing(false);
     setDraft(null);
@@ -209,6 +233,7 @@ export default function ColliderGroundTruth({
   const setVertices = (verts) => setDraft((d) => ({ ...d, vertices: verts }));
 
   function pullInBounds() {
+    if (draft?.type !== "convex") return; // vertices only exist on polygons
     setVertices(
       draft.vertices.map(([x, y]) => [
         round2(Math.max(0, Math.min(W, x))),
@@ -285,6 +310,20 @@ export default function ColliderGroundTruth({
             >
               ▦ Trace silhouette
             </button>
+            <button
+              onClick={() => fitPrimitive("circle")}
+              title="Fit a bounding circle to the content — the Planck-safe fix for round shapes (balls, wheels). Always passes the vertex cap."
+              style={headerBtnStyle}
+            >
+              ◯ Fit circle
+            </button>
+            <button
+              onClick={() => fitPrimitive("box")}
+              title="Fit an axis-aligned bounding box to the content — Planck-safe for rectangular shapes (crates, planks)."
+              style={headerBtnStyle}
+            >
+              ▭ Fit box
+            </button>
             {editable && (
               <button onClick={enterEdit} style={headerBtnStyle}>
                 Edit collider
@@ -305,8 +344,9 @@ export default function ColliderGroundTruth({
 
       {!editing && storedCollider && !editable && (
         <div style={{ fontSize: 11, color: "var(--color-text-tertiary)", marginBottom: 8 }}>
-          Editing {storedCollider.type} colliders isn’t supported yet — this
-          phase edits polygons only.
+          No vertex editor for {storedCollider.type} colliders — to change it,
+          re-fit a primitive (Fit circle / Fit box) or trace a polygon outline
+          above.
         </div>
       )}
 
@@ -343,6 +383,14 @@ export default function ColliderGroundTruth({
           <PolygonEditLayer
             vertices={draft.vertices}
             onChange={setVertices}
+            space={space}
+            vbWidth={W}
+            vbHeight={H}
+          />
+        ) : editing && (draft?.type === "circle" || draft?.type === "box") ? (
+          <PrimitiveEditLayer
+            collider={draft}
+            onChange={(patch) => setDraft((d) => ({ ...d, ...patch }))}
             space={space}
             vbWidth={W}
             vbHeight={H}
@@ -407,6 +455,7 @@ export default function ColliderGroundTruth({
           dirty={dirty}
           saving={saving}
           isOob={isOob}
+          draftType={draft?.type}
           concave={concave}
           planckCapViolated={planckCapViolated}
           selfIntersects={selfIntersects}
@@ -686,11 +735,200 @@ function PolygonEditLayer({ vertices, onChange, space, vbWidth, vbHeight }) {
   );
 }
 
-// Buttons + live validation while editing a polygon collider.
+// Interactive resize layer for a circle or box draft, in the SAME coordinate
+// space as the icon/grid (so handles sit exactly on the shape). Drag a corner/
+// edge handle to resize, the center handle to move. Circle: 4 cardinal radius
+// handles + center. Box: 4 corner + 4 edge handles (opposite edge anchored) +
+// center. Handles carry pointer events; the shape outline does not, so the fill
+// never swallows a grab. Mouse → viewBox-unit via getScreenCTM().inverse(),
+// same as PolygonEditLayer.
+const MIN_PRIMITIVE = 2; // floor for radius / box side (viewBox units)
+
+function boxEdges(c) {
+  const [cx, cy] = c.center;
+  const hw = c.width / 2;
+  const hh = c.height / 2;
+  return { L: cx - hw, T: cy - hh, R: cx + hw, B: cy + hh };
+}
+function boxFromEdges(L, T, R, B) {
+  return {
+    center: [round2((L + R) / 2), round2((T + B) / 2)],
+    width: round2(R - L),
+    height: round2(B - T),
+  };
+}
+
+function PrimitiveEditLayer({ collider, onChange, space, vbWidth, vbHeight }) {
+  const svgRef = useRef(null);
+  const [drag, setDrag] = useState(null); // handle descriptor being dragged
+
+  const { minX, minY, maxX, maxY } = space;
+  const EW = maxX - minX;
+  const EH = maxY - minY;
+  const maxDim = Math.max(EW, EH);
+  const dotR = maxDim / 36;
+
+  const clientToSvg = useCallback((clientX, clientY) => {
+    const svg = svgRef.current;
+    if (!svg) return [0, 0];
+    const pt = svg.createSVGPoint();
+    pt.x = clientX;
+    pt.y = clientY;
+    const ctm = svg.getScreenCTM();
+    if (!ctm) return [0, 0];
+    const p = pt.matrixTransform(ctm.inverse());
+    return [p.x, p.y];
+  }, []);
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+  // Build the handle list for the current shape.
+  const handles = [];
+  if (collider.type === "circle") {
+    const [cx, cy] = collider.center;
+    const r = collider.radius;
+    handles.push({ id: "center", x: cx, y: cy, kind: "move", cursor: "move" });
+    handles.push({ id: "e", x: cx + r, y: cy, kind: "radius", cursor: "ew-resize" });
+    handles.push({ id: "w", x: cx - r, y: cy, kind: "radius", cursor: "ew-resize" });
+    handles.push({ id: "n", x: cx, y: cy - r, kind: "radius", cursor: "ns-resize" });
+    handles.push({ id: "s", x: cx, y: cy + r, kind: "radius", cursor: "ns-resize" });
+  } else if (collider.type === "box") {
+    const { L, T, R, B } = boxEdges(collider);
+    const midX = (L + R) / 2;
+    const midY = (T + B) / 2;
+    handles.push({ id: "center", x: midX, y: midY, kind: "move", cursor: "move" });
+    handles.push({ id: "tl", x: L, y: T, kind: "resize", ex: "L", ey: "T", cursor: "nwse-resize" });
+    handles.push({ id: "tr", x: R, y: T, kind: "resize", ex: "R", ey: "T", cursor: "nesw-resize" });
+    handles.push({ id: "bl", x: L, y: B, kind: "resize", ex: "L", ey: "B", cursor: "nesw-resize" });
+    handles.push({ id: "br", x: R, y: B, kind: "resize", ex: "R", ey: "B", cursor: "nwse-resize" });
+    handles.push({ id: "l", x: L, y: midY, kind: "resize", ex: "L", cursor: "ew-resize" });
+    handles.push({ id: "r", x: R, y: midY, kind: "resize", ex: "R", cursor: "ew-resize" });
+    handles.push({ id: "t", x: midX, y: T, kind: "resize", ey: "T", cursor: "ns-resize" });
+    handles.push({ id: "b", x: midX, y: B, kind: "resize", ey: "B", cursor: "ns-resize" });
+  }
+
+  const onDown = (e, h) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDrag(h);
+    svgRef.current?.setPointerCapture(e.pointerId);
+  };
+  const onMove = useCallback(
+    (e) => {
+      if (!drag) return;
+      const [rx, ry] = clientToSvg(e.clientX, e.clientY);
+      const px = clamp(rx, minX, maxX);
+      const py = clamp(ry, minY, maxY);
+      if (collider.type === "circle") {
+        if (drag.kind === "move") {
+          onChange({ center: [round2(px), round2(py)] });
+        } else {
+          const [cx, cy] = collider.center;
+          const r = Math.max(MIN_PRIMITIVE, Math.hypot(px - cx, py - cy));
+          onChange({ radius: round2(r) });
+        }
+      } else if (collider.type === "box") {
+        if (drag.kind === "move") {
+          onChange({ center: [round2(px), round2(py)] });
+        } else {
+          let { L, T, R, B } = boxEdges(collider);
+          if (drag.ex === "L") L = Math.min(px, R - MIN_PRIMITIVE);
+          if (drag.ex === "R") R = Math.max(px, L + MIN_PRIMITIVE);
+          if (drag.ey === "T") T = Math.min(py, B - MIN_PRIMITIVE);
+          if (drag.ey === "B") B = Math.max(py, T + MIN_PRIMITIVE);
+          onChange(boxFromEdges(L, T, R, B));
+        }
+      }
+    },
+    [drag, collider, onChange, clientToSvg, minX, minY, maxX, maxY]
+  );
+  const onUp = useCallback(() => setDrag(null), []);
+
+  const oobShape =
+    collider.type === "circle"
+      ? collider.center[0] - collider.radius < 0 ||
+        collider.center[1] - collider.radius < 0 ||
+        collider.center[0] + collider.radius > vbWidth ||
+        collider.center[1] + collider.radius > vbHeight
+      : (() => {
+          const { L, T, R, B } = boxEdges(collider);
+          return L < 0 || T < 0 || R > vbWidth || B > vbHeight;
+        })();
+  const stroke = oobShape ? "#EF4444" : "#3B82F6";
+
+  return (
+    <svg
+      ref={svgRef}
+      viewBox={`${minX} ${minY} ${EW} ${EH}`}
+      preserveAspectRatio="xMidYMid meet"
+      style={{
+        position: "absolute",
+        inset: 0,
+        width: "100%",
+        height: "100%",
+        pointerEvents: "auto",
+        overflow: "visible",
+        touchAction: "none",
+        cursor: drag ? "grabbing" : "default",
+      }}
+      onPointerMove={onMove}
+      onPointerUp={onUp}
+      onPointerLeave={onUp}
+    >
+      {collider.type === "circle" ? (
+        <circle
+          cx={collider.center[0]}
+          cy={collider.center[1]}
+          r={collider.radius}
+          fill="rgba(59, 130, 246, 0.12)"
+          stroke={stroke}
+          strokeWidth={maxDim / 150}
+          strokeDasharray={`${maxDim / 40} ${maxDim / 80}`}
+          style={{ pointerEvents: "none" }}
+        />
+      ) : (
+        (() => {
+          const { L, T, R, B } = boxEdges(collider);
+          return (
+            <rect
+              x={L}
+              y={T}
+              width={R - L}
+              height={B - T}
+              fill="rgba(59, 130, 246, 0.12)"
+              stroke={stroke}
+              strokeWidth={maxDim / 150}
+              strokeDasharray={`${maxDim / 40} ${maxDim / 80}`}
+              style={{ pointerEvents: "none" }}
+            />
+          );
+        })()
+      )}
+
+      {handles.map((h) => (
+        <circle
+          key={h.id}
+          cx={h.x}
+          cy={h.y}
+          r={dotR}
+          fill={h.kind === "move" ? "#F59E0B" : "#3B82F6"}
+          stroke="white"
+          strokeWidth={maxDim / 260}
+          style={{ cursor: h.cursor, pointerEvents: "auto" }}
+          onPointerDown={(e) => onDown(e, h)}
+        />
+      ))}
+    </svg>
+  );
+}
+
+// Buttons + live validation while editing a collider. A "convex" draft is the
+// interactive polygon edit (drag/add/delete vertices, pull in-bounds); a
+// circle/box draft is a fitted primitive that's review-and-Save only.
 function EditToolbar({
   dirty,
   saving,
   isOob,
+  draftType,
   concave,
   planckCapViolated,
   selfIntersects,
@@ -699,6 +937,7 @@ function EditToolbar({
   onSave,
   onCancel,
 }) {
+  const isPolygon = draftType === "convex";
   const blocked = planckCapViolated || selfIntersects;
   const saveDisabled = !dirty || saving || blocked;
   return (
@@ -736,25 +975,37 @@ function EditToolbar({
         >
           Cancel
         </button>
-        <button
-          onClick={onPullInBounds}
-          disabled={!isOob || saving}
-          title="Clamp every vertex into the 0–W / 0–H viewBox"
-          style={{
-            fontSize: 12,
-            padding: "6px 12px",
-            borderRadius: "var(--border-radius-md)",
-            border: "0.5px solid var(--color-border-secondary)",
-            background: "var(--color-background-primary)",
-            color: isOob ? undefined : "var(--color-text-tertiary)",
-            cursor: !isOob || saving ? "default" : "pointer",
-          }}
-        >
-          Pull in-bounds
-        </button>
+        {isPolygon && (
+          <button
+            onClick={onPullInBounds}
+            disabled={!isOob || saving}
+            title="Clamp every vertex into the 0–W / 0–H viewBox"
+            style={{
+              fontSize: 12,
+              padding: "6px 12px",
+              borderRadius: "var(--border-radius-md)",
+              border: "0.5px solid var(--color-border-secondary)",
+              background: "var(--color-background-primary)",
+              color: isOob ? undefined : "var(--color-text-tertiary)",
+              cursor: !isOob || saving ? "default" : "pointer",
+            }}
+          >
+            Pull in-bounds
+          </button>
+        )}
         <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>
-          {vertCount} vertices · drag a dot to move · click an edge to add ·
-          press <kbd>Delete</kbd> to remove the vertex you're hovering or dragging
+          {isPolygon ? (
+            <>
+              {vertCount} vertices · drag a dot to move · click an edge to add ·
+              press <kbd>Delete</kbd> to remove the vertex you're hovering or dragging
+            </>
+          ) : (
+            <>
+              {draftType === "circle" ? "circle" : "box"} · drag a{" "}
+              {draftType === "circle" ? "radius" : "corner/edge"} handle to
+              resize · drag the amber center to move · then Save
+            </>
+          )}
         </span>
       </div>
 

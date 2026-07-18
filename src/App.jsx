@@ -817,6 +817,7 @@ function SignedInApp({ user, onSignOut }) {
           onSaveCollider={(id, collider) =>
             svgs.updatePhysicalProperties(id, { collider })
           }
+          onSetStatus={svgs.updateStatus}
           onDownload={handleColliderLabDownload}
           showToast={showToast}
         />

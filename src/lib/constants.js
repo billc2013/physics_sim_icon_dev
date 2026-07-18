@@ -1,7 +1,9 @@
 import systemPromptConfig from "../../shared/system_prompt.json";
 
-// Status workflow values, in canonical display order.
-export const STATUSES = ["draft", "revised", "approved", "idea_only"];
+// Status workflow values, in canonical display order. 'fix' sits after
+// 'approved' — it's a collider-quality quarantine for SVGs failing Planck's
+// 12-vertex verdict, pulled out of the approved/export set until repaired.
+export const STATUSES = ["draft", "revised", "approved", "fix", "idea_only"];
 
 // Per-status display config: label, accent color, background, dark text.
 // Keys: c = accent color, bg = background, dk = dark text on background.
@@ -9,6 +11,7 @@ export const STATUS_CONFIG = {
   draft:     { label: "Draft",     c: "#6366F1", bg: "#EEEDFE", dk: "#3C3489" },
   revised:   { label: "Revised",   c: "#D85A30", bg: "#FAECE7", dk: "#712B13" },
   approved:  { label: "Approved",  c: "#1D9E75", bg: "#E1F5EE", dk: "#085041" },
+  fix:       { label: "Fix",       c: "#E11D48", bg: "#FDE7EC", dk: "#8D1231" },
   idea_only: { label: "Idea only", c: "#BA7517", bg: "#FAEEDA", dk: "#412402" },
 };
 

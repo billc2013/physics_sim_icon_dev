@@ -1,15 +1,23 @@
 import { useState } from "react";
 
-// Minimal email/password login screen. Toggles between sign-in and sign-up
-// modes. On success, useAuth's onAuthStateChange listener fires and the
-// app routes to the grid automatically.
-export default function LoginPage({ onSignIn, onSignUp }) {
-  const [mode, setMode] = useState("signIn"); // 'signIn' | 'signUp'
+// Minimal email/password login screen. Toggles between sign-in, sign-up,
+// and forgot-password modes. On success, useAuth's onAuthStateChange
+// listener fires and the app routes to the grid automatically.
+export default function LoginPage({ onSignIn, onSignUp, onResetPassword }) {
+  const [mode, setMode] = useState("signIn"); // 'signIn' | 'signUp' | 'forgot'
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [pendingConfirm, setPendingConfirm] = useState(false);
+  const [resetSent, setResetSent] = useState(false);
+
+  const switchMode = (next) => {
+    setMode(next);
+    setError(null);
+    setPendingConfirm(false);
+    setResetSent(false);
+  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -18,11 +26,14 @@ export default function LoginPage({ onSignIn, onSignUp }) {
     try {
       if (mode === "signIn") {
         await onSignIn(email, password);
-      } else {
+      } else if (mode === "signUp") {
         await onSignUp(email, password);
         // If the project requires email confirmation, the session won't
         // start until the user clicks the confirmation link. Show a hint.
         setPendingConfirm(true);
+      } else {
+        await onResetPassword(email);
+        setResetSent(true);
       }
     } catch (err) {
       setError(err.message ?? String(err));
@@ -68,7 +79,11 @@ export default function LoginPage({ onSignIn, onSignUp }) {
             marginBottom: 16,
           }}
         >
-          {mode === "signIn" ? "Sign in to continue." : "Create an account."}
+          {mode === "signIn"
+            ? "Sign in to continue."
+            : mode === "signUp"
+              ? "Create an account."
+              : "Enter your email and we'll send a password reset link."}
         </div>
 
         <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: 10 }}>
@@ -81,15 +96,17 @@ export default function LoginPage({ onSignIn, onSignUp }) {
             autoFocus
             style={{ width: "100%" }}
           />
-          <input
-            type="password"
-            placeholder="Password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            required
-            minLength={6}
-            style={{ width: "100%" }}
-          />
+          {mode !== "forgot" && (
+            <input
+              type="password"
+              placeholder="Password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              required
+              minLength={6}
+              style={{ width: "100%" }}
+            />
+          )}
           {error && (
             <div
               style={{
@@ -116,8 +133,28 @@ export default function LoginPage({ onSignIn, onSignUp }) {
               Check your email for a confirmation link, then come back and sign in.
             </div>
           )}
+          {resetSent && (
+            <div
+              style={{
+                fontSize: 12,
+                color: "var(--color-text-success)",
+                background: "var(--color-background-success)",
+                padding: "6px 10px",
+                borderRadius: "var(--border-radius-md)",
+              }}
+            >
+              If an account exists for that email, a reset link is on its way.
+              Click it to choose a new password.
+            </div>
+          )}
           <button type="submit" disabled={submitting} style={{ fontSize: 13 }}>
-            {submitting ? "Working..." : mode === "signIn" ? "Sign in" : "Create account"}
+            {submitting
+              ? "Working..."
+              : mode === "signIn"
+                ? "Sign in"
+                : mode === "signUp"
+                  ? "Create account"
+                  : "Send reset link"}
           </button>
         </form>
 
@@ -134,11 +171,7 @@ export default function LoginPage({ onSignIn, onSignUp }) {
               No account?{" "}
               <button
                 type="button"
-                onClick={() => {
-                  setMode("signUp");
-                  setError(null);
-                  setPendingConfirm(false);
-                }}
+                onClick={() => switchMode("signUp")}
                 style={{
                   color: "var(--color-text-info)",
                   border: "none",
@@ -147,17 +180,25 @@ export default function LoginPage({ onSignIn, onSignUp }) {
               >
                 Sign up
               </button>
+              {" · "}
+              <button
+                type="button"
+                onClick={() => switchMode("forgot")}
+                style={{
+                  color: "var(--color-text-info)",
+                  border: "none",
+                  padding: 0,
+                }}
+              >
+                Lost password?
+              </button>
             </>
           ) : (
             <>
               Have an account?{" "}
               <button
                 type="button"
-                onClick={() => {
-                  setMode("signIn");
-                  setError(null);
-                  setPendingConfirm(false);
-                }}
+                onClick={() => switchMode("signIn")}
                 style={{
                   color: "var(--color-text-info)",
                   border: "none",

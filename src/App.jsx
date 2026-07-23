@@ -14,6 +14,7 @@ import {
   parseViewBox,
 } from "./lib/svgGeometry.js";
 import LoginPage from "./components/LoginPage.jsx";
+import ResetPasswordPage from "./components/ResetPasswordPage.jsx";
 import Header from "./components/Header.jsx";
 import TabStrip from "./components/TabStrip.jsx";
 import Toast from "./components/Toast.jsx";
@@ -89,8 +90,19 @@ export default function App() {
   if (auth.loading) {
     return <CenteredMessage>Loading...</CenteredMessage>;
   }
+  // Arrived via a password-recovery email link: Supabase signed the user in
+  // with a temporary session — make them set a new password before entering.
+  if (auth.passwordRecovery && auth.user) {
+    return <ResetPasswordPage onUpdatePassword={auth.updatePassword} />;
+  }
   if (!auth.user) {
-    return <LoginPage onSignIn={auth.signIn} onSignUp={auth.signUp} />;
+    return (
+      <LoginPage
+        onSignIn={auth.signIn}
+        onSignUp={auth.signUp}
+        onResetPassword={auth.resetPassword}
+      />
+    );
   }
 
   return <SignedInApp user={auth.user} onSignOut={auth.signOut} />;

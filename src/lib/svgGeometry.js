@@ -190,6 +190,31 @@ export function getColliderBounds(collider) {
   }
 }
 
+/**
+ * Per-edge overflow of a collider past the [0,0 → W,H] viewBox rect — THE
+ * out-of-bounds predicate. The ground-truth inspector's expanded-space
+ * warning, the Collider Lab's OOB badge, and the Lab's "Move all OOB → Fix"
+ * bulk sweep all use this single helper so they always agree (same
+ * discipline as useSvgs' isStale()).
+ *
+ * Returns `{ left, top, right, bottom, any }` — each edge holds the
+ * overflowing coordinate or null; `any` is true when at least one edge
+ * overflows. Returns null if the collider has no well-defined bounds.
+ */
+export function colliderOverflow(collider, vbWidth, vbHeight) {
+  const b = getColliderBounds(collider);
+  if (!b) return null;
+  const o = {
+    left: b.min[0] < 0 ? b.min[0] : null,
+    top: b.min[1] < 0 ? b.min[1] : null,
+    right: b.max[0] > vbWidth ? b.max[0] : null,
+    bottom: b.max[1] > vbHeight ? b.max[1] : null,
+  };
+  o.any =
+    o.left != null || o.top != null || o.right != null || o.bottom != null;
+  return o;
+}
+
 function boundsFromPoints(points) {
   if (!points || points.length === 0) return null;
   let minX = Infinity;

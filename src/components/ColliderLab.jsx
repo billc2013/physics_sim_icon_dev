@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { isConvexPolygon, planckReadiness } from "../lib/colliderSchema.js";
+import { parseViewBox, colliderOverflow } from "../lib/svgGeometry.js";
 import { STATUSES, STATUS_CONFIG } from "../lib/constants.js";
 import ColliderGroundTruth from "./ColliderGroundTruth.jsx";
 
@@ -58,6 +59,17 @@ function planckLevel(item) {
   return planckReadiness(c).level;
 }
 
+// Out-of-bounds: the collider spills past the item's own viewBox. Uses the
+// same shared colliderOverflow predicate as the ground-truth inspector's
+// warning, so the OOB badge / bulk sweep / inspector always agree. The 64×64
+// fallback mirrors the inspector's when the viewBox is unparseable.
+function isOutOfBounds(item) {
+  const c = item.effectivePhysicalProperties?.collider;
+  if (!c) return false;
+  const vb = parseViewBox(item.svg) ?? { width: 64, height: 64 };
+  return colliderOverflow(c, vb.width, vb.height)?.any ?? false;
+}
+
 export default function ColliderLab({
   items,
   initialSelectedId,
@@ -81,11 +93,14 @@ export default function ColliderLab({
     (it) => !it.parentId && it.status !== "idea_only"
   );
 
-  // The ✖P bulk-move target is computed from the FULL set, not the filtered
-  // view — "move all ✖P" must not silently miss items hidden by the filter.
-  // Already-fix items are excluded so re-running the button is a no-op.
+  // Bulk-move targets are computed from the FULL set, not the filtered view —
+  // "move all" must not silently miss items hidden by the filter.
+  // Already-fix items are excluded so re-running a button is a no-op.
   const failSet = allLabItems.filter(
     (it) => it.status !== "fix" && planckLevel(it) === "fail"
+  );
+  const oobSet = allLabItems.filter(
+    (it) => it.status !== "fix" && isOutOfBounds(it)
   );
 
   const labItems = allLabItems.filter((it) => statusFilter.has(it.status));
@@ -100,11 +115,13 @@ export default function ColliderLab({
       return next.size === 0 ? new Set(LAB_STATUSES) : next;
     });
 
-  const handleBulkMoveToFix = async () => {
-    if (!onSetStatus || failSet.length === 0 || moving) return;
+  // Shared bulk-mover for the per-issue sweep buttons (✖P, OOB). Each issue
+  // supplies its target set + a one-line reason for the confirm dialog.
+  const bulkMoveToFix = async (targetSet, reason) => {
+    if (!onSetStatus || targetSet.length === 0 || moving) return;
     // Breakdown by current status so sweeping in-progress items is never a
     // surprise (a repaired draft should go back to draft, not silently ship).
-    const byStatus = failSet.reduce((acc, it) => {
+    const byStatus = targetSet.reduce((acc, it) => {
       acc[it.status] = (acc[it.status] || 0) + 1;
       return acc;
     }, {});
@@ -112,17 +129,16 @@ export default function ColliderLab({
       .map((s) => `${byStatus[s]} ${STATUS_CONFIG[s].label.toLowerCase()}`)
       .join(", ");
     const ok = window.confirm(
-      `Move ${failSet.length} item${failSet.length === 1 ? "" : "s"} to Fix ` +
+      `Move ${targetSet.length} item${targetSet.length === 1 ? "" : "s"} to Fix ` +
         `(${breakdown})?\n\n` +
-        `These colliders exceed Planck's 12-vertex cap. Fix items drop out of ` +
-        `the approved/export set until repaired. Return them via each item's ` +
-        `status control once the Lab verdict is green.`
+        `${reason} Fix items drop out of the approved/export set until ` +
+        `repaired. Return them via each item's status control once repaired.`
     );
     if (!ok) return;
     setMoving(true);
     let moved = 0;
     try {
-      for (const it of failSet) {
+      for (const it of targetSet) {
         await onSetStatus(it.id, "fix");
         moved += 1;
       }
@@ -130,7 +146,7 @@ export default function ColliderLab({
     } catch {
       showToast?.(
         moved > 0
-          ? `Moved ${moved} of ${failSet.length} to Fix — the rest failed`
+          ? `Moved ${moved} of ${targetSet.length} to Fix — the rest failed`
           : "Move to Fix failed"
       );
     } finally {
@@ -205,30 +221,55 @@ export default function ColliderLab({
           );
         })}
         <span style={{ flex: 1 }} />
-        <button
-          onClick={handleBulkMoveToFix}
-          disabled={failSet.length === 0 || moving}
-          title="Move every collider that exceeds Planck's 12-vertex cap (✖P) into the Fix status, pulling it out of the export set"
-          style={{
-            fontSize: 12,
-            padding: "4px 10px",
-            borderRadius: "var(--border-radius-md)",
-            cursor: failSet.length === 0 || moving ? "default" : "pointer",
-            background: failSet.length === 0 ? "transparent" : STATUS_CONFIG.fix.bg,
-            color:
-              failSet.length === 0
-                ? "var(--color-text-tertiary)"
-                : STATUS_CONFIG.fix.dk,
-            border:
-              failSet.length === 0
-                ? "0.5px solid var(--color-border-tertiary)"
-                : `0.5px solid ${STATUS_CONFIG.fix.c}`,
-            fontWeight: 500,
-            opacity: moving ? 0.6 : 1,
-          }}
-        >
-          {moving ? "Moving…" : `Move all ✖P → Fix (${failSet.length})`}
-        </button>
+        {/* One sweep button per fix-worthy issue: ✖P (Planck fail) and OOB
+            (collider spills past the viewBox). Same styling; each names its
+            issue in the label, tooltip, and confirm. */}
+        {[
+          {
+            key: "planck",
+            set: failSet,
+            label: `Move all ✖P → Fix (${failSet.length})`,
+            title:
+              "Move every collider that exceeds Planck's 12-vertex cap (✖P) into the Fix status, pulling it out of the export set",
+            reason: "These colliders exceed Planck's 12-vertex cap.",
+          },
+          {
+            key: "oob",
+            set: oobSet,
+            label: `Move all OOB → Fix (${oobSet.length})`,
+            title:
+              "Move every collider that extends outside its icon's viewBox (OOB) into the Fix status, pulling it out of the export set",
+            reason:
+              "These colliders extend outside their icon's viewBox, so they misalign with the art in GIST.",
+          },
+        ].map((issue) => (
+          <button
+            key={issue.key}
+            onClick={() => bulkMoveToFix(issue.set, issue.reason)}
+            disabled={issue.set.length === 0 || moving}
+            title={issue.title}
+            style={{
+              fontSize: 12,
+              padding: "4px 10px",
+              borderRadius: "var(--border-radius-md)",
+              cursor: issue.set.length === 0 || moving ? "default" : "pointer",
+              background:
+                issue.set.length === 0 ? "transparent" : STATUS_CONFIG.fix.bg,
+              color:
+                issue.set.length === 0
+                  ? "var(--color-text-tertiary)"
+                  : STATUS_CONFIG.fix.dk,
+              border:
+                issue.set.length === 0
+                  ? "0.5px solid var(--color-border-tertiary)"
+                  : `0.5px solid ${STATUS_CONFIG.fix.c}`,
+              fontWeight: 500,
+              opacity: moving ? 0.6 : 1,
+            }}
+          >
+            {moving ? "Moving…" : issue.label}
+          </button>
+        ))}
       </div>
 
       {labItems.length === 0 ? (
@@ -277,6 +318,7 @@ export default function ColliderLab({
                       selected={it.id === selectedId}
                       concave={isConcaveOutline(it)}
                       planck={planckLevel(it)}
+                      oob={isOutOfBounds(it)}
                       onClick={() => setSelectedId(it.id)}
                     />
                   ))}
@@ -308,7 +350,7 @@ export default function ColliderLab({
   );
 }
 
-function LabCard({ item, selected, concave, planck, onClick }) {
+function LabCard({ item, selected, concave, planck, oob, onClick }) {
   const planckBadge =
     planck === "fail"
       ? { bg: "#FEE2E2", fg: "#991B1B", text: "✖P", title: "Exceeds Planck's 12-vertex cap — decomposition won't reduce it below 12" }
@@ -380,6 +422,24 @@ function LabCard({ item, selected, concave, planck, onClick }) {
           }}
         >
           concave
+        </span>
+      )}
+      {oob && (
+        <span
+          title="Collider extends outside the icon's viewBox — misaligns with the art in GIST; pull it in-bounds in the editor"
+          style={{
+            position: "absolute",
+            bottom: 3,
+            left: 3,
+            fontSize: 8,
+            fontWeight: 700,
+            padding: "1px 4px",
+            borderRadius: 4,
+            background: "#FEF3C7",
+            color: "#92400E",
+          }}
+        >
+          OOB
         </span>
       )}
     </div>

@@ -58,6 +58,11 @@ others is a silent drift bug. The current instances (all enumerated in
 5. **The stale predicate** — `isStale()` in `useSvgs.js` is the single source
    used by `SvgCard`, `DetailModal`, and `DownloadApprovedModal`. All three
    MUST use the helper, or they disagree about what's in the next export.
+6. **The out-of-bounds predicate** (added 2026-07-24) — `colliderOverflow()`
+   in `svgGeometry.js` is the single source for "does this collider spill
+   past its viewBox," used by `ColliderGroundTruth`'s overflow warning, the
+   Collider Lab's `OOB` badge, and the Lab's "Move all OOB → Fix" sweep.
+   Same discipline as #5: never reimplement the check inline.
 
 If a decision touches one of these and you've updated only some copies, it
 **isn't fully landed** — say so plainly and name which copy is missing (and

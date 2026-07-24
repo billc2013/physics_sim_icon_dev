@@ -215,7 +215,9 @@ Done. The repo is public on GitHub (public since 2026-06-23). Decision on what t
   - `VITE_SUPABASE_URL`
   - `VITE_SUPABASE_ANON_KEY`
   - `MODAL_ENDPOINT_URL`
+  - `MODAL_BATCH_ENDPOINT_URL` (added for Flows C/D — CLAUDE.md's Vercel env section lists all four)
   - Use `vercel env add <name> production` from the CLI for each
+- **Add the production URL to Supabase's Auth → URL Configuration allow-list** (Site URL or Additional Redirect URLs). The password-reset flow (shipped 2026-07-23) redirects recovery emails to `window.location.origin` — without this, reset emails from the production site bounce users to localhost
 - Possibly add `vercel.json` if a rewrite/header is needed (probably not)
 - Verify push to `main` triggers a deploy
 - Smoke-test the production URL: sign up as Duncan, sign in as Bill, generate something, accept it
@@ -226,7 +228,7 @@ Done. The repo is public on GitHub (public since 2026-06-23). Decision on what t
 - Custom domain (use the default `*.vercel.app` URL for now)
 
 **Acceptance**
-- Production URL works end-to-end with auth, generation (both flows), and persistence
+- Production URL works end-to-end with auth (including a password-reset email round-trip), generation (both flows), and persistence
 - Pushing to `main` redeploys automatically
 - Duncan can sign up via the production URL (Task 4 then unblocks)
 
@@ -822,7 +824,7 @@ series" framing — likely no single universal answer):
 `bird` (16-vert torso part) is the pilot specimen — its re-trace is Task 15's
 remaining ☐ and should exercise whichever option wins.
 
-**(2) New status `fix` + bulk move of failing items — SHIPPED 2026-07-18 (Task 16b), pending Bill's enum migration.** Intent: an
+**(2) New status `fix` + bulk move of failing items — SHIPPED 2026-07-18 (Task 16b; enum migration 11e run + verified same day).** Intent: an
 SVG whose collider fails Planck must not sit in the export set
 looking shippable. **Scope decision (2026-07-18): the bulk-move sweeps ALL ✖P
 items regardless of stage (draft/revised/approved), not just approved.** `fix`
@@ -867,17 +869,36 @@ breakdown** so sweeping in-progress items is never a surprise. Status is a
   missed), with a status-breakdown `window.confirm`, looping `updateStatus`
   (passed as `onSetStatus`). Also added: **status filter buttons** in the Lab
   (mirror FilterBar's solo behavior; idea_only excluded).
+- **Second fix-worthy issue: out-of-bounds (OOB) — SHIPPED 2026-07-24.** `fix`
+  now has two entry issues, not one: the Planck ✖P verdict AND a collider that
+  spills past its icon's viewBox (the data-quality problem the ground-truth
+  inspector's expanded grid revealed — `dynamics_cart`, `fire_truck`,
+  `flat_asteroid`). The OOB predicate is a **new single-source helper**,
+  `colliderOverflow(collider, W, H)` in
+  [svgGeometry.js](src/lib/svgGeometry.js) (per-edge overflow vs the 0–W/0–H
+  rect, all collider types via `getColliderBounds`), used by ALL THREE
+  consumers — the inspector's expanded-space warning (refactored to it), the
+  Lab's amber `OOB` card badge, and the Lab's **"Move all OOB → Fix (N)"**
+  button — same discipline as `isStale()`, so they can never disagree. The
+  sweep shares `bulkMoveToFix(set, reason)` with the ✖P button (full-set
+  computation, `status !== "fix"` exclusion, status-breakdown confirm). The
+  predicate is deliberately **strict** (any spill counts, matching the
+  inspector's red markers — no epsilon); if trivial overflows over-catch, add
+  a tolerance later. An item can be both ✖P and OOB — first sweep wins, the
+  other button's count drops. Repair = "Pull in-bounds" / vertex-drag /
+  primitive resize in the Lab, then the usual manual status return.
 
 **Acceptance**
 - ☐ Fix options (part 1) written up here with a chosen default per shape class;
   `bird` repaired as the pilot (closes Task 15's ☐). **Still open — part 1.**
 - ☑ `fix` exists end-to-end: schema file updated (migration 11e) + `STATUSES`/
   `STATUS_CONFIG` chip (red/rose) + FilterBar button (auto) + Lab status filters.
-  **Bill still owes the live enum migration** (`alter type svg_status add value
-  'fix';` outside a txn) — code is deployed but the DB write of a `fix` row will
-  error until then.
+  Live enum migration run + verified 2026-07-18 (the earlier "Bill still owes
+  the migration" note here was stale — CLAUDE.md had it right).
 - ☑ Bulk-move sweeps all `✖P` items to `fix`; export scope (`status ===
-  "approved"`) verifiably excludes them. **Verify after the migration.**
+  "approved"`) verifiably excludes them.
+- ☑ OOB sweep (2026-07-24): out-of-bounds items badge `OOB` and bulk-move to
+  `fix` via the second sweep button; predicate shared with the inspector.
 
 ---
 

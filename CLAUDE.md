@@ -17,7 +17,7 @@ For full project context, architecture diagram, schema details, and rationale, *
 Working end-to-end **on localhost**:
 
 - ✓ Vite + React app, decomposed into components/hooks/lib
-- ✓ Supabase auth (login UI, session handling, sign in / sign up / sign out)
+- ✓ Supabase auth (login UI, session handling, sign in / sign up / sign out, password reset — "Lost password?" flow added 2026-07-23)
 - ✓ Supabase data layer (`useSvgs` reads `svgs_with_details` view + `svg_feedback`, optimistic update mutations for status/notes/color/feedback)
 - ✓ Seed script with all 50 original SVGs in the database, attributed to Bill as `created_by`
 - ✓ Bill exists in `project_members` as owner; RLS enforced
@@ -46,6 +46,7 @@ Done (off-task-list):
 - ◐ Over-cap triage (Task 16, **2026-07-18**) — **part 2 shipped, part 1 in progress**:
   - ✓ **`fix` status** (schema migration 11e, live-migrated + checked) — a collider-quality quarantine for SVGs failing the Planck >12 verdict. `fix` items drop out of the approved/export set automatically (export filters `status === "approved"`). Fully synced across schema file / live DB / `constants.js`; not in the LLM contract, so no `modal deploy`. Return path is **manual** (set status back via DetailModal once the Lab verdict is green — a repaired draft returns to draft, not silently to approved).
   - ✓ **Collider Lab bulk triage** — a **"Move all ✖P → Fix"** button (sweeps *every* over-cap collider regardless of stage, with a status breakdown in the confirm) + **status filter buttons** in the Lab.
+  - ✓ **OOB as a second fix-worthy issue (2026-07-24)** — colliders spilling past their icon's viewBox now badge `OOB` in the Lab and have their own **"Move all OOB → Fix"** sweep button. Single-source predicate: `colliderOverflow()` in [svgGeometry.js](src/lib/svgGeometry.js), shared by the inspector's warning, the badge, and the sweep.
   - ◐ **Fix options (part 1):** ✓ **◯ Fit circle / ▭ Fit box** primitive tools + drag-handle **resize** (`PrimitiveEditLayer`) — the direct fix for round/rectangular ✖P items; circle/box are now first-class editable. Still open: re-trace-coarser / auto-coarsen tool + the `bird` pilot re-trace (Task 15's remaining ☐).
   - See [Collider Lab](#collider-lab) and [Dev_Tasks.md](Dev_Tasks.md) Task 16.
 
@@ -128,7 +129,9 @@ Do not violate these without explicit discussion:
 │   │   ├── GenerateNewModal.jsx  Flow A overlay with collision detection
 │   │   ├── GeneratePanel.jsx     STUB — leftover from Task 2, not used. Remove or repurpose.
 │   │   ├── Header.jsx
-│   │   ├── LoginPage.jsx
+│   │   ├── LoginPage.jsx         Sign in / sign up / forgot-password modes
+│   │   ├── ResetPasswordPage.jsx Set-new-password screen shown after a
+│   │   │                          password-recovery email link
 │   │   ├── SvgCard.jsx           Color dots on parent cards, ↑parent on variant cards
 │   │   ├── SvgGrid.jsx
 │   │   ├── SystemPrompt.jsx
@@ -320,7 +323,11 @@ All generation flows (except Flow D) now ask Claude to return a `collider` objec
 A dedicated **`Collider Lab`** tab (third tab in [TabStrip.jsx](src/components/TabStrip.jsx), alongside SVG Manager + Data Transforms) that pulls collider review out of the cramped DetailModal into a spatial audit/triage surface. **Task 13 — Phases 1–2 shipped, Phase 3 partially shipped** (audit/triage + polygon editing + single-item download + two auto-fit outline-trace tools + exact Planck verdicts). Remaining: Phase-2 sub-items (numeric vertex table, "⚠ N out-of-bounds" filter) + the pill editor are in [Dev_Tasks.md](Dev_Tasks.md).
 
 - **A view over existing data — no schema change.** Reads `useSvgs` items, writes via the existing `updatePhysicalProperties` (and `updateStatus` for the bulk-move). Gated behind `needsLibrary` in [App.jsx](src/App.jsx) so it loads the library like the SVG tab.
-- **Over-cap triage (Task 16b, 2026-07-18).** A **status filter row** (draft/revised/approved/fix; mirrors FilterBar's solo behavior, idea_only excluded) intersects with the shape grouping. A **"Move all ✖P → Fix (N)"** button (`handleBulkMoveToFix`) sweeps every collider failing the Planck verdict (`planckLevel === "fail"` AND `status !== "fix"`, computed from the FULL set so a filtered view can't hide any) into the `fix` status via `updateStatus`, with a status-breakdown `window.confirm`. `fix` pulls the item out of the approved/export set until repaired. See [Current state → Over-cap triage](#current-state-as-of-last-session).
+- **Collider-issue triage (Task 16b, 2026-07-18; OOB added 2026-07-24).** A **status filter row** (draft/revised/approved/fix; mirrors FilterBar's solo behavior, idea_only excluded) intersects with the shape grouping. **One sweep button per fix-worthy issue**, both sharing `bulkMoveToFix(set, reason)` in [ColliderLab.jsx](src/components/ColliderLab.jsx) (targets computed from the FULL set so a filtered view can't hide any; `status !== "fix"` excluded so re-running is a no-op; status-breakdown `window.confirm`):
+  - **"Move all ✖P → Fix (N)"** — colliders failing the Planck verdict (`planckLevel === "fail"`).
+  - **"Move all OOB → Fix (N)"** — colliders extending outside their icon's viewBox. The predicate is the shared **`colliderOverflow(collider, W, H)`** helper in [svgGeometry.js](src/lib/svgGeometry.js) — single source for the ground-truth inspector's overflow warning, the Lab's amber `OOB` card badge, and this sweep (the `isStale()` discipline; don't reimplement inline). Deliberately strict — any spill counts, no epsilon. An item can be both ✖P and OOB; whichever sweep runs first takes it.
+
+  `fix` pulls the item out of the approved/export set until repaired. See [Current state → Over-cap triage](#current-state-as-of-last-session).
 - **Grouping is an EXTENSIBLE facet.** [ColliderLab.jsx](src/components/ColliderLab.jsx) buckets items via a `facet` object (`{ groups[], bucketOf() }`). Phase 1 ships the **shape facet** (circle / box / polygon=`convex` / compound / none). Bill's planned **physics-perspective facets** slot in as additional facet objects — no rewrite. Children (variants) and `idea_only` concepts are excluded.
 - **Polygon group = stored `type:"convex"`** (the accepted-concave misnomer). A **"concave" badge** (detected via `isConvexPolygon`) flags closed concave outlines (cups/wagons) that gist will decompose downstream.
 - **Ground-truth inspector** ([ColliderGroundTruth.jsx](src/components/ColliderGroundTruth.jsx)): three aligned layers (icon → coordinate grid → collider overlay) in an **aspect-correct box, so non-square rescaled viewBoxes align with no letterboxing** — this sidesteps the `ColliderEditor` 64×64-hardcode bug. Reuses `ColliderPreview` + `GeometryInfo`, plus a monospace coordinate readout.
@@ -441,7 +448,7 @@ Expected iteration loop while tuning the prompt: edit `shared/system_prompt.json
 - 64×64 viewBox, inline SVG markup stored as `text` in Postgres
 - Monochromatic 3-tone (light/mid/dark from one hue) — see palette table in [overview_April_7.md](overview_April_7.md#color-palette-ramps-8-available)
 - People rendered as traffic-sign pictograms, no faces or details (per Bill's prompt edit)
-- Status workflow: `draft` → `revised` → `approved`, plus `idea_only` for concepts that map to physics-engine primitives (rope → distance joint, etc.) rather than standalone SVGs, plus `fix` — a collider-quality quarantine (Task 16b, 2026-07-18) for SVGs whose collider fails Planck's 12-vertex verdict. `fix` items drop out of the approved/export set automatically (export filters `status === "approved"`). The Collider Lab has a **"Move all ✖P → Fix"** bulk button (sweeps every over-cap collider regardless of stage, with a status breakdown in the confirm) + status filter buttons. Return path is manual — set the status back via DetailModal once the Lab verdict is green (a repaired draft returns to draft, not silently to approved).
+- Status workflow: `draft` → `revised` → `approved`, plus `idea_only` for concepts that map to physics-engine primitives (rope → distance joint, etc.) rather than standalone SVGs, plus `fix` — a collider-quality quarantine (Task 16b, 2026-07-18) for SVGs whose collider fails Planck's 12-vertex verdict **or extends outside its icon's viewBox (OOB, added 2026-07-24)**. `fix` items drop out of the approved/export set automatically (export filters `status === "approved"`). The Collider Lab has per-issue bulk buttons — **"Move all ✖P → Fix"** and **"Move all OOB → Fix"** (each sweeps every matching collider regardless of stage, with a status breakdown in the confirm) — plus status filter buttons. Return path is manual — set the status back via DetailModal once the Lab verdict is green (a repaired draft returns to draft, not silently to approved).
 
 ## UI behaviors worth preserving
 
@@ -456,6 +463,7 @@ These are intentional design decisions, not bugs:
 - **SVG sanitization on upload.** All uploaded SVGs are sanitized with [DOMPurify](https://github.com/cure53/DOMPurify) (`USE_PROFILES: { svg: true, svgFilters: true }`) before they hit state. This strips `<script>`, `on*` event attrs, `javascript:` URLs, `<foreignObject>` HTML payloads, and external `<use href>` exfiltration. If the sanitized output differs from the input the preview surfaces a non-blocking yellow warning so silent stripping isn't a mystery. **Note:** Claude-generated SVGs are NOT yet sanitized; that's a backlog item in [Dev_Tasks.md](Dev_Tasks.md).
 - **Upload size cap: 100 KB.** Existing files are ~1 KB; cap exists to catch "wrong file" disasters, not as a real budget.
 - **Keyboard nav.** Esc closes modal/system-prompt overlay; ← / → navigate visible items in modal. (Cmd/Ctrl+Z undo was removed in Task 3.)
+- **Password reset flow (2026-07-23).** "Lost password?" on [LoginPage.jsx](src/components/LoginPage.jsx) → email-only form → `resetPassword(email)` in [useAuth.js](src/hooks/useAuth.js) (`supabase.auth.resetPasswordForEmail` with `redirectTo: window.location.origin`). Clicking the emailed link signs the user in with a temporary session (that's Supabase's recovery model — the link IS the proof of identity) and fires `PASSWORD_RECOVERY`; App's gate then **forces** [ResetPasswordPage.jsx](src/components/ResetPasswordPage.jsx) (set new password via `supabase.auth.updateUser`) before the grid renders, so a recovery session can't wander into the app without setting a password. The login form's "reset link sent" hint deliberately says "if an account exists…" so it doesn't reveal which emails are registered. **External-config dependency:** the redirect origin must be in the Supabase dashboard's **Auth → URL Configuration** allow-list — localhost is there now; **the production URL must be added when Task 9b deploys** (noted in Dev_Tasks 9b scope), or reset emails will bounce users to localhost. Built-in Supabase mailer is rate-limited to a few emails/hour on free tier — fine for two users.
 
 ## Commands
 

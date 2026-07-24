@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { parseViewBox, getColliderBounds } from "../lib/svgGeometry.js";
+import {
+  parseViewBox,
+  getColliderBounds,
+  colliderOverflow,
+} from "../lib/svgGeometry.js";
 import {
   validateCollider,
   isConvexPolygon,
@@ -101,20 +105,9 @@ export default function ColliderGroundTruth({
   const colBounds = collider ? getColliderBounds(collider) : null;
 
   // Does the (possibly draft) collider spill past the icon's viewBox?
-  const overflow = colBounds
-    ? {
-        left: colBounds.min[0] < 0 ? colBounds.min[0] : null,
-        top: colBounds.min[1] < 0 ? colBounds.min[1] : null,
-        right: colBounds.max[0] > W ? colBounds.max[0] : null,
-        bottom: colBounds.max[1] > H ? colBounds.max[1] : null,
-      }
-    : null;
-  const isOob =
-    overflow &&
-    (overflow.left != null ||
-      overflow.top != null ||
-      overflow.right != null ||
-      overflow.bottom != null);
+  // Shared predicate with the Lab's OOB badge + bulk sweep — see svgGeometry.
+  const overflow = collider ? colliderOverflow(collider, W, H) : null;
+  const isOob = overflow?.any ?? false;
 
   // Active coordinate space. While editing it's the fixed editSpace (stable,
   // everything reachable); read-only it expands dynamically to reveal overflow.

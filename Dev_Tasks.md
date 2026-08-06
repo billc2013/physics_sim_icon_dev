@@ -659,7 +659,7 @@ touching export/authoring rather than doing it standalone.
 
 ---
 
-### 15. Planck-readiness warnings (authoring + gist dev build) — cross-repo `[~]`
+### 15. Planck-readiness warnings (authoring + gist dev build) — cross-repo `[x]` done 2026-08-06
 
 **Strategy (Bill, 2026-06-29):** GIST keeps a **two-engine adapter** (Planck +
 Rapier) with **no default** — deliberately, for the learning and to keep the
@@ -789,10 +789,11 @@ the *decomposition*, not the outline. So:
   which also moves the save-gate, editor add-vertex cap, and hull-tool target
   (Bill's call: 12 everywhere). Lab spot-check CONFIRMED by Bill 2026-07-17:
   over-cap SVGs show `✖P`.
-- ☐ `bird` re-traced so all decomposed parts ≤12; verified in the Lab.
-- ☐ gist dev build warns on any decomposed part >12 (authoritative check;
-  e.g. `bird`'s 16-vert torso part) and is silent in production.
-  (gist-side CC2, pending.)
+- ☑ `bird` re-traced so all decomposed parts ≤12; verified in the Lab —
+  2026-08-06, via the auto-coarsen silhouette trace (Task 16 part 1's
+  coarsenUntilPlanckSafe), the pilot specimen for that tool.
+- ☑ gist dev build warns on any decomposed part >12 (authoritative check)
+  and is silent in production — gist-side CC2, confirmed by Bill 2026-08-06.
 
 ---
 
@@ -907,10 +908,10 @@ breakdown** so sweeping in-progress items is never a surprise. Status is a
 - ◐ Fix options (part 1): defaults per shape class are now in place — round/
   rectangular → ◯/▭ Fit primitive; traced outlines → auto-coarsen (default in
   both trace tools, 2026-08-06) + Coarseness slider for manual override; last
-  resort → manual vertex deletion (verdict recomputes live). **Remaining:**
-  `bird` re-traced and verified green as the pilot (closes Task 15's ☐), and a
-  call on whether compound/pill authoring is still needed for shapes that
-  inherently decompose badly.
+  resort → manual vertex deletion (verdict recomputes live). `bird` re-traced
+  and verified green as the pilot — 2026-08-06 (closed Task 15's ☐).
+  **Remaining:** only the call on whether compound/pill authoring is still
+  needed for shapes that inherently decompose badly.
 - ☑ `fix` exists end-to-end: schema file updated (migration 11e) + `STATUSES`/
   `STATUS_CONFIG` chip (red/rose) + FilterBar button (auto) + Lab status filters.
   Live enum migration run + verified 2026-07-18 (the earlier "Bill still owes

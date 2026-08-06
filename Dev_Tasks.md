@@ -806,7 +806,11 @@ verdict now *identifies* failures exactly; this decides how to *repair* them.
 Candidate approaches to evaluate (per shape, extending the "auto-fit tool
 series" framing — likely no single universal answer):
 - **Re-trace coarser** — silhouette trace with a larger RDP epsilon so smooth
-  arcs land fewer vertices per convex run.
+  arcs land fewer vertices per convex run. **SHIPPED 2026-08-06** as a
+  **Coarseness slider** in the ground-truth view: both trace tools return their
+  raw ring, and while a trace draft is active the slider re-runs
+  `ringToCollider(ring, ε)` live (verdict recomputes as you slide). Hand-editing
+  a vertex or Pull-in-bounds detaches the slider so it can't discard hand work.
 - **Manual vertex deletion** in the Lab editor on the offending arc — the
   verdict recomputes live during edit, so "delete until green" already works.
 - **Wrong-tool cases** — near-convex blobs should be circle / ≤12-hull, not
@@ -819,7 +823,18 @@ series" framing — likely no single universal answer):
 - **Compound/pill authoring** for shapes that inherently decompose badly.
 - **Possible new tool:** "auto-coarsen until Planck-safe" — iterate RDP epsilon
   until all decomposed parts ≤12. Evaluate whether it earns its complexity vs.
-  manual deletion.
+  manual deletion. **SHIPPED 2026-08-06 — and not as a separate tool but as the
+  DEFAULT inside both trace tools** (Bill's call: build it into the trace so
+  colliders are born safe and never need the fix queue).
+  `coarsenUntilPlanckSafe(ring)` in
+  [colliderGenerator.js](src/lib/colliderGenerator.js) escalates epsilon
+  (×1.4/pass, ≤12 passes, bail at ≤4 verts), re-running the exact
+  `planckReadiness` verdict each pass until `ok`; `computeSilhouetteOutline`
+  and `computeConcaveOutline` use it by default (`autoCoarsen:false` opts out)
+  and report `epsilon`/`coarsenAttempts`/`planckSafe` in debug + the toast.
+  Side effect: a trace on a convex blob now coarsens to a Planck-safe ≤12
+  convex ring instead of stranding an over-cap polygon, so the old
+  "wrong tool" nudge only fires when even the coarsest pass fails.
 
 `bird` (16-vert torso part) is the pilot specimen — its re-trace is Task 15's
 remaining ☐ and should exercise whichever option wins.
@@ -889,8 +904,13 @@ breakdown** so sweeping in-progress items is never a surprise. Status is a
   primitive resize in the Lab, then the usual manual status return.
 
 **Acceptance**
-- ☐ Fix options (part 1) written up here with a chosen default per shape class;
-  `bird` repaired as the pilot (closes Task 15's ☐). **Still open — part 1.**
+- ◐ Fix options (part 1): defaults per shape class are now in place — round/
+  rectangular → ◯/▭ Fit primitive; traced outlines → auto-coarsen (default in
+  both trace tools, 2026-08-06) + Coarseness slider for manual override; last
+  resort → manual vertex deletion (verdict recomputes live). **Remaining:**
+  `bird` re-traced and verified green as the pilot (closes Task 15's ☐), and a
+  call on whether compound/pill authoring is still needed for shapes that
+  inherently decompose badly.
 - ☑ `fix` exists end-to-end: schema file updated (migration 11e) + `STATUSES`/
   `STATUS_CONFIG` chip (red/rose) + FilterBar button (auto) + Lab status filters.
   Live enum migration run + verified 2026-07-18 (the earlier "Bill still owes

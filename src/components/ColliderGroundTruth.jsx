@@ -15,6 +15,7 @@ import {
   computeConcaveOutline,
   computeSilhouetteOutline,
   computeColliderForType,
+  ringToCollider,
 } from "../lib/colliderGenerator.js";
 import ColliderPreview from "./ColliderPreview.jsx";
 import GeometryInfo from "./GeometryInfo.jsx";
@@ -74,6 +75,12 @@ export default function ColliderGroundTruth({
   const [draft, setDraft] = useState(null); // editable collider clone
   const [editSpace, setEditSpace] = useState(null); // fixed canvas while editing
   const [saving, setSaving] = useState(false);
+  // Raw ordered ring from the last trace + its RDP epsilon — powers the
+  // coarseness slider (re-simplify from the same ring at a new epsilon).
+  // Cleared when the draft stops deriving from the trace (hand edit, fit,
+  // cancel), which hides the slider.
+  const [traceRing, setTraceRing] = useState(null);
+  const [traceEpsilon, setTraceEpsilon] = useState(null);
 
   if (!item) {
     return (
@@ -142,53 +149,71 @@ export default function ColliderGroundTruth({
     };
   }
 
+  function clearTrace() {
+    setTraceRing(null);
+    setTraceEpsilon(null);
+  }
+
   function enterEdit() {
+    clearTrace();
     setDraft(JSON.parse(JSON.stringify(storedCollider)));
     setEditSpace(editSpaceFor(getColliderBounds(storedCollider)));
     setEditing(true);
   }
 
+  // Stage a trace result as the edit draft. The edit space is computed from
+  // the RAW ring (a superset of every RDP simplification of it), so sliding
+  // the coarseness slider can never push a vertex outside the fixed canvas.
+  function startTraceDraft(collider, ring, epsilon) {
+    setDraft(collider);
+    setEditSpace(
+      editSpaceFor(getColliderBounds({ type: "convex", vertices: ring }))
+    );
+    setTraceRing(ring);
+    setTraceEpsilon(epsilon);
+    setEditing(true);
+  }
+
   // Task 12 spike: trace an ordered concave outline from the SVG and drop it
   // straight into the edit UI for review. Save (if it validates as a simple
-  // ring) writes it through onSaveCollider like any hand edit.
+  // ring) writes it through onSaveCollider like any hand edit. The RDP epsilon
+  // auto-escalates until the Planck verdict passes (Task 16 part 1); the
+  // coarseness slider below the grid re-simplifies from the same ring.
   function traceOutline() {
-    const { collider: traced, debug } = computeConcaveOutline(item.svg);
+    const { collider: traced, ring, debug } = computeConcaveOutline(item.svg);
     if (!traced) {
       showToast?.(`Couldn't trace an outline (${debug?.error ?? "no geometry"}).`);
       return;
     }
-    setDraft(traced);
-    setEditSpace(editSpaceFor(getColliderBounds(traced)));
-    setEditing(true);
+    startTraceDraft(traced, ring, debug.epsilon);
     const sub = debug.subpaths > 1 ? `, ${debug.subpaths} subpaths ⚠` : "";
-    const rd = planckReadiness(traced);
+    const auto = debug.coarsenAttempts > 1 ? `, auto-coarsened to ε=${debug.epsilon}` : "";
     showToast?.(
-      rd.level === "fail"
-        ? `${rd.message} (path trace is the wrong tool for a convex shape — try circle or hull)`
-        : `Traced ${traced.vertices.length} verts from <${debug.chosenTag}> (${debug.sampledPoints} samples${sub}) — review & Save`
+      debug.planckSafe === false
+        ? `Traced ${traced.vertices.length} verts but still ✖ Planck at ε=${debug.epsilon} — adjust the slider or edit vertices`
+        : `Traced ${traced.vertices.length} verts from <${debug.chosenTag}> (${debug.sampledPoints} samples${sub}${auto}) — review & Save`
     );
   }
 
   // Task 12: raster silhouette trace — captures the whole concave outer
   // boundary of a multi-shape sprite (arms and all) by tracing the rendered
   // alpha blob, then drops it into the edit UI like a hand edit. Async (the
-  // SVG renders to canvas via an Image load).
+  // SVG renders to canvas via an Image load). Auto-coarsens like traceOutline,
+  // so even a convex blob resolves to a Planck-safe ≤12-vertex polygon.
   async function traceSilhouette() {
     try {
-      const { collider: traced, debug } = await computeSilhouetteOutline(item.svg);
+      const { collider: traced, ring, debug } = await computeSilhouetteOutline(item.svg);
       if (!traced) {
         showToast?.(`Couldn't trace silhouette (${debug?.error ?? "no geometry"}).`);
         return;
       }
-      setDraft(traced);
-      setEditSpace(editSpaceFor(getColliderBounds(traced)));
-      setEditing(true);
+      startTraceDraft(traced, ring, debug.epsilon);
       const parts = debug.components > 1 ? `${debug.components} parts → 1 blob, ` : "";
-      const rd = planckReadiness(traced);
+      const auto = debug.coarsenAttempts > 1 ? `, auto-coarsened to ε=${debug.epsilon}` : "";
       showToast?.(
-        rd.level === "fail"
-          ? `${rd.message} (silhouette is the wrong tool for a convex blob — try circle or ≤${MAX_CONVEX_VERTICES} hull)`
-          : `Silhouette: ${traced.vertices.length} verts (${parts}${debug.contourPixels} contour px) — review & Save`
+        debug.planckSafe === false
+          ? `Silhouette: ${traced.vertices.length} verts but still ✖ Planck at ε=${debug.epsilon} — adjust the slider, edit vertices, or try ◯/▭`
+          : `Silhouette: ${traced.vertices.length} verts (${parts}${debug.contourPixels} contour px${auto}) — review & Save`
       );
     } catch (e) {
       showToast?.(`Silhouette trace failed: ${e?.message ?? e}`);
@@ -207,6 +232,7 @@ export default function ColliderGroundTruth({
       showToast?.(`Couldn't fit a ${type} (no geometry).`);
       return;
     }
+    clearTrace();
     setDraft(fitted);
     setEditSpace(editSpaceFor(getColliderBounds(fitted)));
     setEditing(true);
@@ -221,13 +247,29 @@ export default function ColliderGroundTruth({
     setEditing(false);
     setDraft(null);
     setEditSpace(null);
+    clearTrace();
   }
 
   const setVertices = (verts) => setDraft((d) => ({ ...d, vertices: verts }));
 
+  // Hand edits (vertex drag/add/delete, pull-in-bounds) detach the coarseness
+  // slider — the draft no longer derives from the trace ring, so re-sliding
+  // would silently discard the hand work.
+  const setVerticesByHand = (verts) => {
+    setTraceRing(null);
+    setVertices(verts);
+  };
+
+  // Re-simplify the raw trace ring at a new epsilon (coarseness slider). The
+  // Planck verdict below the grid recomputes live from the new draft.
+  function resimplify(eps) {
+    setTraceEpsilon(eps);
+    setDraft(ringToCollider(traceRing, eps));
+  }
+
   function pullInBounds() {
     if (draft?.type !== "convex") return; // vertices only exist on polygons
-    setVertices(
+    setVerticesByHand(
       draft.vertices.map(([x, y]) => [
         round2(Math.max(0, Math.min(W, x))),
         round2(Math.max(0, Math.min(H, y))),
@@ -375,7 +417,7 @@ export default function ColliderGroundTruth({
         {editing && draft?.type === "convex" ? (
           <PolygonEditLayer
             vertices={draft.vertices}
-            onChange={setVertices}
+            onChange={setVerticesByHand}
             space={space}
             vbWidth={W}
             vbHeight={H}
@@ -442,6 +484,14 @@ export default function ColliderGroundTruth({
       {/* Planck verdict sits BELOW the grid (with the outline/validity notes)
           so it never shifts the icon/grid when it appears or its text changes. */}
       {collider && <PlanckVerdict collider={collider} />}
+
+      {editing && traceRing && draft?.type === "convex" && (
+        <CoarsenessSlider
+          epsilon={traceEpsilon}
+          vertCount={draft.vertices?.length ?? 0}
+          onChange={resimplify}
+        />
+      )}
 
       {editing && (
         <EditToolbar
@@ -1021,6 +1071,51 @@ function EditToolbar({
           load. The Planck verdict below shows the actual part sizes.
         </div>
       )}
+    </div>
+  );
+}
+
+// Re-trace-coarser slider (Task 16 part 1). Shown only while a trace-derived
+// polygon draft is active: it re-runs RDP on the RAW trace ring at the chosen
+// epsilon, so the Planck verdict above recomputes live as you slide. The
+// trace's auto-coarsen picks the starting epsilon (first Planck-safe pass);
+// slide left for a tighter fit, right for fewer vertices. Hand-editing any
+// vertex detaches the slider (the draft stops deriving from the ring).
+function CoarsenessSlider({ epsilon, vertCount, onChange }) {
+  // Auto-coarsen can land past the nominal range — stretch the max to keep
+  // the current value reachable.
+  const max = Math.max(6, Math.ceil(epsilon ?? 1));
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 8,
+        marginTop: 8,
+        fontSize: 11,
+        color: "var(--color-text-secondary)",
+      }}
+    >
+      <span style={{ fontWeight: 600, flexShrink: 0 }}>Coarseness</span>
+      <input
+        type="range"
+        min={0.2}
+        max={max}
+        step={0.05}
+        value={epsilon ?? 0.8}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        title="RDP tolerance in viewBox units — higher = fewer vertices, coarser outline. Re-simplifies from the raw trace; hand-editing a vertex detaches this slider."
+        style={{ flex: 1, minWidth: 140 }}
+      />
+      <span
+        style={{
+          flexShrink: 0,
+          fontVariantNumeric: "tabular-nums",
+          color: "var(--color-text-tertiary)",
+        }}
+      >
+        ε {(epsilon ?? 0).toFixed(2)} · {vertCount} verts
+      </span>
     </div>
   );
 }

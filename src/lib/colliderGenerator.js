@@ -8,7 +8,11 @@
 //
 // No external dependencies. All geometry routines are inlined below.
 
-import { MAX_CONVEX_VERTICES, VIEWBOX_SIZE } from "./colliderSchema.js";
+import {
+  MAX_CONVEX_VERTICES,
+  VIEWBOX_SIZE,
+  planckReadiness,
+} from "./colliderSchema.js";
 
 // ---- Public API ----
 
@@ -285,40 +289,103 @@ export function extractOrderedOutline(svgMarkup, opts = {}) {
   }
 }
 
+// ---- Ring → collider + auto-coarsen-until-Planck-safe (Task 16 part 1) ----
+//
+// Both trace routes (ordered path outline + raster silhouette) end the same
+// way: an ordered ring that RDP reduces to a collider polygon. The epsilon
+// picks the coarseness — and Planck safety is largely a function of
+// coarseness, because a smooth arc sampled at fine epsilon decomposes into
+// convex runs with many vertices per part. So instead of tracing fine and
+// quarantining failures in the `fix` queue, the traces escalate epsilon until
+// the EXACT planckReadiness verdict (the same pinned poly-decomp gist runs at
+// load) says ok — colliders are born Planck-safe. The Lab's coarseness slider
+// re-runs ringToCollider on the same ring for manual override.
+
+/**
+ * RDP-simplify an ordered ring into a `type:"convex"` collider (the
+ * accepted-concave misnomer — the ring is kept as-is, NO hull is taken).
+ * RDP preserves order AND concavity (it never adds the cross-cuts a hull
+ * would). First/last samples are distinct ring vertices, so no dup endpoint.
+ */
+export function ringToCollider(ring, epsilon) {
+  const simplified = rdpSimplify(ring, epsilon);
+  return {
+    type: "convex",
+    vertices: simplified.map(([x, y]) => [round2(x), round2(y)]),
+  };
+}
+
+/**
+ * Escalate RDP epsilon until the collider passes the exact Planck verdict.
+ * A "warn" verdict (e.g. RDP produced a self-intersecting ring) is treated as
+ * not-safe and coarsening continues — a coarser pass usually clears it.
+ *
+ * Returns { collider, verdict, epsilon, attempts, safe }. A not-safe result
+ * still returns the last (coarsest) attempt so the caller can stage it for
+ * manual repair.
+ */
+export function coarsenUntilPlanckSafe(ring, opts = {}) {
+  const { baseEpsilon = 0.8, growth = 1.4, maxAttempts = 12 } = opts;
+  let epsilon = baseEpsilon;
+  let last = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const collider = ringToCollider(ring, epsilon);
+    const verdict = planckReadiness(collider);
+    last = {
+      collider,
+      verdict,
+      epsilon: round2(epsilon),
+      attempts: attempt,
+      safe: verdict.level === "ok",
+    };
+    if (last.safe) return last;
+    if (collider.vertices.length <= 4) break; // coarser can't help
+    epsilon *= growth;
+  }
+  return last;
+}
+
 /**
  * Compute a concave outer-boundary collider from SVG markup via the ordered
  * sampling route, RDP-simplified to a clean ring. Emits `type:"convex"` with
  * NO convex hull (gist decomposes the concave outline downstream).
  *
- * Returns { collider, debug } like the other generators; `collider` is null if
- * extraction failed.
+ * By default the RDP epsilon auto-escalates until the exact Planck verdict
+ * passes (coarsenUntilPlanckSafe); pass autoCoarsen:false for a single fixed-
+ * epsilon pass.
+ *
+ * Returns { collider, ring, debug }; `collider` is null if extraction failed.
+ * `ring` is the raw ordered trace — callers can re-run ringToCollider on it
+ * at a different epsilon (the Lab's coarseness slider).
  *
  * @param {string} svgMarkup
- * @param {{ sampleStep?: number, epsilon?: number }} [opts] epsilon = RDP
- *   tolerance in viewBox units (default 0.6).
+ * @param {{ sampleStep?: number, epsilon?: number, autoCoarsen?: boolean }}
+ *   [opts] epsilon = RDP tolerance in viewBox units (default 0.6), the
+ *   starting point when autoCoarsen (default true) escalates.
  */
 export function computeConcaveOutline(svgMarkup, opts = {}) {
-  const { sampleStep = 1.5, epsilon = 0.6 } = opts;
+  const { sampleStep = 1.5, epsilon = 0.6, autoCoarsen = true } = opts;
   const { ring, debug } = extractOrderedOutline(svgMarkup, { sampleStep });
 
   if (ring.length < 3) {
-    return { collider: null, debug: { ...debug, strategy: "concave-outline-failed" } };
+    return { collider: null, ring: [], debug: { ...debug, strategy: "concave-outline-failed" } };
   }
 
-  // RDP preserves order AND concavity (it never adds the cross-cuts a hull
-  // would). First/last samples are distinct ring vertices, so no dup endpoint.
-  const simplified = rdpSimplify(ring, epsilon);
+  const result = autoCoarsen
+    ? coarsenUntilPlanckSafe(ring, { baseEpsilon: epsilon })
+    : { collider: ringToCollider(ring, epsilon), epsilon, attempts: 1, safe: null };
 
   return {
-    collider: {
-      type: "convex",
-      vertices: simplified.map(([x, y]) => [round2(x), round2(y)]),
-    },
+    collider: result.collider,
+    ring,
     debug: {
       ...debug,
       strategy: "concave-outline",
       sampledPoints: ring.length,
-      simplifiedTo: simplified.length,
+      simplifiedTo: result.collider.vertices.length,
+      epsilon: result.epsilon,
+      coarsenAttempts: result.attempts,
+      planckSafe: result.safe,
     },
   };
 }
@@ -459,33 +526,45 @@ export async function traceSilhouetteRaster(svgMarkup, opts = {}) {
 
 /**
  * Compute a concave outer-boundary collider via the raster silhouette route,
- * RDP-simplified. Emits `type:"convex"` with NO hull. Returns a
- * Promise<{ collider, debug }>; collider is null on failure.
+ * RDP-simplified. Emits `type:"convex"` with NO hull.
+ *
+ * By default the RDP epsilon auto-escalates until the exact Planck verdict
+ * passes (coarsenUntilPlanckSafe) — a silhouette trace should never need the
+ * `fix` queue. Pass autoCoarsen:false for a single fixed-epsilon pass.
+ *
+ * Returns a Promise<{ collider, ring, debug }>; collider is null on failure.
+ * `ring` is the raw contour — callers can re-run ringToCollider on it at a
+ * different epsilon (the Lab's coarseness slider).
  *
  * @param {string} svgMarkup
- * @param {{ supersample?: number, alphaThreshold?: number, epsilon?: number }} [opts]
- *   epsilon = RDP tolerance in viewBox units (default 0.8).
+ * @param {{ supersample?: number, alphaThreshold?: number, epsilon?: number,
+ *   autoCoarsen?: boolean }} [opts] epsilon = RDP tolerance in viewBox units
+ *   (default 0.8), the starting point when autoCoarsen (default true)
+ *   escalates.
  */
 export async function computeSilhouetteOutline(svgMarkup, opts = {}) {
-  const { epsilon = 0.8 } = opts;
+  const { epsilon = 0.8, autoCoarsen = true } = opts;
   const { ring, debug } = await traceSilhouetteRaster(svgMarkup, opts);
 
   if (ring.length < 3) {
-    return { collider: null, debug: { ...debug, strategy: "silhouette-failed" } };
+    return { collider: null, ring: [], debug: { ...debug, strategy: "silhouette-failed" } };
   }
 
-  const simplified = rdpSimplify(ring, epsilon);
+  const result = autoCoarsen
+    ? coarsenUntilPlanckSafe(ring, { baseEpsilon: epsilon })
+    : { collider: ringToCollider(ring, epsilon), epsilon, attempts: 1, safe: null };
 
   return {
-    collider: {
-      type: "convex",
-      vertices: simplified.map(([x, y]) => [round2(x), round2(y)]),
-    },
+    collider: result.collider,
+    ring,
     debug: {
       ...debug,
       strategy: "raster-silhouette",
       contourPixels: ring.length,
-      simplifiedTo: simplified.length,
+      simplifiedTo: result.collider.vertices.length,
+      epsilon: result.epsilon,
+      coarsenAttempts: result.attempts,
+      planckSafe: result.safe,
     },
   };
 }
